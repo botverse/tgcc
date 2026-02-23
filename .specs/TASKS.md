@@ -1,91 +1,95 @@
 # Implementation Tasks
 
-## Phase 1 — Core Bridge (MVP)
+No phases. Ship it all.
 
-### 1.1 Project Setup
+## Project Setup
 - [ ] Init pnpm project with TypeScript
-- [ ] Add dependencies: grammy, uuid
-- [ ] Configure tsup/tsc build
-- [ ] Basic config loader (`~/.tgcc/config.json`)
+- [ ] Add dependencies: grammy, @modelcontextprotocol/sdk, uuid, pino
+- [ ] Configure tsc build
+- [ ] Config loader (`~/.tgcc/config.json`)
 
-### 1.2 CC Process Manager (`cc-process.ts`)
-- [ ] Spawn CC with stream-json flags
+## CC Process Manager (`cc-process.ts`)
+- [ ] Spawn CC with stream-json flags + `--include-partial-messages`
 - [ ] NDJSON line parser on stdout
 - [ ] Write user messages to stdin
 - [ ] Idle timeout → kill process
 - [ ] Respawn with `--continue` on next message
 - [ ] Error handling (crash, hang detection)
+- [ ] Pass MCP config for send_file/send_image tools
 
-### 1.3 CC Protocol (`cc-protocol.ts`)
+## CC Protocol (`cc-protocol.ts`)
 - [ ] Construct text user message
 - [ ] Construct image user message (base64 content blocks)
-- [ ] Parse assistant text from output events
-- [ ] Parse result events (cost, session_id)
-- [ ] Parse tool_use events (for Write tool file detection)
-- [ ] Parse init event (store session_id)
+- [ ] Parse `stream_event` for content deltas (text + thinking)
+- [ ] Parse `assistant` messages (full, for non-streaming fallback)
+- [ ] Parse `result` events (cost, session_id)
+- [ ] Parse `tool_use` events (for status display)
+- [ ] Parse `system.init` event (store session_id)
 
-### 1.4 Telegram Bot (`telegram.ts`)
+## Streaming (`streaming.ts`)
+- [ ] Accumulate `text_delta` chunks into buffer
+- [ ] Throttled TG message editing (max 1 edit/sec, min 200 chars between edits)
+- [ ] First chunk → sendMessage, subsequent → editMessageText
+- [ ] Thinking indicator: "🤔 Thinking..." during thinking blocks
+- [ ] Tool use indicator: "🔧 Using [tool]..." during tool_use blocks
+- [ ] Replace indicators with actual text when content arrives
+- [ ] Final edit on message_stop
+
+## Telegram Bot (`telegram.ts`)
 - [ ] grammy bot setup with long polling
+- [ ] Multi-bot support (one grammy instance per agent/bot token)
 - [ ] Text message handler → bridge
 - [ ] Photo handler → download → base64 → bridge
 - [ ] Document handler → download → save to disk → bridge
 - [ ] Reply formatting (markdown, code blocks)
 - [ ] Message splitting for >4096 chars
-- [ ] Typing indicator while CC is working
-- [ ] allowedUsers filter
+- [ ] allowedUsers filter per agent
+- [ ] Slash command registration and handling
 
-### 1.5 Bridge (`bridge.ts`)
-- [ ] User → CC process mapping
-- [ ] Route TG messages to CC stdin
-- [ ] Route CC output to TG messages
+## Bridge (`bridge.ts`)
+- [ ] Multi-agent: agent config → CC process mapping
+- [ ] Route TG messages to correct CC stdin
+- [ ] Route CC output to correct TG chat (via streaming module)
 - [ ] Handle process lifecycle (spawn/idle/respawn)
 - [ ] Queue messages while CC is spawning
 
-## Phase 2 — Session Management
-
-### 2.1 Commands
-- [ ] `/new` — fresh session
-- [ ] `/sessions` — list sessions
-- [ ] `/resume <id>` — resume specific session
-- [ ] `/session` — current session info
-- [ ] `/model <name>` — switch model
-- [ ] `/repo <path>` — set working directory
-- [ ] `/cost` — show cost
-
-### 2.2 Session Store (`session.ts`)
-- [ ] JSON file persistence
-- [ ] Track session history per user
-- [ ] Store current session ID, model, repo
-
-## Phase 3 — MCP Tools (File Output)
-
-### 3.1 MCP Server (`mcp-server.ts`)
+## MCP Server (`mcp-server.ts`)
 - [ ] Stdio MCP server using @modelcontextprotocol/sdk
 - [ ] `send_file` tool — read file, IPC to bridge, bridge sends to TG
 - [ ] `send_image` tool — same but sent as TG photo for preview
 - [ ] `send_voice` tool — send as TG voice note (.ogg opus)
 
-### 3.2 MCP Bridge IPC (`mcp-bridge.ts`)
+## MCP Bridge IPC (`mcp-bridge.ts`)
 - [ ] Unix socket server in bridge process
 - [ ] Accept tool call requests from MCP server
 - [ ] Route to correct TG chat via user_id
 - [ ] Return success/error to MCP server
+- [ ] Generate per-agent MCP config JSON at spawn time
 
-### 3.3 MCP Config Generation
-- [ ] Generate per-user MCP config JSON at spawn time
-- [ ] Pass to CC via `--mcp-config`
-- [ ] Include TGCC_USER_ID and socket path in env
+## Session Management (`session.ts`)
+- [ ] JSON file persistence
+- [ ] Track session history per user per agent
+- [ ] Store current session ID, model, repo
 
-## Phase 4 — Polish
+## Slash Commands
+- [ ] `/new` — fresh session
+- [ ] `/sessions` — list recent sessions
+- [ ] `/resume <id>` — resume specific session
+- [ ] `/session` — current session info
+- [ ] `/model <name>` — switch model
+- [ ] `/repo <path>` — set working directory
+- [ ] `/cost` — show cost for current session
+- [ ] `/status` — process state, uptime, model
+- [ ] `/catchup` / `/whatdidimiss` — read CC session history from outside TG, summarize
+- [ ] `/help` — list commands
 
-### 4.1 Reliability
-- [ ] Graceful shutdown (SIGTERM handler)
+## Multi-Agent Config
+- [ ] Config supports multiple agents, each with: bot token, allowed users, default repo, model
+- [ ] Hot reload: watch config file, add/remove bots without restart (grammy bot start/stop)
+- [ ] Each agent gets its own CC process per user
+
+## Reliability
+- [ ] Graceful shutdown (SIGTERM handler, kill all CC processes)
 - [ ] Process cleanup on exit
-- [ ] Reconnection logic for TG polling
-- [ ] Logging (pino or similar)
-
-### 4.2 Quality of Life
-- [ ] Format CC markdown for TG (convert unsupported elements)
-- [ ] Cost tracking per session
-- [ ] `/help` command
-- [ ] Startup self-test (verify CC binary exists)
+- [ ] Logging (pino)
+- [ ] Startup self-test (verify CC binary, validate config)

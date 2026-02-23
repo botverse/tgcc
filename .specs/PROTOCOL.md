@@ -184,6 +184,46 @@ CC has a `--file` flag for downloading files at startup:
 
 But for our use case, we save files to disk and reference them in the message text instead — simpler and works with the stream-json input format.
 
+### Streaming Events (CONFIRMED WORKING)
+
+With `--include-partial-messages`, CC emits `stream_event` NDJSON lines containing raw Anthropic SSE events:
+
+#### Message Start
+```json
+{"type":"stream_event","event":{"type":"message_start","message":{"model":"claude-opus-4-6","id":"msg_...","role":"assistant","content":[],"stop_reason":null,"usage":{...}}}}
+```
+
+#### Content Block Start (text or thinking)
+```json
+{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}
+```
+For thinking blocks: `"content_block":{"type":"thinking","thinking":""}}`
+
+#### Content Block Delta (incremental text)
+```json
+{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"chunk of text"}}}
+```
+For thinking: `"delta":{"type":"thinking_delta","thinking":"..."}`
+
+#### Content Block Stop
+```json
+{"type":"stream_event","event":{"type":"content_block_stop","index":0}}
+```
+
+#### Message Stop
+```json
+{"type":"stream_event","event":{"type":"message_stop"}}
+```
+
+#### Streaming Strategy for TG
+
+1. On `content_block_start` with `type: "thinking"` → send "🤔 *Thinking...*" to TG
+2. Ignore `thinking_delta` content (don't leak thinking to user)
+3. On `content_block_start` with `type: "text"` → start accumulating text
+4. On each `text_delta` → append to buffer, throttled edit TG message (max 1 edit/sec)
+5. On `message_stop` → final edit with complete text
+6. During tool_use blocks → optionally show "🔧 *Using [tool_name]...*"
+
 ### Session Persistence
 
 CC stores sessions at `~/.claude/projects/<project-hash>/sessions/`.

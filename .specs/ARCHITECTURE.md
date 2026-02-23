@@ -102,7 +102,22 @@ CC streams assistant text incrementally. For TG:
 - Send as a single TG message, then edit it as more text arrives (like OpenClaw's partial streaming)
 - Or: wait for full turn completion, send once (simpler, v1)
 
-**v1: Wait for full turn, send once.** Streaming can be v2.
+**Streaming is confirmed working.** CC emits `stream_event` NDJSON lines with `content_block_delta` containing text deltas — same format as the raw Anthropic API. Use `--include-partial-messages` flag.
+
+Stream protocol:
+1. `message_start` → response begins
+2. `content_block_start` (type: "thinking") → show "🤔 Thinking..." on TG
+3. `content_block_delta` (thinking) → skip/ignore content
+4. `content_block_stop` → thinking done
+5. `content_block_start` (type: "text") → replace thinking indicator, start accumulating
+6. `content_block_delta` (type: "text_delta") → accumulate `.delta.text` chunks
+7. Every ~500ms or ~200 chars, edit TG message with accumulated text
+8. `content_block_stop` + `message_stop` → final edit, done
+
+TG edit-streaming (like OpenClaw):
+- First text chunk → `sendMessage` → store message_id
+- Subsequent chunks → `editMessageText` with accumulated text (throttle to avoid TG rate limits: max 1 edit/sec)
+- Final → last edit with complete text
 
 ## Process Lifecycle
 
@@ -346,19 +361,14 @@ claude -p \
   [--continue]
 ```
 
-## Non-Goals (v1)
+## Out of Scope
 
-- Multi-user concurrency (v1 is single-user, single-process)
-- Streaming/partial message edits on TG (v2)
 - Mobile app / API server (future — will need WebSocket layer)
 - MCP tool forwarding (not needed, CC has its own tools)
-- Authentication beyond allowedUsers list
 - Conversation compaction / context management (CC handles this)
 
-## Future (v2+)
+## Future
 
-- **Streaming**: Edit TG messages as CC streams text
-- **Multi-user**: Process pool, per-user isolation
 - **Mobile app**: WebSocket API alongside TG
 - **Sync**: Session history sync between TG and mobile app
 - **Inline buttons**: Approval prompts for CC tool use (like permission mode)
