@@ -57,13 +57,24 @@
 - [ ] Track session history per user
 - [ ] Store current session ID, model, repo
 
-## Phase 3 — File Output
+## Phase 3 — MCP Tools (File Output)
 
-### 3.1 Output Detection
-- [ ] Parse Write tool_use events
-- [ ] Detect writes to output directory
-- [ ] Auto-send files to TG as documents
-- [ ] Clean up after sending
+### 3.1 MCP Server (`mcp-server.ts`)
+- [ ] Stdio MCP server using @modelcontextprotocol/sdk
+- [ ] `send_file` tool — read file, IPC to bridge, bridge sends to TG
+- [ ] `send_image` tool — same but sent as TG photo for preview
+- [ ] `send_voice` tool — send as TG voice note (.ogg opus)
+
+### 3.2 MCP Bridge IPC (`mcp-bridge.ts`)
+- [ ] Unix socket server in bridge process
+- [ ] Accept tool call requests from MCP server
+- [ ] Route to correct TG chat via user_id
+- [ ] Return success/error to MCP server
+
+### 3.3 MCP Config Generation
+- [ ] Generate per-user MCP config JSON at spawn time
+- [ ] Pass to CC via `--mcp-config`
+- [ ] Include TGCC_USER_ID and socket path in env
 
 ## Phase 4 — Polish
 

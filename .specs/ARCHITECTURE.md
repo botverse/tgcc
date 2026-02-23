@@ -40,7 +40,8 @@ Telegram Bot API ←→ TGCC Server ←→ Claude Code CLI (stream-json stdin/st
 4. **`src/cc-protocol.ts`** — Stream-json NDJSON protocol. Parse CC output events, construct user input messages.
 5. **`src/session.ts`** — Session store. Track active session ID per user, list/switch sessions.
 6. **`src/config.ts`** — Configuration (bot token, CC binary path, timeouts, allowed users, repos).
-7. **`src/output.ts`** — Output handler. Watches for CC file writes, sends files back to TG.
+7. **`src/mcp-server.ts`** — MCP stdio server exposing `send_file`, `send_image`, `send_voice` tools to CC.
+8. **`src/mcp-bridge.ts`** — IPC layer between MCP server process and main bridge (Unix socket).
 
 ## Protocol Details
 
@@ -204,18 +205,13 @@ Simple JSON file at `~/.tgcc/sessions.json`:
 | CC Output | TG Handling |
 |-----------|-------------|
 | Text (assistant message) | Send as TG message (markdown) |
-| File write (Write tool to `/tmp/tgcc/output/`) | Detect path, send as TG document |
+| `send_file` MCP tool call | Send file as TG document |
+| `send_image` MCP tool call | Send image as TG photo (with preview) |
+| `send_voice` MCP tool call | Send as TG voice note |
 | Code blocks | Format with TG markdown code blocks |
 | Long text (>4096 chars) | Split into multiple messages |
 
-### Output Directory Convention
-
-CC writes files to `/tmp/tgcc/output/<user_id>/`. The bridge:
-1. Watches this directory (fs.watch or poll after each turn)
-2. On new file: send to TG as document
-3. Clean up after sending
-
-Alternatively: parse CC's tool_use events for Write tool calls — if the path is in the output dir, auto-send to TG. This is more reliable than fs.watch.
+File output is **explicit** — CC calls the `send_file`/`send_image` MCP tools when it wants to deliver something to the user. No directory watching or heuristics needed.
 
 ## Configuration
 
@@ -251,6 +247,104 @@ Alternatively: parse CC's tool_use events for Write tool calls — if the path i
 - **NDJSON parsing**: readline (line-by-line from stdout)
 - **Build**: tsup or tsc
 - **Package manager**: pnpm
+
+## MCP Tools (TGCC → CC)
+
+TGCC runs a local MCP server that CC connects to. This gives CC tools to interact with the user's TG chat.
+
+### `send_file`
+
+Send a file to the user on Telegram.
+
+```json
+{
+  "name": "send_file",
+  "description": "Send a file to the user on Telegram. Use this when you want to deliver a file (image, PDF, code, etc.) to the user.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "path": { "type": "string", "description": "Absolute path to the file to send" },
+      "caption": { "type": "string", "description": "Optional caption for the file" }
+    },
+    "required": ["path"]
+  }
+}
+```
+
+When CC calls this tool:
+1. Bridge reads the file at `path`
+2. Sends it to the user's TG chat as a document (or photo if image)
+3. Returns success/error to CC
+
+### `send_image`
+
+Send an image with optional caption (sent as TG photo, not document — better preview).
+
+```json
+{
+  "name": "send_image",
+  "description": "Send an image to the user on Telegram with a nice preview. Use for generated charts, screenshots, diagrams.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "path": { "type": "string", "description": "Absolute path to the image file" },
+      "caption": { "type": "string", "description": "Optional caption" }
+    },
+    "required": ["path"]
+  }
+}
+```
+
+### `send_voice`
+
+Send a voice message (TG voice note).
+
+```json
+{
+  "name": "send_voice",
+  "description": "Send a voice message to the user on Telegram.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "path": { "type": "string", "description": "Path to .ogg opus audio file" },
+      "caption": { "type": "string", "description": "Optional caption" }
+    },
+    "required": ["path"]
+  }
+}
+```
+
+### MCP Server Implementation
+
+The MCP server runs as a stdio transport that CC connects to via `--mcp-config`:
+
+```json
+{
+  "mcpServers": {
+    "tgcc": {
+      "command": "node",
+      "args": ["<path>/dist/mcp-server.js"],
+      "env": {
+        "TGCC_USER_ID": "<telegram_user_id>",
+        "TGCC_SOCKET": "/tmp/tgcc/bridge.sock"
+      }
+    }
+  }
+}
+```
+
+The MCP server communicates back to the bridge process via Unix socket (or IPC) to trigger the actual TG sends. This keeps the MCP server stateless — it just forwards tool calls to the bridge.
+
+### CC Spawn with MCP
+
+```bash
+claude -p \
+  --input-format stream-json \
+  --output-format stream-json \
+  --verbose \
+  --mcp-config /tmp/tgcc/mcp-config.json \
+  [--continue]
+```
 
 ## Non-Goals (v1)
 
