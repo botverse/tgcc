@@ -591,6 +591,7 @@ export interface SubAgentInfo {
   tgMessageId: number | null;
   status: 'running' | 'dispatched' | 'completed' | 'failed';
   label: string;
+  agentName: string;  // CC's agent name (used as 'from' in mailbox)
   inputPreview: string;
   dispatchedAt: number | null;         // timestamp when dispatched (for elapsed timer)
   elapsedTimer: ReturnType<typeof setInterval> | null;  // periodic edit timer
@@ -703,8 +704,14 @@ export class SubAgentTracker {
     // Detect background agent spawn confirmations — keep as dispatched, don't mark completed
     // Spawn confirmations contain "agent_id:" and "Spawned" patterns
     const isSpawnConfirmation = /agent_id:\s*\S+@\S+/.test(result) || /[Ss]pawned\s+successfully/i.test(result);
+    console.log(`[SUBAGENT] handleToolResult: toolUseId=${toolUseId}, isSpawn=${isSpawnConfirmation}, result=${result.slice(0, 100)}`);
     if (isSpawnConfirmation) {
-      // Extract agent_id for display but stay in dispatched state
+      // Extract agent name from spawn confirmation for mailbox matching
+      const nameMatch = result.match(/name:\s*(\S+)/);
+      if (nameMatch && !info.agentName) info.agentName = nameMatch[1];
+      const agentIdMatch = result.match(/agent_id:\s*(\S+)@/);
+      if (agentIdMatch && !info.agentName) info.agentName = agentIdMatch[1];
+
       const label = info.label || info.toolName;
       const text = `🤖 ${escapeHtml(label)} — Spawned, waiting for results…`;
       this.sendQueue = this.sendQueue.then(async () => {
@@ -757,6 +764,7 @@ export class SubAgentTracker {
       tgMessageId: null,
       status: 'running',
       label: '',
+      agentName: '',
       inputPreview: '',
       dispatchedAt: null,
       elapsedTimer: null,
@@ -789,6 +797,20 @@ export class SubAgentTracker {
     if (!info || !info.tgMessageId) return;
 
     info.inputPreview += event.delta.partial_json;
+
+    // Extract agent name from input JSON (used for mailbox matching)
+    if (!info.agentName) {
+      try {
+        const parsed = JSON.parse(info.inputPreview);
+        if (typeof parsed.name === 'string' && parsed.name.trim()) {
+          info.agentName = parsed.name.trim();
+        }
+      } catch {
+        // Partial JSON — try extracting name field
+        const nameMatch = info.inputPreview.match(/"name"\s*:\s*"([^"]+)"/);
+        if (nameMatch) info.agentName = nameMatch[1];
+      }
+    }
 
     // Try to extract an agent label
     if (!info.label) {
@@ -909,7 +931,15 @@ export class SubAgentTracker {
 
   /** Start watching the mailbox file for sub-agent results. */
   startMailboxWatch(): void {
-    if (this.mailboxWatching || !this.mailboxPath) return;
+    if (this.mailboxWatching) {
+      console.log('[MAILBOX] Already watching, skipping');
+      return;
+    }
+    if (!this.mailboxPath) {
+      console.log('[MAILBOX] No mailbox path set, cannot watch');
+      return;
+    }
+    console.log(`[MAILBOX] Starting watch on ${this.mailboxPath}`);
     this.mailboxWatching = true;
 
     // Ensure directory exists so watchFile doesn't error
@@ -950,6 +980,7 @@ export class SubAgentTracker {
   /** Process new mailbox messages and update sub-agent TG messages. */
   private processMailbox(): void {
     const messages = this.readMailboxMessages();
+    console.log(`[MAILBOX] processMailbox: ${messages.length} total, lastCount=${this.lastMailboxCount}, dispatched=${[...this.agents.values()].filter(a => a.status === 'dispatched').length}`);
     if (messages.length <= this.lastMailboxCount) return;
 
     const newMessages = messages.slice(this.lastMailboxCount);
@@ -1006,8 +1037,12 @@ export class SubAgentTracker {
     const fromLower = from.toLowerCase();
     for (const info of this.agents.values()) {
       if (info.status !== 'dispatched') continue;
+      // Primary match: agentName (CC's internal agent name, used as mailbox 'from')
+      if (info.agentName && info.agentName.toLowerCase() === fromLower) {
+        return info;
+      }
+      // Fallback: fuzzy label match
       const label = (info.label || info.toolName).toLowerCase();
-      // Match: exact, contains, or from contains label
       if (label === fromLower || label.includes(fromLower) || fromLower.includes(label)) {
         return info;
       }

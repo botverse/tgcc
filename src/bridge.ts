@@ -506,6 +506,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
           });
 
           // Start watching if we have dispatched agents
+          console.log(`[BRIDGE] After team name set: hasDispatched=${tracker.hasDispatchedAgents}, isWatching=${tracker.isMailboxWatching}`);
           if (tracker.hasDispatchedAgents) {
             tracker.startMailboxWatch();
           }
