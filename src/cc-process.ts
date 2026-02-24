@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from 'node:child_process';
+import { spawn, execSync, type ChildProcess } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
@@ -7,6 +7,7 @@ import type pino from 'pino';
 import {
   type CCOutputEvent,
   type UserMessage,
+  type StreamInnerEvent,
   parseCCOutputLine,
   serializeMessage,
   createInitializeRequest,
@@ -16,6 +17,22 @@ import type { ResolvedUserConfig } from './config.js';
 // ── Types ──
 
 export type ProcessState = 'idle' | 'spawning' | 'active';
+
+/** CC activity state derived from stream events for smart hang detection. */
+export type CCActivityState = 'idle' | 'responding' | 'tool_executing' | 'waiting_for_api';
+
+// ── Process tree check ──
+
+/** Check if a process has active child processes (tool execution signal). */
+export function hasActiveChildren(pid: number | undefined): boolean {
+  if (!pid) return false;
+  try {
+    execSync(`pgrep --parent ${pid}`, { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 export interface CCProcessOptions {
   agentId: string;
@@ -65,6 +82,7 @@ export class CCProcess extends EventEmitter {
 
   private process: ChildProcess | null = null;
   private _state: ProcessState = 'idle';
+  private _ccActivity: CCActivityState = 'idle';
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
   private hangTimer: ReturnType<typeof setTimeout> | null = null;
   private messageQueue: UserMessage[] = [];
@@ -83,6 +101,7 @@ export class CCProcess extends EventEmitter {
   }
 
   get state(): ProcessState { return this._state; }
+  get ccActivity(): CCActivityState { return this._ccActivity; }
   get sessionId(): string | null { return this._sessionId; }
   get totalCostUsd(): number { return this._totalCostUsd; }
   get spawnedAt(): Date | null { return this._spawnedAt; }
@@ -201,14 +220,22 @@ export class CCProcess extends EventEmitter {
         break;
 
       case 'assistant':
+        // If assistant message has stop_reason 'tool_use', CC will execute the tool
+        if (event.message.stop_reason === 'tool_use') {
+          this._ccActivity = 'tool_executing';
+        }
         this.emit('assistant', event);
         break;
 
       case 'tool_result':
+        // Tool result sent back to CC → CC will call API with result
+        this._ccActivity = 'waiting_for_api';
         this.emit('tool_result', event);
         break;
 
       case 'result':
+        // Turn complete
+        this._ccActivity = 'idle';
         if (event.total_cost_usd) {
           this._totalCostUsd = event.total_cost_usd;
         }
@@ -217,6 +244,7 @@ export class CCProcess extends EventEmitter {
         break;
 
       case 'stream_event':
+        this.updateActivityFromStreamEvent(event.event);
         this.emit('stream_event', event.event);
         break;
 
@@ -231,6 +259,24 @@ export class CCProcess extends EventEmitter {
     }
 
     this.emit('output', event);
+  }
+
+  /** Update CC activity state from stream events. */
+  private updateActivityFromStreamEvent(event: StreamInnerEvent): void {
+    switch (event.type) {
+      case 'message_start':
+        // CC started producing content — API responded
+        this._ccActivity = 'responding';
+        break;
+      case 'content_block_start':
+        if ('content_block' in event && event.content_block.type === 'tool_use') {
+          // Tool use block started — will transition to tool_executing on assistant message
+          this._ccActivity = 'responding';
+        }
+        break;
+      // message_stop and content_block_stop don't change activity —
+      // the assistant message with stop_reason handles the transition
+    }
   }
 
   // ── Send message to CC ──
@@ -249,6 +295,7 @@ export class CCProcess extends EventEmitter {
 
     // Active — write directly
     this.writeToStdin(msg);
+    this._ccActivity = 'waiting_for_api';
     this.clearIdleTimer();
     this.startHangTimer();
   }
@@ -290,10 +337,48 @@ export class CCProcess extends EventEmitter {
   private startHangTimer(): void {
     this.clearHangTimer();
     this.hangTimer = setTimeout(() => {
-      this.logger.warn('Hang timeout — killing CC process');
-      this.emit('hang');
-      this.kill();
+      this.handleHangTimeout();
     }, this.options.userConfig.hangTimeoutMs);
+  }
+
+  /** State-aware hang detection: check CC activity before killing. */
+  private handleHangTimeout(): void {
+    const activity = this._ccActivity;
+    const pid = this.pid;
+
+    if (activity === 'tool_executing') {
+      // CC is executing a tool — check for active child processes
+      if (hasActiveChildren(pid)) {
+        this.logger.info('Hang timer: tool_executing with active children — extending 5 min');
+        this.startHangTimer(); // restart the timer
+        return;
+      }
+      // No children but supposedly executing a tool — wait 60s more
+      this.logger.info('Hang timer: tool_executing but no children — waiting 60s');
+      this.hangTimer = setTimeout(() => {
+        if (hasActiveChildren(pid)) {
+          this.logger.info('Hang timer: children appeared — extending');
+          this.startHangTimer();
+        } else {
+          this.logger.warn('Hang timer: tool_executing, still no children — truly hung');
+          this.emit('hang');
+          this.kill();
+        }
+      }, 60_000);
+      return;
+    }
+
+    if (activity === 'waiting_for_api') {
+      // API calls can be slow — extend
+      this.logger.info('Hang timer: waiting_for_api — extending');
+      this.startHangTimer();
+      return;
+    }
+
+    // responding or idle with no output for hangTimeoutMs — truly hung
+    this.logger.warn({ activity }, 'Hang timeout — truly hung, killing');
+    this.emit('hang');
+    this.kill();
   }
 
   private clearHangTimer(): void {
@@ -340,6 +425,7 @@ export class CCProcess extends EventEmitter {
     this.clearIdleTimer();
     this.clearHangTimer();
     this._state = 'idle';
+    this._ccActivity = 'idle';
     this.process = null;
     this.emit('stateChange', 'idle');
   }
