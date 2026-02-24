@@ -1,14 +1,13 @@
 #!/usr/bin/env node
 
 import { createConnection, type Socket } from 'node:net';
-import { existsSync, readdirSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, readdirSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { join, dirname, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import type { CtlRequest, CtlResponse } from './ctl-server.js';
-import { loadConfig, agentForRepo, type TgccConfig } from './config.js';
+import { loadConfig, agentForRepo, CONFIG_PATH, type TgccConfig } from './config.js';
 
 const CTL_DIR = '/tmp/tgcc/ctl';
-const CONFIG_PATH = join(homedir(), '.tgcc', 'config.json');
 
 // ── Socket communication ──
 
@@ -195,6 +194,198 @@ function loadConfigSafe(): TgccConfig {
   }
 }
 
+// ── Raw config read/write (preserves structure for agent management) ──
+
+function readRawConfig(): Record<string, unknown> {
+  if (!existsSync(CONFIG_PATH)) {
+    return { agents: {} };
+  }
+  return JSON.parse(readFileSync(CONFIG_PATH, 'utf-8'));
+}
+
+function writeRawConfig(raw: Record<string, unknown>): void {
+  const dir = dirname(CONFIG_PATH);
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  writeFileSync(CONFIG_PATH, JSON.stringify(raw, null, 2) + '\n');
+}
+
+// ── Agent management commands ──
+
+function cmdAgentAdd(args: string[]): void {
+  const name = args[0];
+  if (!name) {
+    console.error('Usage: tgcc agent add <name> --bot-token <token> [--repo <name-or-path>]');
+    process.exit(1);
+  }
+
+  let botToken: string | undefined;
+  let repo: string | undefined;
+
+  for (let i = 1; i < args.length; i++) {
+    if ((args[i] === '--bot-token' || args[i] === '--token') && i + 1 < args.length) {
+      botToken = args[++i];
+    } else if (args[i] === '--repo' && i + 1 < args.length) {
+      repo = args[++i];
+    }
+  }
+
+  if (!botToken) {
+    console.error('Error: --bot-token is required');
+    process.exit(1);
+  }
+
+  const raw = readRawConfig();
+  const agents = (raw.agents ?? {}) as Record<string, unknown>;
+
+  if (agents[name]) {
+    console.error(`Error: Agent "${name}" already exists. Remove it first.`);
+    process.exit(1);
+  }
+
+  const agentEntry: Record<string, unknown> = {
+    botToken,
+    allowedUsers: ['7016073156'], // default — user can edit config
+  };
+
+  if (repo) {
+    // Check if it's a registry key or a path
+    const repos = (raw.repos ?? {}) as Record<string, string>;
+    if (repos[repo]) {
+      agentEntry.defaults = { repo };
+    } else {
+      // It's a direct path — add to repos registry and reference it
+      const repoName = repo.split('/').pop() ?? name;
+      const absPath = resolve(repo);
+      repos[repoName] = absPath;
+      raw.repos = repos;
+      agentEntry.defaults = { repo: repoName };
+    }
+  }
+
+  agents[name] = agentEntry;
+  raw.agents = agents;
+  writeRawConfig(raw);
+
+  console.log(`Agent "${name}" added.`);
+  if (repo) console.log(`  Default repo: ${repo}`);
+  console.log('Config hot-reload will pick it up automatically.');
+}
+
+function cmdAgentRemove(args: string[]): void {
+  const name = args[0];
+  if (!name) {
+    console.error('Usage: tgcc agent remove <name>');
+    process.exit(1);
+  }
+
+  const raw = readRawConfig();
+  const agents = (raw.agents ?? {}) as Record<string, unknown>;
+
+  if (!agents[name]) {
+    console.error(`Error: Agent "${name}" not found.`);
+    process.exit(1);
+  }
+
+  delete agents[name];
+  raw.agents = agents;
+  writeRawConfig(raw);
+
+  console.log(`Agent "${name}" removed.`);
+}
+
+function cmdAgentList(): void {
+  const raw = readRawConfig();
+  const agents = (raw.agents ?? {}) as Record<string, Record<string, unknown>>;
+  const repos = (raw.repos ?? {}) as Record<string, string>;
+
+  const entries = Object.entries(agents);
+  if (entries.length === 0) {
+    console.log('No agents configured.');
+    return;
+  }
+
+  for (const [name, agent] of entries) {
+    const defaults = (agent.defaults ?? {}) as Record<string, unknown>;
+    const repoKey = defaults.repo as string | undefined;
+    const repoPath = repoKey ? (repos[repoKey] ?? repoKey) : 'none (generic)';
+
+    console.log(`${name}:`);
+    console.log(`  Token: ${(agent.botToken as string)?.slice(0, 10)}...`);
+    console.log(`  Repo: ${repoPath}`);
+    console.log(`  Users: ${(agent.allowedUsers as string[])?.join(', ') ?? 'none'}`);
+  }
+}
+
+function cmdAgentRepo(args: string[]): void {
+  const name = args[0];
+  const repoArg = args[1];
+
+  if (!name || !repoArg) {
+    console.error('Usage: tgcc agent repo <name> <name-or-path>');
+    process.exit(1);
+  }
+
+  const raw = readRawConfig();
+  const agents = (raw.agents ?? {}) as Record<string, Record<string, unknown>>;
+
+  if (!agents[name]) {
+    console.error(`Error: Agent "${name}" not found.`);
+    process.exit(1);
+  }
+
+  const repos = (raw.repos ?? {}) as Record<string, string>;
+
+  if (repos[repoArg]) {
+    // It's a registry key
+    const defaults = (agents[name].defaults ?? {}) as Record<string, unknown>;
+    defaults.repo = repoArg;
+    agents[name].defaults = defaults;
+  } else {
+    // Direct path — add to registry
+    const repoName = repoArg.split('/').pop() ?? name;
+    const absPath = resolve(repoArg);
+    repos[repoName] = absPath;
+    raw.repos = repos;
+    const defaults = (agents[name].defaults ?? {}) as Record<string, unknown>;
+    defaults.repo = repoName;
+    agents[name].defaults = defaults;
+  }
+
+  raw.agents = agents;
+  writeRawConfig(raw);
+
+  console.log(`Agent "${name}" repo set to "${repoArg}".`);
+}
+
+function cmdAgent(args: string[]): void {
+  const subcommand = args[0];
+
+  switch (subcommand) {
+    case 'add':
+      cmdAgentAdd(args.slice(1));
+      break;
+    case 'remove':
+    case 'rm':
+      cmdAgentRemove(args.slice(1));
+      break;
+    case 'list':
+    case 'ls':
+      cmdAgentList();
+      break;
+    case 'repo':
+      cmdAgentRepo(args.slice(1));
+      break;
+    default:
+      console.error('Usage: tgcc agent <add|remove|list|repo>');
+      console.error('');
+      console.error('  add <name> --bot-token <token> [--repo <path>]');
+      console.error('  remove <name>');
+      console.error('  list');
+      console.error('  repo <name> <path>');
+      process.exit(1);
+  }
+}
+
 // ── Main ──
 
 async function main(): Promise<void> {
@@ -212,10 +403,7 @@ async function main(): Promise<void> {
       break;
 
     case 'agent':
-      // Placeholder — implemented in Stage 3
-      console.error('Agent management commands not yet available.');
-      console.error('Usage: tgcc agent add|remove|list|repo');
-      process.exit(1);
+      cmdAgent(args.slice(1));
       break;
 
     case 'help':
