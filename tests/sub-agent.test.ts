@@ -144,18 +144,28 @@ describe('SubAgentTracker', () => {
       content_block: { type: 'tool_use', id: 'toolu_1', name: 'dispatch_agent', input: {} },
     } as StreamInnerEvent);
 
-    // Send enough input_json_delta to trigger an update (> 200 chars where length % 200 <= 50)
-    const bigChunk = 'x'.repeat(200);
+    // Send input_json_delta in two chunks to hit the throttle window (length % 200 <= 50)
+    // First chunk: enough to have a parseable prompt field
+    const chunk1 = '{"prompt": "Review the authentication middleware and check for security issues in the codebase';
     await tracker.handleEvent({
       type: 'content_block_delta',
       index: 0,
-      delta: { type: 'input_json_delta', partial_json: bigChunk },
+      delta: { type: 'input_json_delta', partial_json: chunk1 },
+    } as StreamInnerEvent);
+    // Second chunk: push past 200 chars to hit % 200 <= 50 window
+    const needed = 200 - chunk1.length + 10; // land at ~210, 210 % 200 = 10 <= 50
+    await tracker.handleEvent({
+      type: 'content_block_delta',
+      index: 0,
+      delta: { type: 'input_json_delta', partial_json: 'x'.repeat(needed) },
     } as StreamInnerEvent);
 
-    // The edit should contain the input preview
+    // The edit should contain extracted summary, not raw JSON
     const editsForAgent = sender.edits.filter(e => e.messageId === 100);
     expect(editsForAgent.length).toBeGreaterThanOrEqual(1);
     expect(editsForAgent[0].text).toContain('<code>dispatch_agent</code>');
+    expect(editsForAgent[0].text).toContain('Review the authentication');
+    expect(editsForAgent[0].text).not.toContain('"prompt"'); // Should not show raw JSON keys
   });
 
   it('ignores text block events', async () => {

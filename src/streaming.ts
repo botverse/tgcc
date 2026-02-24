@@ -288,35 +288,38 @@ export class StreamAccumulator {
     }
   }
 
-  /** Build the full message text including thinking blockquote prefix and usage footer */
-  private buildFullText(includeSuffix = false): string {
+  /** Build the full message text including thinking blockquote prefix and usage footer.
+   *  Returns { text, hasHtmlSuffix } — caller must pass rawHtml=true when hasHtmlSuffix is set
+   *  because the footer contains pre-formatted HTML (<i> tags).
+   */
+  private buildFullText(includeSuffix = false): { text: string; hasHtmlSuffix: boolean } {
     let text = '';
     if (this.thinkingBuffer) {
-      // Truncate thinking to 1024 chars max for the expandable blockquote
       const thinkingPreview = this.thinkingBuffer.length > 1024
         ? this.thinkingBuffer.slice(0, 1024) + '…'
         : this.thinkingBuffer;
       text += `<blockquote expandable>💭 Thinking\n${escapeHtml(thinkingPreview)}</blockquote>\n`;
     }
-    text += this.buffer;
+    // Convert markdown buffer to HTML-safe text
+    text += makeHtmlSafe(this.buffer);
     if (includeSuffix && this.turnUsage) {
       text += '\n' + formatUsageFooter(this.turnUsage);
     }
-    return text;
+    return { text, hasHtmlSuffix: includeSuffix && !!this.turnUsage };
   }
 
   private async doEdit(): Promise<void> {
     if (!this.buffer) return;
 
-    const fullText = this.buildFullText();
+    const { text, hasHtmlSuffix } = this.buildFullText();
 
     // Check if we need to split
-    if (fullText.length > this.splitThreshold) {
+    if (text.length > this.splitThreshold) {
       await this.splitMessage();
       return;
     }
 
-    await this.sendOrEdit(fullText);
+    await this.sendOrEdit(text, true); // buildFullText already does makeHtmlSafe
   }
 
   private async splitMessage(): Promise<void> {
@@ -326,14 +329,14 @@ export class StreamAccumulator {
     const remainder = this.buffer.slice(splitAt);
 
     // Finalize current message with first part
-    await this.sendOrEdit(firstPart);
+    await this.sendOrEdit(makeHtmlSafe(firstPart), true);
 
     // Start a new message for remainder
     this.tgMessageId = null;
     this.buffer = remainder;
 
     if (this.buffer) {
-      await this.sendOrEdit(this.buffer);
+      await this.sendOrEdit(makeHtmlSafe(this.buffer), true);
     }
   }
 
@@ -348,8 +351,8 @@ export class StreamAccumulator {
 
     if (this.buffer) {
       // Final edit with complete text including thinking blockquote and usage footer
-      const fullText = this.buildFullText(true);
-      await this.sendOrEdit(fullText);
+      const { text } = this.buildFullText(true);
+      await this.sendOrEdit(text, true); // buildFullText already does makeHtmlSafe
     } else if (this.thinkingBuffer && this.thinkingIndicatorShown) {
       // Only thinking happened, no text — show thinking as expandable blockquote
       const thinkingPreview = this.thinkingBuffer.length > 1024
@@ -435,6 +438,30 @@ const SUB_AGENT_TOOL_PATTERNS = [/agent/i, /dispatch/i, /^task$/i];
 
 export function isSubAgentTool(toolName: string): boolean {
   return SUB_AGENT_TOOL_PATTERNS.some(p => p.test(toolName));
+}
+
+/** Extract a human-readable summary from partial/complete JSON tool input.
+ *  Looks for prompt, task, command, description fields — returns the first found, truncated.
+ */
+export function extractSubAgentSummary(jsonInput: string, maxLen = 150): string {
+  try {
+    const parsed = JSON.parse(jsonInput);
+    const value = parsed.prompt || parsed.task || parsed.command || parsed.description || parsed.message || '';
+    if (typeof value === 'string' && value.length > 0) {
+      return value.length > maxLen ? value.slice(0, maxLen) + '…' : value;
+    }
+  } catch {
+    // Partial JSON — try regex extraction for common patterns
+    for (const key of ['prompt', 'task', 'command', 'description', 'message']) {
+      const re = new RegExp(`"${key}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)`, 'i');
+      const m = jsonInput.match(re);
+      if (m?.[1]) {
+        const val = m[1].replace(/\\n/g, ' ').replace(/\\"/g, '"');
+        return val.length > maxLen ? val.slice(0, maxLen) + '…' : val;
+      }
+    }
+  }
+  return '';
 }
 
 // ── Sub-Agent Tracker ──
@@ -553,16 +580,16 @@ export class SubAgentTracker {
     // Throttle: only update when we have a reasonable chunk (every 200 chars)
     if (info.inputPreview.length % 200 > 50) return;
 
-    const preview = info.inputPreview.length > 300
-      ? info.inputPreview.slice(0, 300) + '…'
-      : info.inputPreview;
+    // Try to extract a human-readable summary from the JSON input
+    const summary = extractSubAgentSummary(info.inputPreview);
+    if (!summary) return; // Don't update until we have something meaningful
 
     this.sendQueue = this.sendQueue.then(async () => {
       try {
         await this.sender.editMessage(
           this.chatId,
           info.tgMessageId!,
-          `🔄 Sub-agent: <code>${escapeHtml(info.toolName)}</code>\n\n<pre>${escapeHtml(preview)}</pre>`,
+          `🔄 Sub-agent: <code>${escapeHtml(info.toolName)}</code>\n<i>${escapeHtml(summary)}</i>`,
           'HTML',
         );
       } catch {
@@ -581,19 +608,8 @@ export class SubAgentTracker {
 
     info.status = 'completed';
 
-    // Extract a summary from the input preview (first ~100 chars)
-    let summary = '';
-    try {
-      const parsed = JSON.parse(info.inputPreview);
-      // Common patterns: { prompt: "..." }, { task: "..." }, { command: "..." }
-      summary = parsed.prompt || parsed.task || parsed.command || parsed.description || '';
-      if (typeof summary === 'string' && summary.length > 100) {
-        summary = summary.slice(0, 100) + '…';
-      }
-    } catch {
-      summary = info.inputPreview.slice(0, 100);
-      if (info.inputPreview.length > 100) summary += '…';
-    }
+    // Extract a human-readable summary from the tool input
+    const summary = extractSubAgentSummary(info.inputPreview, 100);
 
     const text = summary
       ? `✅ Sub-agent completed: <code>${escapeHtml(info.toolName)}</code>\n<i>${escapeHtml(summary)}</i>`
