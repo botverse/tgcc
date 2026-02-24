@@ -692,6 +692,13 @@ export class SubAgentTracker {
   }
 
   /** Handle a tool_result event — marks the sub-agent as completed with collapsible result */
+  /** Set agent metadata from structured tool_use_result */
+  setAgentMetadata(toolUseId: string, meta: { agentName?: string; agentType?: string; color?: string }): void {
+    const info = this.agents.get(toolUseId);
+    if (!info) return;
+    if (meta.agentName) info.agentName = meta.agentName;
+  }
+
   /** Mark an agent as completed externally (e.g. from bridge follow-up) */
   markCompleted(toolUseId: string, _reason: string): void {
     const info = this.agents.get(toolUseId);

@@ -249,20 +249,6 @@ export class CCProcess extends EventEmitter {
     const event = parseCCOutputLine(line);
     if (!event) return;
 
-    // Log ALL events for debugging
-    const extra: Record<string, unknown> = { subtype: (event as { subtype?: string }).subtype };
-    if (event.type === 'user' || event.type === 'tool_result') {
-      extra.contentPreview = JSON.stringify(event).slice(0, 300);
-    }
-    if (event.type === 'stream_event') {
-      const inner = (event as { event?: { type?: string } }).event;
-      extra.innerType = inner?.type;
-    }
-    if (event.type === 'assistant') {
-      extra.contentPreview = JSON.stringify(event).slice(0, 400);
-    }
-    this.logger.debug({ eventType: event.type, ...extra }, 'CC event');
-
     // Reset hang timer on any output
     this.resetHangTimer();
 
@@ -289,6 +275,7 @@ export class CCProcess extends EventEmitter {
 
       case 'user':
         // User messages can contain tool_result content blocks (sub-agent results)
+        // The raw event also has a top-level `tool_use_result` with rich structured data
         if (event.message?.content) {
           for (const block of event.message.content) {
             if (block.type === 'tool_result' && block.tool_use_id) {
@@ -301,6 +288,8 @@ export class CCProcess extends EventEmitter {
                 type: 'tool_result' as const,
                 tool_use_id: block.tool_use_id,
                 content: resultText,
+                // Forward the rich structured metadata if present
+                tool_use_result: (event as { tool_use_result?: Record<string, unknown> }).tool_use_result,
               });
             }
           }

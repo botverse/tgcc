@@ -196,6 +196,18 @@ export interface ToolResultEvent {
   type: 'tool_result';
   tool_use_id: string;
   content: string;
+  /** Rich structured metadata from CC's tool_use_result field (teammate_spawned, etc.) */
+  tool_use_result?: {
+    status?: string;
+    name?: string;
+    agent_id?: string;
+    agent_type?: string;
+    color?: string;
+    team_name?: string;
+    prompt?: string;
+    teammate_id?: string;
+    [key: string]: unknown;
+  };
 }
 
 export interface ResultEvent {
@@ -362,10 +374,6 @@ export function parseCCOutputLine(line: string): CCOutputEvent | null {
       case 'control_request':
         return parsed as CCOutputEvent;
       default:
-        // Log unknown event types for discovery
-        if (typeof parsed.type === 'string') {
-          console.log(`[CC-RAW] Unknown event type: ${parsed.type}`, JSON.stringify(parsed).slice(0, 200));
-        }
         return null;
     }
   } catch {

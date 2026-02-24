@@ -486,14 +486,13 @@ export class Bridge extends EventEmitter implements CtlHandler {
       if (!tracker) return;
 
       const resultText = typeof event.content === 'string' ? event.content : JSON.stringify(event.content);
+      const meta = event.tool_use_result;
 
-      // Try to extract team name from sub-agent spawn confirmation
-      if (!tracker.currentTeamName) {
-        const teamMatch = resultText.match(/agent_id:\s*\S+@(\S+)/);
-        if (teamMatch) {
-          const teamName = teamMatch[1];
-          this.logger.info({ agentId, teamName }, 'Extracted team name from tool_result');
-          tracker.setTeamName(teamName);
+      // Use structured metadata for deterministic spawn detection
+      if (meta?.status === 'teammate_spawned' && meta.team_name) {
+        if (!tracker.currentTeamName) {
+          this.logger.info({ agentId, teamName: meta.team_name, agentName: meta.name, agentType: meta.agent_type }, 'Spawn detected via tool_use_result');
+          tracker.setTeamName(meta.team_name);
 
           // Wire the "all agents reported" callback to send follow-up to CC
           tracker.setOnAllReported(() => {
@@ -504,14 +503,19 @@ export class Bridge extends EventEmitter implements CtlHandler {
               ));
             }
           });
+        }
 
-          // Don't start watching here — wait until after handleToolResult
-          // sets agent names (needed for mailbox message matching)
-          
+        // Set agent metadata from structured data (more reliable than regex)
+        if (event.tool_use_id && meta.name) {
+          tracker.setAgentMetadata(event.tool_use_id, {
+            agentName: meta.name,
+            agentType: meta.agent_type,
+            color: meta.color,
+          });
         }
       }
 
-      // Handle tool result FIRST (sets agentName for mailbox matching)
+      // Handle tool result (sets status, edits TG message)
       if (event.tool_use_id) {
         tracker.handleToolResult(event.tool_use_id, resultText);
       }
