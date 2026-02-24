@@ -60,9 +60,9 @@ export function serializeMessage(msg: UserMessage): string {
   return JSON.stringify(msg);
 }
 
-// ── Control request/response (SDK initialize handshake) ──
+// ── Control request/response (SDK initialize handshake + permissions) ──
 
-export interface ControlRequest {
+export interface ControlRequestInitialize {
   type: 'control_request';
   request_id: string;
   request: {
@@ -70,20 +70,75 @@ export interface ControlRequest {
   };
 }
 
+export interface PermissionRequest {
+  type: 'control_request';
+  request_id: string;
+  request: {
+    subtype: 'can_use_tool';
+    tool_name: string;
+    input: Record<string, unknown>;
+    tool_use_id: string;
+    agent_id?: string;
+    permission_suggestions?: unknown[];
+    blocked_path?: string;
+    decision_reason?: string;
+  };
+}
+
+export type ControlRequest = ControlRequestInitialize | PermissionRequest;
+
 export interface ControlResponse {
   type: 'control_response';
-  request_id: string;
+  request_id?: string;
   response: {
     subtype: 'success' | 'error';
+    request_id?: string;
+    response?: {
+      behavior: 'allow' | 'deny';
+      updatedInput?: Record<string, unknown>;
+      message?: string;
+    };
+    error?: string;
     [key: string]: unknown;
   };
 }
 
-export function createInitializeRequest(): ControlRequest {
+export function createInitializeRequest(): ControlRequestInitialize {
   return {
     type: 'control_request',
     request_id: uuidv4(),
     request: { subtype: 'initialize' },
+  };
+}
+
+export function createPermissionResponse(
+  requestId: string,
+  allowed: boolean,
+  updatedInput?: Record<string, unknown>,
+): ControlResponse {
+  if (allowed) {
+    return {
+      type: 'control_response',
+      response: {
+        subtype: 'success',
+        request_id: requestId,
+        response: {
+          behavior: 'allow',
+          updatedInput,
+        },
+      },
+    };
+  }
+  return {
+    type: 'control_response',
+    response: {
+      subtype: 'success',
+      request_id: requestId,
+      response: {
+        behavior: 'deny',
+        message: 'Denied by user via Telegram',
+      },
+    },
   };
 }
 
@@ -268,7 +323,8 @@ export type CCOutputEvent =
   | ResultEvent
   | StreamEvent
   | ControlResponse
-  | ApiErrorEvent;
+  | ApiErrorEvent
+  | PermissionRequest;
 
 // ── Parser ──
 
@@ -287,6 +343,7 @@ export function parseCCOutputLine(line: string): CCOutputEvent | null {
       case 'result':
       case 'stream_event':
       case 'control_response':
+      case 'control_request':
         return parsed as CCOutputEvent;
       default:
         return null;

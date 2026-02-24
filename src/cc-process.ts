@@ -9,9 +9,12 @@ import {
   type UserMessage,
   type StreamInnerEvent,
   type ApiErrorEvent,
+  type PermissionRequest,
+  type ControlResponse,
   parseCCOutputLine,
   serializeMessage,
   createInitializeRequest,
+  createPermissionResponse,
 } from './cc-protocol.js';
 import type { ResolvedUserConfig } from './config.js';
 
@@ -271,6 +274,12 @@ export class CCProcess extends EventEmitter {
         this.emit('stream_event', event.event);
         break;
 
+      case 'control_request':
+        if ((event as PermissionRequest).request?.subtype === 'can_use_tool') {
+          this.emit('permission_request', event as PermissionRequest);
+        }
+        break;
+
       case 'control_response':
         this.logger.info('Received control_response — CC initialized');
         if (this._state === 'spawning') {
@@ -435,6 +444,18 @@ export class CCProcess extends EventEmitter {
     }, 5000);
 
     this.process.once('exit', () => clearTimeout(forceTimer));
+  }
+
+  /** Respond to a permission request from CC */
+  respondToPermission(requestId: string, allowed: boolean): void {
+    if (!this.process?.stdin?.writable) {
+      this.logger.error('Cannot send permission response — stdin not writable');
+      return;
+    }
+    const resp = createPermissionResponse(requestId, allowed);
+    const line = JSON.stringify(resp) + '\n';
+    this.process.stdin.write(line);
+    this.logger.info({ requestId, allowed }, 'Sent permission response');
   }
 
   /** Send SIGINT to cancel current turn without killing process */

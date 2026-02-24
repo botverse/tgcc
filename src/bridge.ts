@@ -8,7 +8,7 @@ import type {
   AgentConfig,
   ConfigDiff,
 } from './config.js';
-import type { ApiErrorEvent } from './cc-protocol.js';
+import type { ApiErrorEvent, PermissionRequest } from './cc-protocol.js';
 import { resolveUserConfig, resolveRepoPath, updateConfig, isValidRepoName, findRepoOwner } from './config.js';
 import { CCProcess, generateMcpConfig } from './cc-process.js';
 import {
@@ -41,6 +41,13 @@ import {
 
 // ── Types ──
 
+interface PendingPermission {
+  requestId: string;
+  userId: string;
+  toolName: string;
+  input: Record<string, unknown>;
+}
+
 interface AgentInstance {
   id: string;
   config: AgentConfig;
@@ -50,6 +57,7 @@ interface AgentInstance {
   subAgentTrackers: Map<string, SubAgentTracker>; // `${userId}:${chatId}` → tracker
   batchers: Map<string, MessageBatcher>;   // userId → batcher
   pendingTitles: Map<string, string>;      // userId → first message text for session title
+  pendingPermissions: Map<string, PendingPermission>; // requestId → pending permission
 }
 
 // ── Message Batcher ──
@@ -194,6 +202,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
       subAgentTrackers: new Map(),
       batchers: new Map(),
       pendingTitles: new Map(),
+      pendingPermissions: new Map(),
     };
 
     this.agents.set(agentId, instance);
@@ -478,6 +487,36 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
     proc.on('result', (event: ResultEvent) => {
       this.handleResult(agentId, userId, chatId, event);
+    });
+
+    proc.on('permission_request', (event: PermissionRequest) => {
+      const req = event.request;
+      const requestId = event.request_id;
+
+      // Store pending permission
+      agent.pendingPermissions.set(requestId, {
+        requestId,
+        userId,
+        toolName: req.tool_name,
+        input: req.input,
+      });
+
+      // Build description of what CC wants to do
+      const toolName = escapeHtml(req.tool_name);
+      const inputPreview = req.input
+        ? escapeHtml(JSON.stringify(req.input).slice(0, 200))
+        : '';
+
+      const text = inputPreview
+        ? `🔐 CC wants to use <code>${toolName}</code>\n<pre>${inputPreview}</pre>`
+        : `🔐 CC wants to use <code>${toolName}</code>`;
+
+      const keyboard = new InlineKeyboard()
+        .text('✅ Allow', `perm_allow:${requestId}`)
+        .text('❌ Deny', `perm_deny:${requestId}`)
+        .text('✅ Allow All', `perm_allow_all:${userId}`);
+
+      agent.tgBot.sendTextWithKeyboard(chatId, text, keyboard, 'HTML');
     });
 
     proc.on('api_error', (event: ApiErrorEvent) => {
@@ -1072,6 +1111,59 @@ export class Bridge extends EventEmitter implements CtlHandler {
           '/repo clear — Clear this agent\'s default',
         ].join('\n');
         await agent.tgBot.sendText(query.chatId, helpText, 'HTML');
+        break;
+      }
+
+      case 'perm_allow': {
+        const requestId = query.data;
+        const pending = agent.pendingPermissions.get(requestId);
+        if (!pending) {
+          await agent.tgBot.answerCallbackQuery(query.callbackQueryId, 'Permission expired');
+          break;
+        }
+        const proc = agent.processes.get(pending.userId);
+        if (proc) {
+          proc.respondToPermission(requestId, true);
+        }
+        agent.pendingPermissions.delete(requestId);
+        await agent.tgBot.answerCallbackQuery(query.callbackQueryId, '✅ Allowed');
+        break;
+      }
+
+      case 'perm_deny': {
+        const requestId = query.data;
+        const pending = agent.pendingPermissions.get(requestId);
+        if (!pending) {
+          await agent.tgBot.answerCallbackQuery(query.callbackQueryId, 'Permission expired');
+          break;
+        }
+        const proc = agent.processes.get(pending.userId);
+        if (proc) {
+          proc.respondToPermission(requestId, false);
+        }
+        agent.pendingPermissions.delete(requestId);
+        await agent.tgBot.answerCallbackQuery(query.callbackQueryId, '❌ Denied');
+        break;
+      }
+
+      case 'perm_allow_all': {
+        // Allow all pending permissions for this user
+        const targetUserId = query.data;
+        const toAllow: string[] = [];
+        for (const [reqId, pending] of agent.pendingPermissions) {
+          if (pending.userId === targetUserId) {
+            toAllow.push(reqId);
+          }
+        }
+        const proc = agent.processes.get(targetUserId);
+        for (const reqId of toAllow) {
+          if (proc) proc.respondToPermission(reqId, true);
+          agent.pendingPermissions.delete(reqId);
+        }
+        await agent.tgBot.answerCallbackQuery(
+          query.callbackQueryId,
+          `✅ Allowed ${toAllow.length} permission(s)`,
+        );
         break;
       }
 

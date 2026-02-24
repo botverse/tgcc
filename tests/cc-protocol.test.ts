@@ -17,6 +17,8 @@ import {
   type StreamEvent,
   type ControlResponse,
   type ApiErrorEvent,
+  type PermissionRequest,
+  createPermissionResponse,
 } from '../src/cc-protocol.js';
 
 describe('cc-protocol input construction', () => {
@@ -250,6 +252,42 @@ describe('cc-protocol output parsing', () => {
     expect(event.type).toBe('control_response');
     expect(event.request_id).toBe('req-123');
     expect(event.response.subtype).toBe('success');
+  });
+});
+
+describe('cc-protocol permission request parsing', () => {
+  it('parses control_request with can_use_tool', () => {
+    const line = JSON.stringify({
+      type: 'control_request',
+      request_id: 'perm-123',
+      request: {
+        subtype: 'can_use_tool',
+        tool_name: 'Write',
+        input: { file_path: '/tmp/test.txt', content: 'hello' },
+        tool_use_id: 'toolu_1',
+      },
+    });
+    const event = parseCCOutputLine(line) as PermissionRequest;
+    expect(event).not.toBeNull();
+    expect(event.type).toBe('control_request');
+    expect(event.request.subtype).toBe('can_use_tool');
+    expect(event.request.tool_name).toBe('Write');
+    expect(event.request_id).toBe('perm-123');
+  });
+
+  it('creates allow permission response', () => {
+    const resp = createPermissionResponse('perm-123', true);
+    expect(resp.type).toBe('control_response');
+    expect(resp.response.subtype).toBe('success');
+    expect(resp.response.request_id).toBe('perm-123');
+    expect(resp.response.response?.behavior).toBe('allow');
+  });
+
+  it('creates deny permission response', () => {
+    const resp = createPermissionResponse('perm-123', false);
+    expect(resp.type).toBe('control_response');
+    expect(resp.response.response?.behavior).toBe('deny');
+    expect(resp.response.response?.message).toContain('Denied');
   });
 });
 
