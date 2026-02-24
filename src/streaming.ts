@@ -13,6 +13,14 @@ export interface TelegramSender {
   editMessage(chatId: number | string, messageId: number, text: string, parseMode?: string): Promise<void>;
 }
 
+export interface TurnUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+  costUsd: number | null;
+}
+
 export interface StreamAccumulatorOptions {
   chatId: number | string;
   sender: TelegramSender;
@@ -111,6 +119,7 @@ export class StreamAccumulator {
   private messageIds: number[] = []; // all message IDs sent during this turn
   private finished = false;
   private sendQueue: Promise<void> = Promise.resolve();
+  private turnUsage: TurnUsage | null = null;
 
   constructor(options: StreamAccumulatorOptions) {
     this.chatId = options.chatId;
@@ -120,6 +129,11 @@ export class StreamAccumulator {
   }
 
   get allMessageIds(): number[] { return [...this.messageIds]; }
+
+  /** Set usage stats for the current turn (called from bridge on result event) */
+  setTurnUsage(usage: TurnUsage): void {
+    this.turnUsage = usage;
+  }
 
   // ── Process stream events ──
 
@@ -248,8 +262,8 @@ export class StreamAccumulator {
     }
   }
 
-  /** Build the full message text including thinking blockquote prefix */
-  private buildFullText(): string {
+  /** Build the full message text including thinking blockquote prefix and usage footer */
+  private buildFullText(includeSuffix = false): string {
     let text = '';
     if (this.thinkingBuffer) {
       // Truncate thinking to 1024 chars max for the expandable blockquote
@@ -259,6 +273,9 @@ export class StreamAccumulator {
       text += `<blockquote expandable>💭 Thinking\n${escapeHtml(thinkingPreview)}</blockquote>\n`;
     }
     text += this.buffer;
+    if (includeSuffix && this.turnUsage) {
+      text += '\n' + formatUsageFooter(this.turnUsage);
+    }
     return text;
   }
 
@@ -304,8 +321,8 @@ export class StreamAccumulator {
     }
 
     if (this.buffer) {
-      // Final edit with complete text including thinking blockquote
-      const fullText = this.buildFullText();
+      // Final edit with complete text including thinking blockquote and usage footer
+      const fullText = this.buildFullText(true);
       await this.sendOrEdit(fullText);
     } else if (this.thinkingBuffer && this.thinkingIndicatorShown) {
       // Only thinking happened, no text — show thinking as expandable blockquote
@@ -328,6 +345,7 @@ export class StreamAccumulator {
     this.thinkingIndicatorShown = false;
     this.toolIndicators = [];
     this.finished = false;
+    this.turnUsage = null;
     if (this.editTimer) {
       clearTimeout(this.editTimer);
       this.editTimer = null;
@@ -364,6 +382,24 @@ function findSplitPoint(text: string, threshold: number): number {
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/** Format token count as human-readable: 1234 → "1.2k", 500 → "500" */
+function formatTokens(n: number): string {
+  if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
+  return String(n);
+}
+
+/** Format usage stats as an HTML italic footer line */
+export function formatUsageFooter(usage: TurnUsage): string {
+  const parts = [
+    `↩️ ${formatTokens(usage.inputTokens)} in`,
+    `${formatTokens(usage.outputTokens)} out`,
+  ];
+  if (usage.costUsd != null) {
+    parts.push(`$${usage.costUsd.toFixed(4)}`);
+  }
+  return `<i>${parts.join(' · ')}</i>`;
 }
 
 // ── Sub-agent detection patterns ──

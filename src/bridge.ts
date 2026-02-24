@@ -575,10 +575,20 @@ export class Bridge extends EventEmitter implements CtlHandler {
     const agent = this.agents.get(agentId);
     if (!agent) return;
 
-    // Finalize accumulator but keep it alive for multi-turn continuity
+    // Set usage stats on the accumulator before finalizing
     const accKey = `${userId}:${chatId}`;
     const acc = agent.accumulators.get(accKey);
     if (acc) {
+      // Extract usage from result event
+      if (event.usage) {
+        acc.setTurnUsage({
+          inputTokens: event.usage.input_tokens ?? 0,
+          outputTokens: event.usage.output_tokens ?? 0,
+          cacheReadTokens: event.usage.cache_read_input_tokens ?? 0,
+          cacheCreationTokens: event.usage.cache_creation_input_tokens ?? 0,
+          costUsd: event.total_cost_usd ?? null,
+        });
+      }
       acc.finalize();
       // Don't delete — next turn will softReset via message_start and edit the same message
     }
