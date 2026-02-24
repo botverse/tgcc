@@ -124,7 +124,12 @@ const HELP_TEXT = `*TGCC Commands*
 *Control*
 /cancel — Abort current CC turn
 /model <name> — Switch model
-/repo <path> — Switch working directory
+/repo — List repos (buttons)
+/repo help — Repo management commands
+/repo add <name> <path> — Register a repo
+/repo remove <name> — Unregister a repo
+/repo assign <name> — Set as agent default
+/repo clear — Clear agent default
 
 /help — This message`;
 
@@ -481,6 +486,19 @@ export class Bridge extends EventEmitter implements CtlHandler {
     this.logger.debug({ agentId, command: cmd.command, args: cmd.args }, 'Slash command');
 
     switch (cmd.command) {
+      case 'start': {
+        await agent.tgBot.sendText(
+          cmd.chatId,
+          '👋 TGCC — Telegram ↔ Claude Code bridge\n\nSend me a message to start a CC session, or use /help for commands.',
+        );
+        // Re-register commands with BotFather to ensure menu is up to date
+        try {
+          const { COMMANDS } = await import('./telegram.js');
+          await agent.tgBot.bot.api.setMyCommands(COMMANDS);
+        } catch {}
+        break;
+      }
+
       case 'help':
         await agent.tgBot.sendText(cmd.chatId, HELP_TEXT, 'Markdown');
         break;
@@ -604,6 +622,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
       case 'repo': {
         const repoArgs = cmd.args?.trim().split(/\s+/) ?? [];
         const repoSub = repoArgs[0];
+        this.logger.debug({ repoSub, repoArgs, repos: Object.keys(this.config.repos), hasArgs: !!cmd.args, argsRaw: cmd.args }, '/repo command debug');
 
         if (repoSub === 'add') {
           // /repo add <name> <path>
@@ -691,6 +710,21 @@ export class Bridge extends EventEmitter implements CtlHandler {
           break;
         }
 
+        if (repoSub === 'help') {
+          const helpText = [
+            '*Repo Management*',
+            '',
+            '/repo — List repos (buttons)',
+            '/repo help — This help text',
+            '/repo add <name> <path> — Register a repo',
+            '/repo remove <name> — Unregister a repo',
+            '/repo assign <name> — Set as this agent\'s default',
+            '/repo clear — Clear this agent\'s default',
+          ].join('\n');
+          await agent.tgBot.sendText(cmd.chatId, helpText, 'Markdown');
+          break;
+        }
+
         if (repoSub === 'clear') {
           // /repo clear — clear THIS agent's default repo
           updateConfig((cfg) => {
@@ -716,10 +750,10 @@ export class Bridge extends EventEmitter implements CtlHandler {
             for (const [name] of repoEntries) {
               keyboard.text(name, `repo:${name}`).row();
             }
-            keyboard.text('➕ Add', 'repo_add:prompt').row();
+            keyboard.text('➕ Add', 'repo_add:prompt').text('❓ Help', 'repo_help:show').row();
             await agent.tgBot.sendTextWithKeyboard(
               cmd.chatId,
-              `Current repo: \`${current}\`\n\nSelect a repo:`,
+              `Current repo: \`${current}\`\n\nSelect a repo:\n\n_Type /repo help for management commands_`,
               keyboard,
               'Markdown',
             );
@@ -831,6 +865,22 @@ export class Bridge extends EventEmitter implements CtlHandler {
       case 'repo_add': {
         await agent.tgBot.answerCallbackQuery(query.callbackQueryId, 'Usage below');
         await agent.tgBot.sendText(query.chatId, 'Send: `/repo add <name> <path>`', 'Markdown');
+        break;
+      }
+
+      case 'repo_help': {
+        await agent.tgBot.answerCallbackQuery(query.callbackQueryId);
+        const helpText = [
+          '*Repo Management*',
+          '',
+          '/repo — List repos (buttons)',
+          '/repo help — This help text',
+          '/repo add <name> <path> — Register a repo',
+          '/repo remove <name> — Unregister a repo',
+          '/repo assign <name> — Set as this agent\'s default',
+          '/repo clear — Clear this agent\'s default',
+        ].join('\n');
+        await agent.tgBot.sendText(query.chatId, helpText, 'Markdown');
         break;
       }
 

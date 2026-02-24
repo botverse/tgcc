@@ -39,7 +39,8 @@ export type CallbackHandler = (query: CallbackQuery) => void;
 
 // ── Slash command definitions ──
 
-const COMMANDS = [
+export const COMMANDS = [
+  { command: 'start', description: 'Welcome message & register commands' },
   { command: 'new', description: 'Start a fresh session' },
   { command: 'sessions', description: 'List recent sessions' },
   { command: 'resume', description: 'Resume a session by ID' },
@@ -49,7 +50,7 @@ const COMMANDS = [
   { command: 'catchup', description: 'Summarize external CC activity' },
   { command: 'cancel', description: 'Abort current CC turn' },
   { command: 'model', description: 'Switch model' },
-  { command: 'repo', description: 'Switch working directory' },
+  { command: 'repo', description: 'Manage repos & switch working directory' },
   { command: 'ping', description: 'Quick liveness check' },
   { command: 'help', description: 'List all commands' },
 ];
