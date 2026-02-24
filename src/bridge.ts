@@ -488,11 +488,22 @@ export class Bridge extends EventEmitter implements CtlHandler {
       const resultText = typeof event.content === 'string' ? event.content : JSON.stringify(event.content);
       const meta = event.tool_use_result;
 
-      // Use structured metadata for deterministic spawn detection
-      if (meta?.status === 'teammate_spawned' && meta.team_name) {
+      // Also detect spawn from text (fallback when tool_use_result is missing)
+      const isSpawnText = !meta && /agent_id:\s*\S+@\S+/.test(resultText);
+      const textMeta = isSpawnText ? {
+        status: 'teammate_spawned' as const,
+        team_name: resultText.match(/team_name:\s*(\S+)/)?.[1],
+        name: resultText.match(/^name:\s*(\S+)/m)?.[1],
+        agent_type: undefined as string | undefined,
+        color: undefined as string | undefined,
+      } : undefined;
+
+      const spawnMeta = meta?.status === 'teammate_spawned' ? meta : textMeta;
+
+      if (spawnMeta?.status === 'teammate_spawned' && spawnMeta.team_name) {
         if (!tracker.currentTeamName) {
-          this.logger.info({ agentId, teamName: meta.team_name, agentName: meta.name, agentType: meta.agent_type }, 'Spawn detected via tool_use_result');
-          tracker.setTeamName(meta.team_name);
+          this.logger.info({ agentId, teamName: spawnMeta.team_name, agentName: spawnMeta.name, agentType: spawnMeta.agent_type }, 'Spawn detected');
+          tracker.setTeamName(spawnMeta.team_name!);
 
           // Wire the "all agents reported" callback to send follow-up to CC
           tracker.setOnAllReported(() => {
@@ -505,12 +516,12 @@ export class Bridge extends EventEmitter implements CtlHandler {
           });
         }
 
-        // Set agent metadata from structured data (more reliable than regex)
-        if (event.tool_use_id && meta.name) {
+        // Set agent metadata from structured data or text fallback
+        if (event.tool_use_id && spawnMeta.name) {
           tracker.setAgentMetadata(event.tool_use_id, {
-            agentName: meta.name,
-            agentType: meta.agent_type,
-            color: meta.color,
+            agentName: spawnMeta.name,
+            agentType: spawnMeta.agent_type,
+            color: spawnMeta.color,
           });
         }
       }
