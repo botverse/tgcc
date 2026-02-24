@@ -5,7 +5,7 @@ import { existsSync, readdirSync, readFileSync, writeFileSync, mkdirSync } from 
 import { join, dirname, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import type { CtlRequest, CtlResponse } from './ctl-server.js';
-import { loadConfig, agentForRepo, CONFIG_PATH, type TgccConfig } from './config.js';
+import { loadConfig, agentForRepo, CONFIG_PATH, updateConfig, isValidRepoName, findRepoOwner, type TgccConfig } from './config.js';
 
 const CTL_DIR = '/tmp/tgcc/ctl';
 
@@ -386,6 +386,194 @@ function cmdAgent(args: string[]): void {
   }
 }
 
+// ── Repo management commands ──
+
+function cmdRepoList(): void {
+  const raw = readRawConfig();
+  const repos = (raw.repos ?? {}) as Record<string, string>;
+
+  const entries = Object.entries(repos);
+  if (entries.length === 0) {
+    console.log('No repos registered.');
+    return;
+  }
+
+  for (const [name, path] of entries) {
+    const owner = findRepoOwner(raw, name);
+    console.log(`${name}:`);
+    console.log(`  Path: ${path}`);
+    console.log(`  Agent: ${owner ?? 'unassigned'}`);
+  }
+}
+
+function cmdRepoAdd(args: string[]): void {
+  const name = args[0];
+  const repoPath = args[1];
+
+  if (!name || !repoPath) {
+    console.error('Usage: tgcc repo add <name> <path>');
+    process.exit(1);
+  }
+
+  if (!isValidRepoName(name)) {
+    console.error('Invalid repo name. Use alphanumeric + hyphens only (must start with alphanumeric).');
+    process.exit(1);
+  }
+
+  if (!existsSync(repoPath)) {
+    console.error(`Path not found: ${repoPath}`);
+    process.exit(1);
+  }
+
+  const raw = readRawConfig();
+  const repos = (raw.repos ?? {}) as Record<string, string>;
+  if (repos[name]) {
+    console.error(`Repo "${name}" already exists.`);
+    process.exit(1);
+  }
+
+  const absPath = resolve(repoPath);
+  updateConfig((cfg) => {
+    const r = (cfg.repos ?? {}) as Record<string, string>;
+    r[name] = absPath;
+    cfg.repos = r;
+  });
+
+  console.log(`Repo "${name}" added → ${absPath}`);
+}
+
+function cmdRepoRemove(args: string[]): void {
+  const name = args[0];
+  if (!name) {
+    console.error('Usage: tgcc repo remove <name>');
+    process.exit(1);
+  }
+
+  const raw = readRawConfig();
+  const repos = (raw.repos ?? {}) as Record<string, string>;
+  if (!repos[name]) {
+    console.error(`Repo "${name}" not found.`);
+    process.exit(1);
+  }
+
+  const owner = findRepoOwner(raw, name);
+  if (owner) {
+    console.error(`Can't remove: repo "${name}" is assigned to agent "${owner}". Use "tgcc repo clear ${owner}" first.`);
+    process.exit(1);
+  }
+
+  updateConfig((cfg) => {
+    const r = (cfg.repos ?? {}) as Record<string, string>;
+    delete r[name];
+    cfg.repos = r;
+  });
+
+  console.log(`Repo "${name}" removed.`);
+}
+
+function cmdRepoAssign(args: string[]): void {
+  const agentName = args[0];
+  const repoName = args[1];
+
+  if (!agentName || !repoName) {
+    console.error('Usage: tgcc repo assign <agent> <name>');
+    process.exit(1);
+  }
+
+  const raw = readRawConfig();
+  const repos = (raw.repos ?? {}) as Record<string, string>;
+  const agents = (raw.agents ?? {}) as Record<string, Record<string, unknown>>;
+
+  if (!repos[repoName]) {
+    console.error(`Repo "${repoName}" not found in registry.`);
+    process.exit(1);
+  }
+
+  if (!agents[agentName]) {
+    console.error(`Agent "${agentName}" not found.`);
+    process.exit(1);
+  }
+
+  const existingOwner = findRepoOwner(raw, repoName);
+  if (existingOwner && existingOwner !== agentName) {
+    console.error(`Repo "${repoName}" is already assigned to agent "${existingOwner}".`);
+    process.exit(1);
+  }
+
+  updateConfig((cfg) => {
+    const a = (cfg.agents ?? {}) as Record<string, Record<string, unknown>>;
+    const agentCfg = a[agentName];
+    if (agentCfg) {
+      const defaults = (agentCfg.defaults ?? {}) as Record<string, unknown>;
+      defaults.repo = repoName;
+      agentCfg.defaults = defaults;
+    }
+  });
+
+  console.log(`Repo "${repoName}" assigned to agent "${agentName}".`);
+}
+
+function cmdRepoClear(args: string[]): void {
+  const agentName = args[0];
+  if (!agentName) {
+    console.error('Usage: tgcc repo clear <agent>');
+    process.exit(1);
+  }
+
+  const raw = readRawConfig();
+  const agents = (raw.agents ?? {}) as Record<string, Record<string, unknown>>;
+  if (!agents[agentName]) {
+    console.error(`Agent "${agentName}" not found.`);
+    process.exit(1);
+  }
+
+  updateConfig((cfg) => {
+    const a = (cfg.agents ?? {}) as Record<string, Record<string, unknown>>;
+    const agentCfg = a[agentName];
+    if (agentCfg) {
+      const defaults = (agentCfg.defaults ?? {}) as Record<string, unknown>;
+      delete defaults.repo;
+      agentCfg.defaults = defaults;
+    }
+  });
+
+  console.log(`Default repo cleared for agent "${agentName}".`);
+}
+
+function cmdRepo(args: string[]): void {
+  const subcommand = args[0];
+
+  switch (subcommand) {
+    case 'add':
+      cmdRepoAdd(args.slice(1));
+      break;
+    case 'remove':
+    case 'rm':
+      cmdRepoRemove(args.slice(1));
+      break;
+    case 'assign':
+      cmdRepoAssign(args.slice(1));
+      break;
+    case 'clear':
+      cmdRepoClear(args.slice(1));
+      break;
+    case undefined:
+    case 'list':
+    case 'ls':
+      cmdRepoList();
+      break;
+    default:
+      console.error('Usage: tgcc repo [add|remove|assign|clear|list]');
+      console.error('');
+      console.error('  (no args)                  List all repos');
+      console.error('  add <name> <path>          Register a repo');
+      console.error('  remove <name>              Remove a repo');
+      console.error('  assign <agent> <name>      Set agent default repo');
+      console.error('  clear <agent>              Clear agent default repo');
+      process.exit(1);
+  }
+}
+
 // ── Main ──
 
 async function main(): Promise<void> {
@@ -404,6 +592,10 @@ async function main(): Promise<void> {
 
     case 'agent':
       cmdAgent(args.slice(1));
+      break;
+
+    case 'repo':
+      cmdRepo(args.slice(1));
       break;
 
     case 'help':
@@ -430,12 +622,14 @@ Usage:
   tgcc message [--agent <name>] [--session <id>] "your message"
   tgcc status [--agent <name>]
   tgcc agent add|remove|list|repo
+  tgcc repo [add|remove|assign|clear|list]
   tgcc help
 
 Commands:
   message   Send a message to a running agent
   status    Show running agents and active sessions
   agent     Manage agent registrations
+  repo      Manage repo registry
   help      Show this help message
 
 Options:

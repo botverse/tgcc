@@ -1,5 +1,6 @@
 import { join } from 'node:path';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { EventEmitter } from 'node:events';
 import pino from 'pino';
 import type {
@@ -7,7 +8,7 @@ import type {
   AgentConfig,
   ConfigDiff,
 } from './config.js';
-import { resolveUserConfig, resolveRepoPath } from './config.js';
+import { resolveUserConfig, resolveRepoPath, updateConfig, isValidRepoName, findRepoOwner } from './config.js';
 import { CCProcess, generateMcpConfig } from './cc-process.js';
 import {
   createTextMessage,
@@ -601,6 +602,110 @@ export class Bridge extends EventEmitter implements CtlHandler {
       }
 
       case 'repo': {
+        const repoArgs = cmd.args?.trim().split(/\s+/) ?? [];
+        const repoSub = repoArgs[0];
+
+        if (repoSub === 'add') {
+          // /repo add <name> <path>
+          const repoName = repoArgs[1];
+          const repoAddPath = repoArgs[2];
+          if (!repoName || !repoAddPath) {
+            await agent.tgBot.sendText(cmd.chatId, 'Usage: /repo add <name> <path>');
+            break;
+          }
+          if (!isValidRepoName(repoName)) {
+            await agent.tgBot.sendText(cmd.chatId, 'Invalid repo name. Use alphanumeric + hyphens only.');
+            break;
+          }
+          if (!existsSync(repoAddPath)) {
+            await agent.tgBot.sendText(cmd.chatId, `Path not found: ${repoAddPath}`);
+            break;
+          }
+          if (this.config.repos[repoName]) {
+            await agent.tgBot.sendText(cmd.chatId, `Repo "${repoName}" already exists.`);
+            break;
+          }
+          updateConfig((cfg) => {
+            const repos = (cfg.repos ?? {}) as Record<string, string>;
+            repos[repoName] = repoAddPath;
+            cfg.repos = repos;
+          });
+          await agent.tgBot.sendText(cmd.chatId, `Repo \`${repoName}\` added → ${repoAddPath}`, 'Markdown');
+          break;
+        }
+
+        if (repoSub === 'remove') {
+          // /repo remove <name>
+          const repoName = repoArgs[1];
+          if (!repoName) {
+            await agent.tgBot.sendText(cmd.chatId, 'Usage: /repo remove <name>');
+            break;
+          }
+          if (!this.config.repos[repoName]) {
+            await agent.tgBot.sendText(cmd.chatId, `Repo "${repoName}" not found.`);
+            break;
+          }
+          // Check if any agent has it assigned
+          const rawCfg = JSON.parse(readFileSync(join(homedir(), '.tgcc', 'config.json'), 'utf-8'));
+          const owner = findRepoOwner(rawCfg, repoName);
+          if (owner) {
+            await agent.tgBot.sendText(cmd.chatId, `Can't remove: repo "${repoName}" is assigned to agent "${owner}". Use /repo clear on that agent first.`);
+            break;
+          }
+          updateConfig((cfg) => {
+            const repos = (cfg.repos ?? {}) as Record<string, string>;
+            delete repos[repoName];
+            cfg.repos = repos;
+          });
+          await agent.tgBot.sendText(cmd.chatId, `Repo \`${repoName}\` removed.`, 'Markdown');
+          break;
+        }
+
+        if (repoSub === 'assign') {
+          // /repo assign <name> — assign to THIS agent
+          const repoName = repoArgs[1];
+          if (!repoName) {
+            await agent.tgBot.sendText(cmd.chatId, 'Usage: /repo assign <name>');
+            break;
+          }
+          if (!this.config.repos[repoName]) {
+            await agent.tgBot.sendText(cmd.chatId, `Repo "${repoName}" not found in registry.`);
+            break;
+          }
+          const rawCfg2 = JSON.parse(readFileSync(join(homedir(), '.tgcc', 'config.json'), 'utf-8'));
+          const existingOwner = findRepoOwner(rawCfg2, repoName);
+          if (existingOwner && existingOwner !== agentId) {
+            await agent.tgBot.sendText(cmd.chatId, `Repo "${repoName}" is already assigned to agent "${existingOwner}".`);
+            break;
+          }
+          updateConfig((cfg) => {
+            const agents = (cfg.agents ?? {}) as Record<string, Record<string, unknown>>;
+            const agentCfg = agents[agentId];
+            if (agentCfg) {
+              const defaults = (agentCfg.defaults ?? {}) as Record<string, unknown>;
+              defaults.repo = repoName;
+              agentCfg.defaults = defaults;
+            }
+          });
+          await agent.tgBot.sendText(cmd.chatId, `Repo \`${repoName}\` assigned to agent \`${agentId}\`.`, 'Markdown');
+          break;
+        }
+
+        if (repoSub === 'clear') {
+          // /repo clear — clear THIS agent's default repo
+          updateConfig((cfg) => {
+            const agents = (cfg.agents ?? {}) as Record<string, Record<string, unknown>>;
+            const agentCfg = agents[agentId];
+            if (agentCfg) {
+              const defaults = (agentCfg.defaults ?? {}) as Record<string, unknown>;
+              delete defaults.repo;
+              agentCfg.defaults = defaults;
+            }
+          });
+          await agent.tgBot.sendText(cmd.chatId, `Default repo cleared for agent \`${agentId}\`.`, 'Markdown');
+          break;
+        }
+
         if (!cmd.args) {
           const current = this.sessionStore.getUser(agentId, cmd.userId).repo
             || resolveUserConfig(agent.config, cmd.userId).repo;
@@ -611,6 +716,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
             for (const [name] of repoEntries) {
               keyboard.text(name, `repo:${name}`).row();
             }
+            keyboard.text('➕ Add', 'repo_add:prompt').row();
             await agent.tgBot.sendTextWithKeyboard(
               cmd.chatId,
               `Current repo: \`${current}\`\n\nSelect a repo:`,
@@ -622,7 +728,8 @@ export class Bridge extends EventEmitter implements CtlHandler {
           }
           break;
         }
-        // Resolve repo name from registry, or use as direct path
+
+        // Fallback: /repo <path-or-name> — switch working directory for session
         const repoPath = resolveRepoPath(this.config.repos, cmd.args.trim());
         if (!existsSync(repoPath)) {
           await agent.tgBot.sendText(cmd.chatId, `Path not found: ${repoPath}`);
@@ -718,6 +825,12 @@ export class Bridge extends EventEmitter implements CtlHandler {
         this.sessionStore.clearSession(agentId, query.userId);
         await agent.tgBot.answerCallbackQuery(query.callbackQueryId, `Repo: ${repoName}`);
         await agent.tgBot.sendText(query.chatId, `Repo set to \`${repoPath}\`. Session cleared.`, 'Markdown');
+        break;
+      }
+
+      case 'repo_add': {
+        await agent.tgBot.answerCallbackQuery(query.callbackQueryId, 'Usage below');
+        await agent.tgBot.sendText(query.chatId, 'Send: `/repo add <name> <path>`', 'Markdown');
         break;
       }
 

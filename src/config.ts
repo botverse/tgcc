@@ -1,6 +1,6 @@
-import { readFileSync, watchFile, unwatchFile, existsSync, mkdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, watchFile, unwatchFile, existsSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import { EventEmitter } from 'node:events';
 import pino from 'pino';
 
@@ -222,6 +222,44 @@ export function agentForRepo(config: TgccConfig, repoPath: string): string | nul
     }
   }
   return null;
+}
+
+// ── Repo name validation ──
+
+const REPO_NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9-]*$/;
+
+export function isValidRepoName(name: string): boolean {
+  return REPO_NAME_RE.test(name);
+}
+
+/** Find which agent "owns" a repo key (has it as defaults.repo in the raw config). */
+export function findRepoOwner(rawConfig: Record<string, unknown>, repoKey: string): string | null {
+  const agents = (rawConfig.agents ?? {}) as Record<string, Record<string, unknown>>;
+  for (const [agentId, agent] of Object.entries(agents)) {
+    const defaults = (agent.defaults ?? {}) as Record<string, unknown>;
+    if (defaults.repo === repoKey) return agentId;
+  }
+  return null;
+}
+
+// ── Config mutation helper ──
+
+/**
+ * Read config, apply a mutator, write back.
+ * The file watcher handles hot-reload automatically.
+ */
+export function updateConfig(mutator: (config: Record<string, unknown>) => void): void {
+  const dir = dirname(CONFIG_PATH);
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+
+  let raw: Record<string, unknown> = {};
+  if (existsSync(CONFIG_PATH)) {
+    raw = JSON.parse(readFileSync(CONFIG_PATH, 'utf-8'));
+  }
+
+  mutator(raw);
+
+  writeFileSync(CONFIG_PATH, JSON.stringify(raw, null, 2) + '\n');
 }
 
 // ── Config loading and watching ──
