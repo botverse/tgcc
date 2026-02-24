@@ -16,7 +16,25 @@ import {
   createInitializeRequest,
   createPermissionResponse,
 } from './cc-protocol.js';
-import type { ResolvedUserConfig } from './config.js';
+
+// ── Inline config types (decoupled from ./config for library use) ──
+
+export interface CCUserConfig {
+  model: string;
+  repo: string;
+  maxTurns: number;
+  idleTimeoutMs: number;
+  hangTimeoutMs: number;
+  permissionMode: 'default' | 'plan' | 'acceptEdits' | 'dangerously-skip';
+}
+
+// ── Noop logger for library use when no pino logger is provided ──
+
+const noopFn = () => {};
+const noopLogger = {
+  info: noopFn, warn: noopFn, error: noopFn, debug: noopFn, trace: noopFn, fatal: noopFn,
+  child: () => noopLogger,
+};
 
 // ── Types ──
 
@@ -42,11 +60,11 @@ export interface CCProcessOptions {
   agentId: string;
   userId: string;
   ccBinaryPath: string;
-  userConfig: ResolvedUserConfig;
+  userConfig: CCUserConfig;
   mcpConfigPath?: string;
   sessionId?: string;
   continueSession: boolean;
-  logger: pino.Logger;
+  logger?: pino.Logger;
 }
 
 // ── MCP config generation ──
@@ -103,7 +121,9 @@ export class CCProcess extends EventEmitter {
     this.agentId = options.agentId;
     this.userId = options.userId;
     this.options = options;
-    this.logger = options.logger.child({ agentId: options.agentId, userId: options.userId });
+    this.logger = options.logger
+      ? options.logger.child({ agentId: options.agentId, userId: options.userId })
+      : noopLogger as unknown as pino.Logger;
   }
 
   get state(): ProcessState { return this._state; }

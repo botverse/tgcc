@@ -1,101 +1,99 @@
-import pino from 'pino';
-import { loadConfig, ensureDirectories, ConfigWatcher, CONFIG_PATH } from './config.js';
-import { Bridge } from './bridge.js';
+// ── @fonz/tgcc — Library exports ──
+//
+// This file is the public API surface for library consumers.
+// The standalone service entry point is in ./service.ts (invoked via CLI).
 
-async function main(): Promise<void> {
-  // ── Load config ──
-  const configPath = process.env.TGCC_CONFIG ?? CONFIG_PATH;
-  let config;
+// CC process lifecycle
+export {
+  CCProcess,
+  type CCProcessOptions,
+  type CCUserConfig,
+  type ProcessState,
+  type CCActivityState,
+  hasActiveChildren,
+  generateMcpConfig,
+} from './cc-process.js';
 
-  try {
-    config = loadConfig(configPath);
-  } catch (err) {
-    console.error(`Failed to load config from ${configPath}:`);
-    console.error(err instanceof Error ? err.message : err);
-    process.exit(1);
-  }
+// Protocol types and parsers
+export {
+  parseCCOutputLine,
+  createInitializeRequest,
+  createPermissionResponse,
+  createTextMessage,
+  createImageMessage,
+  createDocumentMessage,
+  serializeMessage,
+  extractAssistantText,
+  extractToolUses,
+  isStreamTextDelta,
+  isStreamThinkingDelta,
+  getStreamBlockType,
+  // Input types
+  type TextContent,
+  type ImageContent,
+  type ContentBlock,
+  type UserMessage,
+  // Control types
+  type ControlRequestInitialize,
+  type PermissionRequest,
+  type ControlRequest,
+  type ControlResponse,
+  // Output event types
+  type InitEvent,
+  type AssistantTextBlock,
+  type AssistantToolUseBlock,
+  type AssistantThinkingBlock,
+  type AssistantContentBlock,
+  type AssistantMessage,
+  type ToolResultEvent,
+  type ResultEvent,
+  type ApiErrorEvent,
+  type CCOutputEvent,
+  // Stream types
+  type StreamMessageStart,
+  type StreamContentBlockStart,
+  type StreamContentBlockStartText,
+  type StreamContentBlockStartThinking,
+  type StreamContentBlockStartToolUse,
+  type StreamTextDelta,
+  type StreamThinkingDelta,
+  type StreamInputJsonDelta,
+  type StreamContentBlockDelta,
+  type StreamContentBlockStop,
+  type StreamMessageStop,
+  type StreamInnerEvent,
+  type StreamEvent,
+} from './cc-protocol.js';
 
-  // ── Setup logger ──
-  const logger = pino({
-    level: config.global.logLevel,
-    transport: process.env.NODE_ENV !== 'production'
-      ? { target: 'pino/file', options: { destination: 1 } }
-      : undefined,
-  });
+// Session store
+export {
+  SessionStore,
+  getSessionJsonlPath,
+  findMissedSessions,
+  computeProjectSlug,
+  summarizeJsonlDelta,
+  formatCatchupMessage,
+  type SessionInfo,
+  type UserState,
+  type AgentState,
+  type StateStore,
+  type JsonlTracking,
+} from './session.js';
 
-  // ── Ensure directories ──
-  ensureDirectories(config);
-
-  // ── Startup self-test ──
-  logger.info({ configPath, agents: Object.keys(config.agents) }, 'TGCC starting');
-
-  // ── Create bridge ──
-  const bridge = new Bridge(config, logger);
-
-  // ── Config watcher (hot reload) ──
-  const watcher = new ConfigWatcher(config, configPath, logger);
-
-  watcher.on('change', async (newConfig, diff) => {
-    try {
-      await bridge.handleConfigChange(newConfig, diff);
-    } catch (err) {
-      logger.error({ err }, 'Failed to apply config change');
-    }
-  });
-
-  watcher.on('error', (err) => {
-    logger.error({ err }, 'Config watcher error');
-  });
-
-  // ── SIGHUP → manual reload ──
-  process.on('SIGHUP', () => {
-    logger.info('SIGHUP received — reloading config');
-    watcher.reload();
-  });
-
-  // ── Graceful shutdown ──
-  let shuttingDown = false;
-
-  async function shutdown(signal: string): Promise<void> {
-    if (shuttingDown) return;
-    shuttingDown = true;
-
-    logger.info({ signal }, 'Shutdown signal received');
-
-    // Stop watching config
-    watcher.stop();
-
-    // Stop bridge (stops all bots, kills all CC processes, closes MCP sockets)
-    try {
-      await bridge.stop();
-    } catch (err) {
-      logger.error({ err }, 'Error during bridge shutdown');
-    }
-
-    logger.info('Shutdown complete');
-    process.exit(0);
-  }
-
-  process.on('SIGTERM', () => shutdown('SIGTERM'));
-  process.on('SIGINT', () => shutdown('SIGINT'));
-
-  // Uncaught exceptions — log and continue (don't crash on TG errors)
-  process.on('uncaughtException', (err) => {
-    logger.error({ err }, 'Uncaught exception');
-  });
-
-  process.on('unhandledRejection', (reason) => {
-    logger.error({ reason }, 'Unhandled rejection');
-  });
-
-  // ── Start ──
-  await bridge.start();
-  watcher.start();
-
-  logger.info('TGCC is running');
-}
-
-main().catch((err) => {
-  console.error('Fatal error:', err);
-  process.exit(1);
-});
+// Streaming utilities
+export {
+  StreamAccumulator,
+  SubAgentTracker,
+  markdownToHtml,
+  makeHtmlSafe,
+  escapeHtml,
+  formatUsageFooter,
+  splitText,
+  isSubAgentTool,
+  type TelegramSender,
+  type TurnUsage,
+  type StreamAccumulatorOptions,
+  type SubAgentInfo,
+  type SubAgentSender,
+  type SubAgentTrackerOptions,
+} from './streaming.js';

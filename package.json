@@ -4,10 +4,41 @@
   "description": "Telegram ↔ Claude Code CLI bridge",
   "type": "module",
   "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./process": {
+      "types": "./dist/cc-process.d.ts",
+      "import": "./dist/cc-process.js"
+    },
+    "./protocol": {
+      "types": "./dist/cc-protocol.d.ts",
+      "import": "./dist/cc-protocol.js"
+    },
+    "./session": {
+      "types": "./dist/session.d.ts",
+      "import": "./dist/session.js"
+    },
+    "./streaming": {
+      "types": "./dist/streaming.d.ts",
+      "import": "./dist/streaming.js"
+    }
+  },
+  "typesVersions": {
+    "*": {
+      "process": ["dist/cc-process.d.ts"],
+      "protocol": ["dist/cc-protocol.d.ts"],
+      "session": ["dist/session.d.ts"],
+      "streaming": ["dist/streaming.d.ts"]
+    }
+  },
   "scripts": {
     "build": "tsc",
-    "dev": "tsx src/index.ts",
-    "start": "node dist/index.js",
+    "dev": "tsx src/service.ts",
+    "start": "node dist/service.js",
     "test": "vitest run",
     "test:watch": "vitest"
   },
