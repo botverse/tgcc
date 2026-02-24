@@ -700,6 +700,22 @@ export class SubAgentTracker {
     const info = this.agents.get(toolUseId);
     if (!info || !info.tgMessageId) return;
 
+    // Detect background agent spawn confirmations — keep as dispatched, don't mark completed
+    // Spawn confirmations contain "agent_id:" and "Spawned" patterns
+    const isSpawnConfirmation = /agent_id:\s*\S+@\S+/.test(result) || /[Ss]pawned\s+successfully/i.test(result);
+    if (isSpawnConfirmation) {
+      // Extract agent_id for display but stay in dispatched state
+      const label = info.label || info.toolName;
+      const text = `🤖 ${escapeHtml(label)} — Spawned, waiting for results…`;
+      this.sendQueue = this.sendQueue.then(async () => {
+        try {
+          await this.sender.editMessage(this.chatId, info.tgMessageId!, text, 'HTML');
+        } catch { /* ignore */ }
+      });
+      await this.sendQueue;
+      return;
+    }
+
     // Clear elapsed timer
     this.clearElapsedTimer(info);
 
