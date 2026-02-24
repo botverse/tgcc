@@ -978,14 +978,14 @@ export class SubAgentTracker {
       // Skip idle notifications (JSON objects, not real results)
       if (msg.text.startsWith('{')) continue;
 
-      // Match msg.from to a tracked sub-agent by label
+      // Match msg.from to a tracked sub-agent
       const matched = this.findAgentByFrom(msg.from);
-      if (!matched) continue;
-
-      // CRITICAL ORDER: set status + bump version FIRST, then clear timer
+      if (!matched) {
+        console.error(`[MAILBOX] No match for from="${msg.from}". Agents: ${[...this.agents.values()].map(a => `${a.agentName}/${a.label}/${a.status}`).join(', ')}`);
+        continue;
+      }
 
       matched.status = 'completed';
-
 
 
       if (!matched.tgMessageId) continue;
