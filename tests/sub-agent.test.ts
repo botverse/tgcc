@@ -101,7 +101,7 @@ describe('SubAgentTracker', () => {
     } as StreamInnerEvent);
 
     expect(sender.sends).toHaveLength(1);
-    expect(sender.sends[0].text).toContain('🔄');
+    expect(sender.sends[0].text).toContain('🤖');
     expect(sender.sends[0].text).toContain('Starting sub-agent');
   });
 
@@ -127,9 +127,9 @@ describe('SubAgentTracker', () => {
       index: 0,
     } as StreamInnerEvent);
 
-    // Should show ⏳ dispatched with "— Working…"
+    // Should show 🤖 dispatched with "— Working…"
     expect(sender.edits).toHaveLength(1);
-    expect(sender.edits[0].text).toContain('⏳');
+    expect(sender.edits[0].text).toContain('🤖');
     expect(sender.edits[0].text).toContain('— Working…');
     expect(sender.edits[0].text).not.toContain('✅');
 
@@ -187,7 +187,7 @@ describe('SubAgentTracker', () => {
     // Should have edited to show label with "Working…" format
     const labelEdits = sender.edits.filter(e => e.text.includes('code-reviewer'));
     expect(labelEdits.length).toBeGreaterThanOrEqual(1);
-    expect(labelEdits[0].text).toContain('⏳ code-reviewer — Working…');
+    expect(labelEdits[0].text).toContain('🤖 code-reviewer — Working…');
   });
 
   it('starts elapsed timer on dispatch and updates every 15s', async () => {
@@ -215,7 +215,7 @@ describe('SubAgentTracker', () => {
     expect(sender.edits.length).toBeGreaterThan(editsBeforeTimer);
 
     const timerEdit = sender.edits[sender.edits.length - 1];
-    expect(timerEdit.text).toContain('⏳ spec-reviewer — Working…');
+    expect(timerEdit.text).toContain('🤖 spec-reviewer — Working…');
     expect(timerEdit.text).toMatch(/\(\d+s\)/);
 
     // Advance another 15 seconds

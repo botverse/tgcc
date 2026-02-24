@@ -661,6 +661,19 @@ export class Bridge extends EventEmitter implements CtlHandler {
     if (event.is_error && event.result) {
       agent.tgBot.sendText(chatId, `<i>Error: ${escapeHtml(String(event.result))}</i>`, 'HTML');
     }
+
+    // Check if background sub-agents are still running (dispatched but no result)
+    const tracker = agent.subAgentTrackers.get(accKey);
+    if (tracker?.hasDispatchedAgents) {
+      this.logger.info({ agentId }, 'Turn ended with background sub-agents still running — sending follow-up');
+      // Wait a moment then ask CC to collect the background agent results
+      setTimeout(() => {
+        const proc = agent.processes.get(userId);
+        if (proc && proc.state === 'active') {
+          proc.sendMessage(createTextMessage('The background agents should have finished by now. Please check on their results and share the findings.'));
+        }
+      }, 5000); // 5s delay to let agents finish
+    }
   }
 
   // ── Slash commands ──

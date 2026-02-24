@@ -624,6 +624,11 @@ export class SubAgentTracker {
     return this.agents.size > 0;
   }
 
+  /** Returns true if any sub-agents are in dispatched state (spawned but no result yet) */
+  get hasDispatchedAgents(): boolean {
+    return [...this.agents.values()].some(a => a.status === 'dispatched');
+  }
+
   async handleEvent(event: StreamInnerEvent): Promise<void> {
     switch (event.type) {
       case 'content_block_start':
@@ -706,7 +711,7 @@ export class SubAgentTracker {
       try {
         const msgId = await this.sender.sendMessage(
           this.chatId,
-          '🔄 Starting sub-agent…',
+          '🤖 Starting sub-agent…',
           'HTML',
         );
         info.tgMessageId = msgId;
@@ -738,7 +743,7 @@ export class SubAgentTracker {
             await this.sender.editMessage(
               this.chatId,
               info.tgMessageId!,
-              `⏳ ${escapeHtml(displayLabel)} — Working…`,
+              `🤖 ${escapeHtml(displayLabel)} — Working…`,
               'HTML',
             );
           } catch {
@@ -768,7 +773,7 @@ export class SubAgentTracker {
     }
 
     const displayLabel = info.label || info.toolName;
-    const text = `⏳ ${escapeHtml(displayLabel)} — Working…`;
+    const text = `🤖 ${escapeHtml(displayLabel)} — Working…`;
 
     this.sendQueue = this.sendQueue.then(async () => {
       try {
@@ -801,7 +806,7 @@ export class SubAgentTracker {
       }
 
       const elapsedSec = Math.round((Date.now() - info.dispatchedAt) / 1000);
-      const text = `⏳ ${escapeHtml(displayLabel)} — Working… (${elapsedSec}s)`;
+      const text = `🤖 ${escapeHtml(displayLabel)} — Working… (${elapsedSec}s)`;
 
       this.sendQueue = this.sendQueue.then(async () => {
         try {
