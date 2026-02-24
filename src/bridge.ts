@@ -651,12 +651,14 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
     // On message_start: if sub-agents were active, reset accumulator so conclusions
     // stream to a NEW message instead of editing the original pre-sub-agent message.
-    // Also reset the tracker AFTER checking hadSubAgents.
     if (event.type === 'message_start') {
       if (tracker.hadSubAgents) {
         acc.reset(); // Full reset — next text creates a fresh TG message
       }
-      tracker.reset(); // Clear tracker for the new turn
+      // Only reset tracker if no agents are still waiting for mailbox results
+      if (!tracker.hasDispatchedAgents) {
+        tracker.reset();
+      }
     }
 
     acc.handleEvent(event);
