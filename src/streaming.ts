@@ -577,6 +577,8 @@ export interface SubAgentInfo {
   status: 'running' | 'dispatched' | 'completed' | 'failed';
   label: string;
   inputPreview: string;
+  dispatchedAt: number | null;         // timestamp when dispatched (for elapsed timer)
+  elapsedTimer: ReturnType<typeof setInterval> | null;  // periodic edit timer
 }
 
 export interface SubAgentSender {
@@ -605,6 +607,11 @@ export class SubAgentTracker {
     return [...this.agents.values()];
   }
 
+  /** Returns true if any sub-agents were tracked in this turn (including completed ones) */
+  get hadSubAgents(): boolean {
+    return this.agents.size > 0;
+  }
+
   async handleEvent(event: StreamInnerEvent): Promise<void> {
     switch (event.type) {
       case 'content_block_start':
@@ -623,24 +630,28 @@ export class SubAgentTracker {
         await this.onBlockStop(event as StreamContentBlockStop);
         break;
 
-      case 'message_start':
-        // New turn — reset tracker
-        this.reset();
-        break;
+      // NOTE: message_start reset is handled by the bridge (not here)
+      // so it can check hadSubAgents before clearing state
     }
   }
 
-  /** Handle a tool_result event — marks the sub-agent as completed with results */
+  /** Handle a tool_result event — marks the sub-agent as completed with collapsible result */
   async handleToolResult(toolUseId: string, result: string): Promise<void> {
     const info = this.agents.get(toolUseId);
     if (!info || !info.tgMessageId) return;
 
+    // Clear elapsed timer
+    this.clearElapsedTimer(info);
+
     info.status = 'completed';
 
     const label = info.label || info.toolName;
-    const resultPreview = result.length > 300 ? result.slice(0, 300) + '…' : result;
+    // Truncate result for blockquote (TG message limit ~4096 chars)
+    const maxResultLen = 3500;
+    const resultText = result.length > maxResultLen ? result.slice(0, maxResultLen) + '…' : result;
 
-    const text = `✅ ${escapeHtml(label)}\n<i>${escapeHtml(resultPreview)}</i>`;
+    // Use expandable blockquote — collapsed shows "✅ label" + first line, tap to expand
+    const text = `<blockquote expandable>✅ ${escapeHtml(label)}\n${escapeHtml(resultText)}</blockquote>`;
 
     this.sendQueue = this.sendQueue.then(async () => {
       try {
@@ -671,6 +682,8 @@ export class SubAgentTracker {
       status: 'running',
       label: '',
       inputPreview: '',
+      dispatchedAt: null,
+      elapsedTimer: null,
     };
 
     this.agents.set(block.id, info);
@@ -701,34 +714,28 @@ export class SubAgentTracker {
 
     info.inputPreview += event.delta.partial_json;
 
-    // Throttle: only update when we have a reasonable chunk (every 200 chars)
-    if (info.inputPreview.length % 200 > 50) return;
-
     // Try to extract an agent label
     if (!info.label) {
       const label = extractAgentLabel(info.inputPreview);
-      if (label) info.label = label;
-    }
-
-    // Try to extract a human-readable summary from the JSON input
-    const summary = extractSubAgentSummary(info.inputPreview);
-    if (!summary) return; // Don't update until we have something meaningful
-
-    const displayLabel = info.label || info.toolName;
-
-    this.sendQueue = this.sendQueue.then(async () => {
-      try {
-        await this.sender.editMessage(
-          this.chatId,
-          info.tgMessageId!,
-          `🔄 ${escapeHtml(displayLabel)}\n<i>${escapeHtml(summary)}</i>`,
-          'HTML',
-        );
-      } catch {
-        // Ignore edit failures (rate limits, not modified, etc.)
+      if (label) {
+        info.label = label;
+        // Once we have a label, update the message to show it
+        const displayLabel = info.label;
+        this.sendQueue = this.sendQueue.then(async () => {
+          try {
+            await this.sender.editMessage(
+              this.chatId,
+              info.tgMessageId!,
+              `⏳ ${escapeHtml(displayLabel)} — Working…`,
+              'HTML',
+            );
+          } catch {
+            // Ignore edit failures
+          }
+        });
+        await this.sendQueue;
       }
-    });
-    await this.sendQueue;
+    }
   }
 
   private async onBlockStop(event: StreamContentBlockStop): Promise<void> {
@@ -740,6 +747,7 @@ export class SubAgentTracker {
 
     // content_block_stop = input done, NOT sub-agent done. Mark as dispatched.
     info.status = 'dispatched';
+    info.dispatchedAt = Date.now();
 
     // Final chance to extract label from complete input
     if (!info.label) {
@@ -748,7 +756,7 @@ export class SubAgentTracker {
     }
 
     const displayLabel = info.label || info.toolName;
-    const text = `⏳ ${escapeHtml(displayLabel)}\nWorking…`;
+    const text = `⏳ ${escapeHtml(displayLabel)} — Working…`;
 
     this.sendQueue = this.sendQueue.then(async () => {
       try {
@@ -763,9 +771,54 @@ export class SubAgentTracker {
       }
     });
     await this.sendQueue;
+
+    // Start elapsed timer — update every 15s to show progress
+    this.startElapsedTimer(info);
+  }
+
+  /** Start a periodic timer that edits the message with elapsed time */
+  private startElapsedTimer(info: SubAgentInfo): void {
+    if (info.elapsedTimer) return; // already running
+
+    const displayLabel = info.label || info.toolName;
+
+    info.elapsedTimer = setInterval(() => {
+      if (info.status !== 'dispatched' || !info.tgMessageId || !info.dispatchedAt) {
+        this.clearElapsedTimer(info);
+        return;
+      }
+
+      const elapsedSec = Math.round((Date.now() - info.dispatchedAt) / 1000);
+      const text = `⏳ ${escapeHtml(displayLabel)} — Working… (${elapsedSec}s)`;
+
+      this.sendQueue = this.sendQueue.then(async () => {
+        try {
+          await this.sender.editMessage(
+            this.chatId,
+            info.tgMessageId!,
+            text,
+            'HTML',
+          );
+        } catch {
+          // Ignore edit failures (rate limits, not modified, etc.)
+        }
+      });
+    }, 15_000);
+  }
+
+  /** Clear the elapsed timer for a sub-agent */
+  private clearElapsedTimer(info: SubAgentInfo): void {
+    if (info.elapsedTimer) {
+      clearInterval(info.elapsedTimer);
+      info.elapsedTimer = null;
+    }
   }
 
   reset(): void {
+    // Clear all elapsed timers before resetting
+    for (const info of this.agents.values()) {
+      this.clearElapsedTimer(info);
+    }
     this.agents.clear();
     this.blockToAgent.clear();
     this.sendQueue = Promise.resolve();

@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { SubAgentTracker, isSubAgentTool, extractAgentLabel, markdownToHtml, type SubAgentSender } from '../src/streaming.js';
 import type { StreamInnerEvent } from '../src/cc-protocol.js';
 
@@ -69,11 +69,17 @@ describe('SubAgentTracker', () => {
   let tracker: SubAgentTracker;
 
   beforeEach(() => {
+    vi.useFakeTimers();
     sender = createMockSubAgentSender();
     tracker = new SubAgentTracker({
       chatId: 123,
       sender,
     });
+  });
+
+  afterEach(() => {
+    tracker.reset(); // Clear timers
+    vi.useRealTimers();
   });
 
   it('sends standalone message when sub-agent tool is detected (no reply_to)', async () => {
@@ -86,7 +92,6 @@ describe('SubAgentTracker', () => {
     expect(sender.sends).toHaveLength(1);
     expect(sender.sends[0].text).toContain('🔄');
     expect(sender.sends[0].text).toContain('Starting sub-agent');
-    // No replyTo property — standalone message
   });
 
   it('does NOT send message for normal tools', async () => {
@@ -99,7 +104,7 @@ describe('SubAgentTracker', () => {
     expect(sender.sends).toHaveLength(0);
   });
 
-  it('marks dispatched (not completed) on content_block_stop', async () => {
+  it('marks dispatched on content_block_stop with "Working…" format', async () => {
     await tracker.handleEvent({
       type: 'content_block_start',
       index: 0,
@@ -111,10 +116,10 @@ describe('SubAgentTracker', () => {
       index: 0,
     } as StreamInnerEvent);
 
-    // Should show ⏳ dispatched, not ✅ completed
+    // Should show ⏳ dispatched with "— Working…"
     expect(sender.edits).toHaveLength(1);
     expect(sender.edits[0].text).toContain('⏳');
-    expect(sender.edits[0].text).toContain('Working');
+    expect(sender.edits[0].text).toContain('— Working…');
     expect(sender.edits[0].text).not.toContain('✅');
 
     // Status should be dispatched
@@ -122,7 +127,7 @@ describe('SubAgentTracker', () => {
     expect(agents[0].status).toBe('dispatched');
   });
 
-  it('marks completed on handleToolResult with result preview', async () => {
+  it('shows collapsible blockquote on handleToolResult', async () => {
     await tracker.handleEvent({
       type: 'content_block_start',
       index: 0,
@@ -145,41 +150,111 @@ describe('SubAgentTracker', () => {
     await tracker.handleToolResult('toolu_1', 'Found 3 discrepancies in weight calculations.');
 
     const lastEdit = sender.edits[sender.edits.length - 1];
-    expect(lastEdit.text).toContain('✅');
-    expect(lastEdit.text).toContain('spec-reviewer');
+    // Should use expandable blockquote format
+    expect(lastEdit.text).toContain('<blockquote expandable>');
+    expect(lastEdit.text).toContain('✅ spec-reviewer');
     expect(lastEdit.text).toContain('Found 3 discrepancies');
+    expect(lastEdit.text).toContain('</blockquote>');
 
     expect(tracker.activeAgents[0].status).toBe('completed');
   });
 
-  it('extracts agent label from input and uses it in display', async () => {
+  it('updates message once label is extracted from input_json_delta', async () => {
     await tracker.handleEvent({
       type: 'content_block_start',
       index: 0,
       content_block: { type: 'tool_use', id: 'toolu_1', name: 'Task', input: {} },
     } as StreamInnerEvent);
 
-    // Send enough input to extract label and trigger an edit
-    const json = '{"prompt": "You are a code-reviewer. Review the authentication middleware and check for security issues in the codebase"}';
+    // Send input with extractable label
     await tracker.handleEvent({
       type: 'content_block_delta',
       index: 0,
-      delta: { type: 'input_json_delta', partial_json: json },
+      delta: { type: 'input_json_delta', partial_json: '{"name": "code-reviewer", "prompt": "Review the code"}' },
     } as StreamInnerEvent);
 
-    // Push past 200 chars to hit throttle window
-    const needed = 200 - json.length + 10;
+    // Should have edited to show label with "Working…" format
+    const labelEdits = sender.edits.filter(e => e.text.includes('code-reviewer'));
+    expect(labelEdits.length).toBeGreaterThanOrEqual(1);
+    expect(labelEdits[0].text).toContain('⏳ code-reviewer — Working…');
+  });
+
+  it('starts elapsed timer on dispatch and updates every 15s', async () => {
+    await tracker.handleEvent({
+      type: 'content_block_start',
+      index: 0,
+      content_block: { type: 'tool_use', id: 'toolu_1', name: 'dispatch_agent', input: {} },
+    } as StreamInnerEvent);
+
     await tracker.handleEvent({
       type: 'content_block_delta',
       index: 0,
-      delta: { type: 'input_json_delta', partial_json: 'x'.repeat(Math.max(needed, 1)) },
+      delta: { type: 'input_json_delta', partial_json: '{"name": "spec-reviewer"}' },
     } as StreamInnerEvent);
 
-    // Should use extracted label, not raw tool name "Task"
-    const editsForAgent = sender.edits.filter(e => e.messageId === 100);
-    expect(editsForAgent.length).toBeGreaterThanOrEqual(1);
-    expect(editsForAgent[0].text).toContain('code-reviewer');
-    expect(editsForAgent[0].text).not.toContain('Task');
+    await tracker.handleEvent({
+      type: 'content_block_stop',
+      index: 0,
+    } as StreamInnerEvent);
+
+    const editsBeforeTimer = sender.edits.length;
+
+    // Advance 15 seconds — should trigger first timer edit
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(sender.edits.length).toBeGreaterThan(editsBeforeTimer);
+
+    const timerEdit = sender.edits[sender.edits.length - 1];
+    expect(timerEdit.text).toContain('⏳ spec-reviewer — Working…');
+    expect(timerEdit.text).toMatch(/\(\d+s\)/);
+
+    // Advance another 15 seconds
+    const editsAfterFirst = sender.edits.length;
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(sender.edits.length).toBeGreaterThan(editsAfterFirst);
+
+    const secondTimerEdit = sender.edits[sender.edits.length - 1];
+    expect(secondTimerEdit.text).toMatch(/\(30s\)/);
+  });
+
+  it('clears elapsed timer on tool_result', async () => {
+    await tracker.handleEvent({
+      type: 'content_block_start',
+      index: 0,
+      content_block: { type: 'tool_use', id: 'toolu_1', name: 'dispatch_agent', input: {} },
+    } as StreamInnerEvent);
+
+    await tracker.handleEvent({
+      type: 'content_block_stop',
+      index: 0,
+    } as StreamInnerEvent);
+
+    // Complete the sub-agent
+    await tracker.handleToolResult('toolu_1', 'Done!');
+
+    const editsAfterResult = sender.edits.length;
+
+    // Advance time — timer should NOT fire
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(sender.edits.length).toBe(editsAfterResult);
+  });
+
+  it('clears all elapsed timers on reset', async () => {
+    await tracker.handleEvent({
+      type: 'content_block_start',
+      index: 0,
+      content_block: { type: 'tool_use', id: 'toolu_1', name: 'dispatch_agent', input: {} },
+    } as StreamInnerEvent);
+
+    await tracker.handleEvent({
+      type: 'content_block_stop',
+      index: 0,
+    } as StreamInnerEvent);
+
+    tracker.reset();
+
+    const editsAfterReset = sender.edits.length;
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(sender.edits.length).toBe(editsAfterReset);
   });
 
   it('handles multiple concurrent sub-agents', async () => {
@@ -199,7 +274,23 @@ describe('SubAgentTracker', () => {
     expect(tracker.activeAgents).toHaveLength(2);
   });
 
-  it('resets on message_start', async () => {
+  it('tracks hadSubAgents correctly', async () => {
+    expect(tracker.hadSubAgents).toBe(false);
+
+    await tracker.handleEvent({
+      type: 'content_block_start',
+      index: 0,
+      content_block: { type: 'tool_use', id: 'toolu_1', name: 'dispatch_agent', input: {} },
+    } as StreamInnerEvent);
+
+    expect(tracker.hadSubAgents).toBe(true);
+
+    // After reset, should be false again
+    tracker.reset();
+    expect(tracker.hadSubAgents).toBe(false);
+  });
+
+  it('does NOT reset on message_start (handled by bridge)', async () => {
     await tracker.handleEvent({
       type: 'content_block_start',
       index: 0,
@@ -208,9 +299,10 @@ describe('SubAgentTracker', () => {
 
     expect(tracker.activeAgents).toHaveLength(1);
 
+    // message_start should NOT reset (bridge handles this now)
     await tracker.handleEvent({ type: 'message_start' } as StreamInnerEvent);
 
-    expect(tracker.activeAgents).toHaveLength(0);
+    expect(tracker.activeAgents).toHaveLength(1);
   });
 
   it('ignores text block events', async () => {
@@ -229,20 +321,21 @@ describe('SubAgentTracker', () => {
     expect(sender.edits).toHaveLength(0);
   });
 
-  it('truncates long tool results to 300 chars', async () => {
+  it('truncates long tool results in collapsible blockquote', async () => {
     await tracker.handleEvent({
       type: 'content_block_start',
       index: 0,
       content_block: { type: 'tool_use', id: 'toolu_1', name: 'dispatch_agent', input: {} },
     } as StreamInnerEvent);
 
-    const longResult = 'A'.repeat(500);
+    const longResult = 'A'.repeat(4000);
     await tracker.handleToolResult('toolu_1', longResult);
 
     const lastEdit = sender.edits[sender.edits.length - 1];
+    expect(lastEdit.text).toContain('<blockquote expandable>');
     expect(lastEdit.text).toContain('…');
-    // The preview should be ~300 chars + ellipsis, not the full 500
-    expect(lastEdit.text.length).toBeLessThan(450);
+    // Should be truncated to ~3500 chars + markup
+    expect(lastEdit.text.length).toBeLessThan(3700);
   });
 });
 
