@@ -8,6 +8,7 @@ import {
   type CCOutputEvent,
   type UserMessage,
   type StreamInnerEvent,
+  type ApiErrorEvent,
   parseCCOutputLine,
   serializeMessage,
   createInitializeRequest,
@@ -236,6 +237,8 @@ export class CCProcess extends EventEmitter {
           this.emit('stateChange', 'active');
           this.emit('init', event);
           this.flushQueue();
+        } else if (event.subtype === 'api_error') {
+          this.emit('api_error', event as ApiErrorEvent);
         }
         break;
 

@@ -8,6 +8,7 @@ import type {
   AgentConfig,
   ConfigDiff,
 } from './config.js';
+import type { ApiErrorEvent } from './cc-protocol.js';
 import { resolveUserConfig, resolveRepoPath, updateConfig, isValidRepoName, findRepoOwner } from './config.js';
 import { CCProcess, generateMcpConfig } from './cc-process.js';
 import {
@@ -477,6 +478,21 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
     proc.on('result', (event: ResultEvent) => {
       this.handleResult(agentId, userId, chatId, event);
+    });
+
+    proc.on('api_error', (event: ApiErrorEvent) => {
+      const errMsg = event.error?.message || 'Unknown API error';
+      const status = event.error?.status;
+      const isOverloaded = status === 529 || errMsg.includes('overloaded');
+      const retryInfo = event.retryAttempt != null && event.maxRetries != null
+        ? ` (retry ${event.retryAttempt}/${event.maxRetries})`
+        : '';
+
+      const text = isOverloaded
+        ? `<blockquote>⚠️ API overloaded, retrying...${retryInfo}</blockquote>`
+        : `<blockquote>⚠️ ${escapeHtml(errMsg)}${retryInfo}</blockquote>`;
+
+      agent.tgBot.sendText(chatId, text, 'HTML');
     });
 
     proc.on('hang', () => {

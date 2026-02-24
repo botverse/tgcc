@@ -241,6 +241,24 @@ export interface StreamEvent {
   event: StreamInnerEvent;
 }
 
+// ── API error events ──
+
+export interface ApiErrorEvent {
+  type: 'system';
+  subtype: 'api_error';
+  level: 'error';
+  error: {
+    message?: string;
+    status?: number;
+    [key: string]: unknown;
+  };
+  retryInMs?: number;
+  retryAttempt?: number;
+  maxRetries?: number;
+  timestamp?: string;
+  uuid?: string;
+}
+
 // ── Union of all CC output events ──
 
 export type CCOutputEvent =
@@ -249,7 +267,8 @@ export type CCOutputEvent =
   | ToolResultEvent
   | ResultEvent
   | StreamEvent
-  | ControlResponse;
+  | ControlResponse
+  | ApiErrorEvent;
 
 // ── Parser ──
 

@@ -16,6 +16,7 @@ import {
   type ResultEvent,
   type StreamEvent,
   type ControlResponse,
+  type ApiErrorEvent,
 } from '../src/cc-protocol.js';
 
 describe('cc-protocol input construction', () => {
@@ -217,6 +218,25 @@ describe('cc-protocol output parsing', () => {
 
   it('returns null for unknown event type', () => {
     expect(parseCCOutputLine('{"type":"unknown_type"}')).toBeNull();
+  });
+
+  it('parses system api_error event', () => {
+    const line = JSON.stringify({
+      type: 'system',
+      subtype: 'api_error',
+      level: 'error',
+      error: { message: 'API overloaded', status: 529 },
+      retryInMs: 5000,
+      retryAttempt: 1,
+      maxRetries: 3,
+      timestamp: '2026-02-24T15:00:00.000Z',
+    });
+    const event = parseCCOutputLine(line) as ApiErrorEvent;
+    expect(event).not.toBeNull();
+    expect(event.type).toBe('system');
+    expect(event.subtype).toBe('api_error');
+    expect(event.error.status).toBe(529);
+    expect(event.retryAttempt).toBe(1);
   });
 
   it('parses control_response event', () => {
