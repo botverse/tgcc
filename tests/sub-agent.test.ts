@@ -1,9 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { SubAgentTracker, isSubAgentTool, extractAgentLabel, markdownToHtml, type SubAgentSender, type MailboxMessage } from '../src/streaming.js';
+import { SubAgentTracker, isSubAgentTool, extractAgentLabel, markdownToHtml, parseBackgroundNotifications, type SubAgentSender } from '../src/streaming.js';
 import type { StreamInnerEvent } from '../src/cc-protocol.js';
-import * as fs from 'node:fs';
-import * as path from 'node:path';
-import * as os from 'node:os';
 
 function createMockSubAgentSender() {
   let nextId = 100;
@@ -78,6 +75,86 @@ describe('extractAgentLabel', () => {
   });
 });
 
+describe('parseBackgroundNotifications', () => {
+  it('parses a single notification', () => {
+    const xml = `<background_agent_notification>
+  <parent_tool_use_id>toolu_abc123</parent_tool_use_id>
+  <status>completed</status>
+  <result>All tests passed.</result>
+</background_agent_notification>`;
+
+    const notifications = parseBackgroundNotifications(xml);
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0].parentToolUseId).toBe('toolu_abc123');
+    expect(notifications[0].status).toBe('completed');
+    expect(notifications[0].result).toBe('All tests passed.');
+  });
+
+  it('parses multiple notifications', () => {
+    const xml = `<background_agent_notification>
+  <parent_tool_use_id>toolu_1</parent_tool_use_id>
+  <status>completed</status>
+</background_agent_notification>
+Some text between
+<background_agent_notification>
+  <parent_tool_use_id>toolu_2</parent_tool_use_id>
+  <status>failed</status>
+  <result>Build error</result>
+</background_agent_notification>`;
+
+    const notifications = parseBackgroundNotifications(xml);
+    expect(notifications).toHaveLength(2);
+    expect(notifications[0].parentToolUseId).toBe('toolu_1');
+    expect(notifications[1].parentToolUseId).toBe('toolu_2');
+    expect(notifications[1].status).toBe('failed');
+  });
+
+  it('extracts agent_name when present', () => {
+    const xml = `<background_agent_notification>
+  <parent_tool_use_id>toolu_x</parent_tool_use_id>
+  <status>completed</status>
+  <agent_name>spec-reviewer</agent_name>
+</background_agent_notification>`;
+
+    const notifications = parseBackgroundNotifications(xml);
+    expect(notifications[0].agentName).toBe('spec-reviewer');
+  });
+
+  it('falls back to name tag for agent name', () => {
+    const xml = `<background_agent_notification>
+  <parent_tool_use_id>toolu_x</parent_tool_use_id>
+  <status>completed</status>
+  <name>code-checker</name>
+</background_agent_notification>`;
+
+    const notifications = parseBackgroundNotifications(xml);
+    expect(notifications[0].agentName).toBe('code-checker');
+  });
+
+  it('returns empty for text without notifications', () => {
+    expect(parseBackgroundNotifications('Just some regular text')).toHaveLength(0);
+    expect(parseBackgroundNotifications('')).toHaveLength(0);
+  });
+
+  it('skips malformed notifications (missing required fields)', () => {
+    const xml = `<background_agent_notification>
+  <status>completed</status>
+</background_agent_notification>`;
+    expect(parseBackgroundNotifications(xml)).toHaveLength(0);
+  });
+
+  it('uses summary tag as fallback for result', () => {
+    const xml = `<background_agent_notification>
+  <parent_tool_use_id>toolu_x</parent_tool_use_id>
+  <status>completed</status>
+  <summary>Review complete with 3 findings</summary>
+</background_agent_notification>`;
+
+    const notifications = parseBackgroundNotifications(xml);
+    expect(notifications[0].result).toBe('Review complete with 3 findings');
+  });
+});
+
 describe('SubAgentTracker', () => {
   let sender: ReturnType<typeof createMockSubAgentSender>;
   let tracker: SubAgentTracker;
@@ -92,7 +169,7 @@ describe('SubAgentTracker', () => {
   });
 
   afterEach(() => {
-    tracker.reset(); // Clear timers
+    tracker.reset();
     vi.useRealTimers();
   });
 
@@ -130,13 +207,11 @@ describe('SubAgentTracker', () => {
       index: 0,
     } as StreamInnerEvent);
 
-    // Should show 🤖 dispatched with "— Working…"
     expect(sender.edits).toHaveLength(1);
     expect(sender.edits[0].text).toContain('🤖');
     expect(sender.edits[0].text).toContain('— Working…');
     expect(sender.edits[0].text).not.toContain('✅');
 
-    // Status should be dispatched
     const agents = tracker.activeAgents;
     expect(agents[0].status).toBe('dispatched');
   });
@@ -148,7 +223,6 @@ describe('SubAgentTracker', () => {
       content_block: { type: 'tool_use', id: 'toolu_1', name: 'dispatch_agent', input: {} },
     } as StreamInnerEvent);
 
-    // Feed some input to set a label
     await tracker.handleEvent({
       type: 'content_block_delta',
       index: 0,
@@ -160,11 +234,9 @@ describe('SubAgentTracker', () => {
       index: 0,
     } as StreamInnerEvent);
 
-    // Now simulate tool_result
     await tracker.handleToolResult('toolu_1', 'Found 3 discrepancies in weight calculations.');
 
     const lastEdit = sender.edits[sender.edits.length - 1];
-    // Should use expandable blockquote format
     expect(lastEdit.text).toContain('<blockquote expandable>');
     expect(lastEdit.text).toContain('✅ spec-reviewer');
     expect(lastEdit.text).toContain('Found 3 discrepancies');
@@ -180,14 +252,12 @@ describe('SubAgentTracker', () => {
       content_block: { type: 'tool_use', id: 'toolu_1', name: 'Task', input: {} },
     } as StreamInnerEvent);
 
-    // Send input with extractable label
     await tracker.handleEvent({
       type: 'content_block_delta',
       index: 0,
       delta: { type: 'input_json_delta', partial_json: '{"name": "code-reviewer", "prompt": "Review the code"}' },
     } as StreamInnerEvent);
 
-    // Should have edited to show label with "Working…" format
     const labelEdits = sender.edits.filter(e => e.text.includes('code-reviewer'));
     expect(labelEdits.length).toBeGreaterThanOrEqual(1);
     expect(labelEdits[0].text).toContain('🤖 code-reviewer — Working…');
@@ -213,7 +283,6 @@ describe('SubAgentTracker', () => {
 
     const editsBeforeTimer = sender.edits.length;
 
-    // Advance 15 seconds — should trigger first timer edit
     await vi.advanceTimersByTimeAsync(15_000);
     expect(sender.edits.length).toBeGreaterThan(editsBeforeTimer);
 
@@ -221,7 +290,6 @@ describe('SubAgentTracker', () => {
     expect(timerEdit.text).toContain('🤖 spec-reviewer — Working…');
     expect(timerEdit.text).toMatch(/\(\d+s\)/);
 
-    // Advance another 15 seconds
     const editsAfterFirst = sender.edits.length;
     await vi.advanceTimersByTimeAsync(15_000);
     expect(sender.edits.length).toBeGreaterThan(editsAfterFirst);
@@ -242,12 +310,9 @@ describe('SubAgentTracker', () => {
       index: 0,
     } as StreamInnerEvent);
 
-    // Complete the sub-agent
     await tracker.handleToolResult('toolu_1', 'Done!');
 
     const editsAfterResult = sender.edits.length;
-
-    // Advance time — timer should NOT fire
     await vi.advanceTimersByTimeAsync(30_000);
     expect(sender.edits.length).toBe(editsAfterResult);
   });
@@ -299,7 +364,6 @@ describe('SubAgentTracker', () => {
 
     expect(tracker.hadSubAgents).toBe(true);
 
-    // After reset, should be false again
     tracker.reset();
     expect(tracker.hadSubAgents).toBe(false);
   });
@@ -313,7 +377,6 @@ describe('SubAgentTracker', () => {
 
     expect(tracker.activeAgents).toHaveLength(1);
 
-    // message_start should NOT reset (bridge handles this now)
     await tracker.handleEvent({ type: 'message_start' } as StreamInnerEvent);
 
     expect(tracker.activeAgents).toHaveLength(1);
@@ -348,103 +411,26 @@ describe('SubAgentTracker', () => {
     const lastEdit = sender.edits[sender.edits.length - 1];
     expect(lastEdit.text).toContain('<blockquote expandable>');
     expect(lastEdit.text).toContain('…');
-    // Should be truncated to ~3500 chars + markup
     expect(lastEdit.text.length).toBeLessThan(3700);
   });
 });
 
-describe('SubAgentTracker — team name extraction', () => {
+describe('SubAgentTracker — auto-backgrounding detection', () => {
   let sender: ReturnType<typeof createMockSubAgentSender>;
   let tracker: SubAgentTracker;
-
-  beforeEach(() => {
-    sender = createMockSubAgentSender();
-    tracker = new SubAgentTracker({ chatId: 123, sender });
-  });
-
-  afterEach(() => {
-    tracker.reset();
-  });
-
-  it('extracts team name via setTeamName', () => {
-    expect(tracker.currentTeamName).toBeNull();
-    tracker.setTeamName('kyo-review-5');
-    expect(tracker.currentTeamName).toBe('kyo-review-5');
-  });
-
-  it('regex extraction from agent_id text', () => {
-    const text = 'agent_id: spec-reviewer@kyo-review-5';
-    const match = text.match(/agent_id:\s*\S+@(\S+)/);
-    expect(match?.[1]).toBe('kyo-review-5');
-  });
-
-  it('regex extraction handles various formats', () => {
-    const texts = [
-      'agent_id: code-reviewer@my-team-123',
-      'agent_id:worker@team',
-      'agent_id: a@b',
-    ];
-    for (const t of texts) {
-      const m = t.match(/agent_id:\s*\S+@(\S+)/);
-      expect(m).not.toBeNull();
-    }
-  });
-});
-
-describe('SubAgentTracker — mailbox watching', () => {
-  let sender: ReturnType<typeof createMockSubAgentSender>;
-  let tracker: SubAgentTracker;
-  let tmpDir: string;
-  let mailboxPath: string;
 
   beforeEach(() => {
     vi.useFakeTimers();
     sender = createMockSubAgentSender();
     tracker = new SubAgentTracker({ chatId: 123, sender });
-
-    // Create a temp directory structure for mailbox
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tgcc-test-'));
   });
 
   afterEach(() => {
     tracker.reset();
     vi.useRealTimers();
-    // Cleanup temp dir
-    try { fs.rmSync(tmpDir, { recursive: true }); } catch {}
   });
 
-  it('startMailboxWatch does nothing without team name', () => {
-    tracker.startMailboxWatch();
-    expect(tracker.isMailboxWatching).toBe(false);
-  });
-
-  it('startMailboxWatch activates with team name set', () => {
-    tracker.setTeamName('test-team');
-    // Override mailboxPath for testing
-    (tracker as any).mailboxPath = path.join(tmpDir, 'team-lead.json');
-    tracker.startMailboxWatch();
-    expect(tracker.isMailboxWatching).toBe(true);
-  });
-
-  it('stopMailboxWatch deactivates', () => {
-    tracker.setTeamName('test-team');
-    (tracker as any).mailboxPath = path.join(tmpDir, 'team-lead.json');
-    tracker.startMailboxWatch();
-    tracker.stopMailboxWatch();
-    expect(tracker.isMailboxWatching).toBe(false);
-  });
-
-  it('reset clears team name and stops watching', () => {
-    tracker.setTeamName('test-team');
-    (tracker as any).mailboxPath = path.join(tmpDir, 'team-lead.json');
-    tracker.startMailboxWatch();
-    tracker.reset();
-    expect(tracker.currentTeamName).toBeNull();
-    expect(tracker.isMailboxWatching).toBe(false);
-  });
-
-  it('findAgentByFrom matches agent labels', async () => {
-    // Set up a dispatched agent
+  it('detects async_launched status and keeps agent dispatched', async () => {
     await tracker.handleEvent({
       type: 'content_block_start',
       index: 0,
@@ -454,247 +440,221 @@ describe('SubAgentTracker — mailbox watching', () => {
     await tracker.handleEvent({
       type: 'content_block_delta',
       index: 0,
-      delta: { type: 'input_json_delta', partial_json: '{"name": "spec-reviewer"}' },
+      delta: { type: 'input_json_delta', partial_json: '{"name": "long-runner"}' },
     } as StreamInnerEvent);
 
-    await tracker.handleEvent({
-      type: 'content_block_stop',
-      index: 0,
-    } as StreamInnerEvent);
+    await tracker.handleEvent({ type: 'content_block_stop', index: 0 } as StreamInnerEvent);
 
-    // Use the private method via processMailbox
-    const matched = (tracker as any).findAgentByFrom('spec-reviewer');
-    expect(matched).not.toBeNull();
-    expect(matched.label).toBe('spec-reviewer');
-  });
+    await tracker.handleToolResult('toolu_1', '{"status": "async_launched", "outputFile": "/home/user/.claude/projects/abc/agents/xyz/output.md"}');
 
-  it('processMailbox updates agent TG message with mailbox result', async () => {
-    // Set up a dispatched agent
-    await tracker.handleEvent({
-      type: 'content_block_start',
-      index: 0,
-      content_block: { type: 'tool_use', id: 'toolu_1', name: 'dispatch_agent', input: {} },
-    } as StreamInnerEvent);
-
-    await tracker.handleEvent({
-      type: 'content_block_delta',
-      index: 0,
-      delta: { type: 'input_json_delta', partial_json: '{"name": "spec-reviewer"}' },
-    } as StreamInnerEvent);
-
-    await tracker.handleEvent({
-      type: 'content_block_stop',
-      index: 0,
-    } as StreamInnerEvent);
-
-    // Write mailbox file
-    const mailboxFile = path.join(tmpDir, 'team-lead.json');
-    const messages: MailboxMessage[] = [
-      {
-        from: 'spec-reviewer',
-        text: '## Findings Report\n\nAll claims verified.',
-        summary: 'Spec review complete',
-        timestamp: new Date().toISOString(),
-        color: 'green',
-        read: false,
-      },
-    ];
-    fs.writeFileSync(mailboxFile, JSON.stringify(messages));
-
-    // Set up mailbox path and process
-    tracker.setTeamName('test-team');
-    (tracker as any).mailboxPath = mailboxFile;
-    (tracker as any).lastMailboxCount = 0;
-    (tracker as any).processMailbox();
-
-    // Wait for async queue to flush
-    await (tracker as any).sendQueue;
-
-    // Check: agent should be completed and TG message edited with blockquote
-    const agents = tracker.activeAgents;
-    expect(agents[0].status).toBe('completed');
-
+    // Should remain dispatched, not completed
+    expect(tracker.activeAgents[0].status).toBe('dispatched');
     const lastEdit = sender.edits[sender.edits.length - 1];
-    expect(lastEdit.text).toContain('<blockquote expandable>');
+    expect(lastEdit.text).toContain('Auto-backgrounded');
+    expect(lastEdit.text).toContain('long-runner');
+  });
+
+  it('extracts outputFile path from auto-backgrounding result', async () => {
+    await tracker.handleEvent({
+      type: 'content_block_start',
+      index: 0,
+      content_block: { type: 'tool_use', id: 'toolu_1', name: 'dispatch_agent', input: {} },
+    } as StreamInnerEvent);
+
+    await tracker.handleEvent({ type: 'content_block_stop', index: 0 } as StreamInnerEvent);
+
+    await tracker.handleToolResult('toolu_1', '{"status": "async_launched", "outputFile": "/home/user/.claude/projects/abc/agents/xyz/output.md"}');
+
+    expect(tracker.activeAgents[0].outputFile).toBe('/home/user/.claude/projects/abc/agents/xyz/output.md');
+  });
+
+  it('detects spawn confirmations and keeps dispatched', async () => {
+    await tracker.handleEvent({
+      type: 'content_block_start',
+      index: 0,
+      content_block: { type: 'tool_use', id: 'toolu_1', name: 'dispatch_agent', input: {} },
+    } as StreamInnerEvent);
+
+    await tracker.handleEvent({ type: 'content_block_stop', index: 0 } as StreamInnerEvent);
+
+    await tracker.handleToolResult('toolu_1', 'agent_id: reviewer@team-5\nSpawned successfully');
+
+    expect(tracker.activeAgents[0].status).toBe('dispatched');
+    expect(tracker.activeAgents[0].agentName).toBe('reviewer');
+    const lastEdit = sender.edits[sender.edits.length - 1];
+    expect(lastEdit.text).toContain('Spawned');
+  });
+});
+
+describe('SubAgentTracker — background notification handling', () => {
+  let sender: ReturnType<typeof createMockSubAgentSender>;
+  let tracker: SubAgentTracker;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    sender = createMockSubAgentSender();
+    tracker = new SubAgentTracker({ chatId: 123, sender });
+  });
+
+  afterEach(() => {
+    tracker.reset();
+    vi.useRealTimers();
+  });
+
+  it('matches notification by parent_tool_use_id and marks completed', async () => {
+    await tracker.handleEvent({
+      type: 'content_block_start',
+      index: 0,
+      content_block: { type: 'tool_use', id: 'toolu_abc', name: 'dispatch_agent', input: {} },
+    } as StreamInnerEvent);
+
+    await tracker.handleEvent({
+      type: 'content_block_delta',
+      index: 0,
+      delta: { type: 'input_json_delta', partial_json: '{"name": "spec-reviewer"}' },
+    } as StreamInnerEvent);
+
+    await tracker.handleEvent({ type: 'content_block_stop', index: 0 } as StreamInnerEvent);
+
+    // Simulate spawn confirmation to keep dispatched
+    await tracker.handleToolResult('toolu_abc', 'agent_id: spec-reviewer@team-1\nSpawned successfully');
+    expect(tracker.activeAgents[0].status).toBe('dispatched');
+
+    // Now handle background notification
+    await tracker.handleBackgroundNotification(`<background_agent_notification>
+  <parent_tool_use_id>toolu_abc</parent_tool_use_id>
+  <status>completed</status>
+  <result>All specs verified successfully.</result>
+</background_agent_notification>`);
+
+    expect(tracker.activeAgents[0].status).toBe('completed');
+    const lastEdit = sender.edits[sender.edits.length - 1];
     expect(lastEdit.text).toContain('✅');
     expect(lastEdit.text).toContain('spec-reviewer');
-    expect(lastEdit.text).toContain('Spec review complete');
-    expect(lastEdit.text).toContain('Findings Report');
+    expect(lastEdit.text).toContain('All specs verified');
   });
 
-  it('processMailbox calls onAllReported when all agents complete', async () => {
-    const reportedCb = vi.fn();
-    tracker.setOnAllReported(reportedCb);
+  it('matches notification by agent name as fallback', async () => {
+    await tracker.handleEvent({
+      type: 'content_block_start',
+      index: 0,
+      content_block: { type: 'tool_use', id: 'toolu_xyz', name: 'Task', input: {} },
+    } as StreamInnerEvent);
 
-    // Set up a dispatched agent
+    await tracker.handleEvent({
+      type: 'content_block_delta',
+      index: 0,
+      delta: { type: 'input_json_delta', partial_json: '{"name": "code-checker"}' },
+    } as StreamInnerEvent);
+
+    await tracker.handleEvent({ type: 'content_block_stop', index: 0 } as StreamInnerEvent);
+
+    // Spawn confirmation
+    await tracker.handleToolResult('toolu_xyz', 'agent_id: code-checker@team-1\nSpawned successfully');
+
+    // Notification with a DIFFERENT parent_tool_use_id but matching agent_name
+    await tracker.handleBackgroundNotification(`<background_agent_notification>
+  <parent_tool_use_id>toolu_unknown</parent_tool_use_id>
+  <status>completed</status>
+  <agent_name>code-checker</agent_name>
+  <result>No issues found.</result>
+</background_agent_notification>`);
+
+    expect(tracker.activeAgents[0].status).toBe('completed');
+  });
+
+  it('handles failed status with error emoji', async () => {
     await tracker.handleEvent({
       type: 'content_block_start',
       index: 0,
       content_block: { type: 'tool_use', id: 'toolu_1', name: 'dispatch_agent', input: {} },
     } as StreamInnerEvent);
 
-    await tracker.handleEvent({
-      type: 'content_block_delta',
-      index: 0,
-      delta: { type: 'input_json_delta', partial_json: '{"name": "spec-reviewer"}' },
-    } as StreamInnerEvent);
+    await tracker.handleEvent({ type: 'content_block_stop', index: 0 } as StreamInnerEvent);
 
-    await tracker.handleEvent({
-      type: 'content_block_stop',
-      index: 0,
-    } as StreamInnerEvent);
+    await tracker.handleToolResult('toolu_1', 'agent_id: builder@team\nSpawned successfully');
 
-    // Write mailbox
-    const mailboxFile = path.join(tmpDir, 'team-lead.json');
-    fs.writeFileSync(mailboxFile, JSON.stringify([{
-      from: 'spec-reviewer',
-      text: 'Done',
-      summary: 'Complete',
-      timestamp: new Date().toISOString(),
-      color: 'green',
-      read: false,
-    }]));
+    await tracker.handleBackgroundNotification(`<background_agent_notification>
+  <parent_tool_use_id>toolu_1</parent_tool_use_id>
+  <status>failed</status>
+  <result>Build failed: missing dependency</result>
+</background_agent_notification>`);
 
-    tracker.setTeamName('test-team');
-    (tracker as any).mailboxPath = mailboxFile;
-    (tracker as any).lastMailboxCount = 0;
-    (tracker as any).processMailbox();
-
-    // Callback is deferred by 500ms
-    await vi.advanceTimersByTimeAsync(600);
-    expect(reportedCb).toHaveBeenCalledOnce();
+    expect(tracker.activeAgents[0].status).toBe('failed');
+    const lastEdit = sender.edits[sender.edits.length - 1];
+    expect(lastEdit.text).toContain('❌');
   });
 
-  it('processMailbox handles multiple agents and messages', async () => {
-    // Set up two dispatched agents
+  it('fires onAllReported callback when all agents complete via notifications', async () => {
+    const callback = vi.fn();
+    tracker.setOnAllReported(callback);
+
+    // Set up two agents
     await tracker.handleEvent({
       type: 'content_block_start',
       index: 0,
       content_block: { type: 'tool_use', id: 'toolu_1', name: 'dispatch_agent', input: {} },
-    } as StreamInnerEvent);
-    await tracker.handleEvent({
-      type: 'content_block_delta',
-      index: 0,
-      delta: { type: 'input_json_delta', partial_json: '{"name": "spec-reviewer"}' },
     } as StreamInnerEvent);
     await tracker.handleEvent({ type: 'content_block_stop', index: 0 } as StreamInnerEvent);
+    await tracker.handleToolResult('toolu_1', 'agent_id: a@team\nSpawned successfully');
 
     await tracker.handleEvent({
       type: 'content_block_start',
       index: 1,
       content_block: { type: 'tool_use', id: 'toolu_2', name: 'Task', input: {} },
     } as StreamInnerEvent);
-    await tracker.handleEvent({
-      type: 'content_block_delta',
-      index: 1,
-      delta: { type: 'input_json_delta', partial_json: '{"name": "code-reviewer"}' },
-    } as StreamInnerEvent);
     await tracker.handleEvent({ type: 'content_block_stop', index: 1 } as StreamInnerEvent);
+    await tracker.handleToolResult('toolu_2', 'agent_id: b@team\nSpawned successfully');
 
-    // Write mailbox with both results
-    const mailboxFile = path.join(tmpDir, 'team-lead.json');
-    fs.writeFileSync(mailboxFile, JSON.stringify([
-      { from: 'spec-reviewer', text: 'Spec OK', summary: 'Passed', timestamp: new Date().toISOString(), color: 'green', read: false },
-      { from: 'code-reviewer', text: 'Code OK', summary: 'Clean', timestamp: new Date().toISOString(), color: 'green', read: false },
-    ]));
+    // First notification — not all complete yet
+    await tracker.handleBackgroundNotification(`<background_agent_notification>
+  <parent_tool_use_id>toolu_1</parent_tool_use_id>
+  <status>completed</status>
+</background_agent_notification>`);
 
-    tracker.setTeamName('test-team');
-    (tracker as any).mailboxPath = mailboxFile;
-    (tracker as any).lastMailboxCount = 0;
-    (tracker as any).processMailbox();
+    expect(callback).not.toHaveBeenCalled();
 
-    await (tracker as any).sendQueue;
+    // Second notification — all complete now
+    await tracker.handleBackgroundNotification(`<background_agent_notification>
+  <parent_tool_use_id>toolu_2</parent_tool_use_id>
+  <status>completed</status>
+</background_agent_notification>`);
 
-    const completed = tracker.activeAgents.filter(a => a.status === 'completed');
-    expect(completed).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(600);
+    expect(callback).toHaveBeenCalledOnce();
   });
 
-  it('processMailbox ignores unmatched from field', async () => {
+  it('ignores notifications for already-completed agents', async () => {
     await tracker.handleEvent({
       type: 'content_block_start',
       index: 0,
       content_block: { type: 'tool_use', id: 'toolu_1', name: 'dispatch_agent', input: {} },
     } as StreamInnerEvent);
-    await tracker.handleEvent({
-      type: 'content_block_delta',
-      index: 0,
-      delta: { type: 'input_json_delta', partial_json: '{"name": "spec-reviewer"}' },
-    } as StreamInnerEvent);
+
     await tracker.handleEvent({ type: 'content_block_stop', index: 0 } as StreamInnerEvent);
 
-    const mailboxFile = path.join(tmpDir, 'team-lead.json');
-    fs.writeFileSync(mailboxFile, JSON.stringify([
-      { from: 'unknown-agent', text: 'Hi', summary: 'Mystery', timestamp: new Date().toISOString(), read: false },
-    ]));
+    // Complete via tool_result (normal completion)
+    await tracker.handleToolResult('toolu_1', 'Done normally.');
 
-    tracker.setTeamName('test-team');
-    (tracker as any).mailboxPath = mailboxFile;
-    (tracker as any).lastMailboxCount = 0;
-    (tracker as any).processMailbox();
+    const editsAfterResult = sender.edits.length;
 
-    // Agent should still be dispatched (not completed)
-    expect(tracker.activeAgents[0].status).toBe('dispatched');
+    // Duplicate notification arrives — should be ignored
+    await tracker.handleBackgroundNotification(`<background_agent_notification>
+  <parent_tool_use_id>toolu_1</parent_tool_use_id>
+  <status>completed</status>
+</background_agent_notification>`);
+
+    expect(sender.edits.length).toBe(editsAfterResult);
   });
 
-  it('processMailbox truncates long text', async () => {
-    await tracker.handleEvent({
-      type: 'content_block_start',
-      index: 0,
-      content_block: { type: 'tool_use', id: 'toolu_1', name: 'dispatch_agent', input: {} },
-    } as StreamInnerEvent);
-    await tracker.handleEvent({
-      type: 'content_block_delta',
-      index: 0,
-      delta: { type: 'input_json_delta', partial_json: '{"name": "spec-reviewer"}' },
-    } as StreamInnerEvent);
-    await tracker.handleEvent({ type: 'content_block_stop', index: 0 } as StreamInnerEvent);
+  it('ignores notifications with no matching agent', async () => {
+    await tracker.handleBackgroundNotification(`<background_agent_notification>
+  <parent_tool_use_id>toolu_nonexistent</parent_tool_use_id>
+  <status>completed</status>
+</background_agent_notification>`);
 
-    const longText = 'X'.repeat(2000);
-    const mailboxFile = path.join(tmpDir, 'team-lead.json');
-    fs.writeFileSync(mailboxFile, JSON.stringify([
-      { from: 'spec-reviewer', text: longText, summary: 'Done', timestamp: new Date().toISOString(), color: 'green', read: false },
-    ]));
-
-    tracker.setTeamName('test-team');
-    (tracker as any).mailboxPath = mailboxFile;
-    (tracker as any).lastMailboxCount = 0;
-    (tracker as any).processMailbox();
-
-    await (tracker as any).sendQueue;
-
-    const lastEdit = sender.edits[sender.edits.length - 1];
-    expect(lastEdit.text).toContain('…');
-    // Should be truncated - text portion should be ~1024 + markup
-    expect(lastEdit.text.length).toBeLessThan(1300);
-  });
-
-  it('uses color emoji from mailbox message', async () => {
-    await tracker.handleEvent({
-      type: 'content_block_start',
-      index: 0,
-      content_block: { type: 'tool_use', id: 'toolu_1', name: 'dispatch_agent', input: {} },
-    } as StreamInnerEvent);
-    await tracker.handleEvent({
-      type: 'content_block_delta',
-      index: 0,
-      delta: { type: 'input_json_delta', partial_json: '{"name": "spec-reviewer"}' },
-    } as StreamInnerEvent);
-    await tracker.handleEvent({ type: 'content_block_stop', index: 0 } as StreamInnerEvent);
-
-    const mailboxFile = path.join(tmpDir, 'team-lead.json');
-    fs.writeFileSync(mailboxFile, JSON.stringify([
-      { from: 'spec-reviewer', text: 'Failed!', summary: 'Errors found', timestamp: new Date().toISOString(), color: 'red', read: false },
-    ]));
-
-    tracker.setTeamName('test-team');
-    (tracker as any).mailboxPath = mailboxFile;
-    (tracker as any).lastMailboxCount = 0;
-    (tracker as any).processMailbox();
-
-    await (tracker as any).sendQueue;
-
-    const lastEdit = sender.edits[sender.edits.length - 1];
-    expect(lastEdit.text).toContain('❌');
+    // No agents tracked, no edits
+    expect(sender.edits).toHaveLength(0);
   });
 });
 
@@ -735,7 +695,6 @@ More text`;
   it('preserves code blocks containing tables', () => {
     const md = '```\n| a | b |\n|---|---|\n| 1 | 2 |\n```';
     const html = markdownToHtml(md);
-    // Should be inside <pre><code>, not converted
     expect(html).toContain('<pre>');
     expect(html).toContain('| a | b |');
   });

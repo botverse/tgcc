@@ -289,6 +289,15 @@ export class CCProcess extends EventEmitter {
                 content: resultText,
               });
             }
+            // Detect <background_agent_notification> XML in text content blocks
+            if (block.type === 'text') {
+              const text = typeof block.content === 'string'
+                ? block.content
+                : (block as { text?: string }).text ?? '';
+              if (text.includes('<background_agent_notification>')) {
+                this.emit('background_notification', text);
+              }
+            }
           }
         }
         break;

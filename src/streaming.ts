@@ -1,6 +1,5 @@
-import { readFileSync, watchFile, unwatchFile, existsSync, mkdirSync } from 'node:fs';
-import { join, dirname } from 'node:path';
-import { homedir } from 'node:os';
+import { readFileSync, existsSync, statSync } from 'node:fs';
+import type pino from 'pino';
 import type {
   StreamInnerEvent,
   StreamContentBlockStart,
@@ -591,10 +590,11 @@ export interface SubAgentInfo {
   tgMessageId: number | null;
   status: 'running' | 'dispatched' | 'completed' | 'failed';
   label: string;
-  agentName: string;  // CC's agent name (used as 'from' in mailbox)
+  agentName: string;  // CC's agent name (used for notification matching)
   inputPreview: string;
   dispatchedAt: number | null;         // timestamp when dispatched (for elapsed timer)
   elapsedTimer: ReturnType<typeof setInterval> | null;  // periodic edit timer
+  outputFile: string | null;           // path to agent output file (from auto-backgrounding)
 }
 
 export interface SubAgentSender {
@@ -605,36 +605,64 @@ export interface SubAgentSender {
 export interface SubAgentTrackerOptions {
   chatId: number | string;
   sender: SubAgentSender;
+  logger?: pino.Logger;
 }
 
-/** A single mailbox message from a CC background sub-agent. */
-export interface MailboxMessage {
-  from: string;
-  text: string;
-  summary: string;
-  timestamp: string;
-  color?: string;
-  read: boolean;
+/** Parsed background agent notification from CC's injected XML. */
+export interface BackgroundNotification {
+  parentToolUseId: string;
+  status: string;
+  agentName?: string;
+  result?: string;
 }
 
-/** Callback invoked when all tracked sub-agents have reported via mailbox. */
+/** Callback invoked when all tracked sub-agents have reported. */
 export type AllAgentsReportedCallback = () => void;
+
+/**
+ * Parse `<background_agent_notification>` XML from CC user messages.
+ * Returns parsed notifications or empty array if none found.
+ */
+export function parseBackgroundNotifications(text: string): BackgroundNotification[] {
+  const notifications: BackgroundNotification[] = [];
+  const regex = /<background_agent_notification>([\s\S]*?)<\/background_agent_notification>/g;
+  let match: RegExpExecArray | null;
+
+  while ((match = regex.exec(text)) !== null) {
+    const xml = match[1];
+    const getTag = (tag: string): string | undefined => {
+      const m = xml.match(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`));
+      return m?.[1]?.trim();
+    };
+
+    const parentToolUseId = getTag('parent_tool_use_id');
+    const status = getTag('status');
+    if (!parentToolUseId || !status) continue;
+
+    notifications.push({
+      parentToolUseId,
+      status,
+      agentName: getTag('agent_name') || getTag('name'),
+      result: getTag('result') || getTag('summary'),
+    });
+  }
+
+  return notifications;
+}
 
 export class SubAgentTracker {
   private chatId: number | string;
   private sender: SubAgentSender;
+  private logger: pino.Logger | null;
   private agents = new Map<string, SubAgentInfo>();        // toolUseId → info
   private blockToAgent = new Map<number, string>();         // blockIndex → toolUseId
   private sendQueue: Promise<void> = Promise.resolve();
-  private teamName: string | null = null;
-  private mailboxPath: string | null = null;
-  private mailboxWatching = false;
-  private lastMailboxCount = 0;
   private onAllReported: AllAgentsReportedCallback | null = null;
 
   constructor(options: SubAgentTrackerOptions) {
     this.chatId = options.chatId;
     this.sender = options.sender;
+    this.logger = options.logger ?? null;
   }
 
   get activeAgents(): SubAgentInfo[] {
@@ -658,11 +686,7 @@ export class SubAgentTracker {
     for (const [, info] of this.agents) {
       if (info.status !== 'dispatched' || !info.tgMessageId) continue;
       info.status = 'completed';
-      // Clear elapsed timer
-      if (info.elapsedTimer) {
-        clearInterval(info.elapsedTimer);
-        info.elapsedTimer = null;
-      }
+      this.clearElapsedTimer(info);
       const label = info.label || info.toolName;
       const text = `✅ ${escapeHtml(label)} — see main message`;
       this.sendQueue = this.sendQueue.then(async () => {
@@ -702,18 +726,32 @@ export class SubAgentTracker {
     if (!info || !info.tgMessageId) return;
 
     // Detect background agent spawn confirmations — keep as dispatched, don't mark completed
-    // Spawn confirmations contain "agent_id:" and "Spawned" patterns
     const isSpawnConfirmation = /agent_id:\s*\S+@\S+/.test(result) || /[Ss]pawned\s+successfully/i.test(result);
-    console.log(`[SUBAGENT] handleToolResult: toolUseId=${toolUseId}, isSpawn=${isSpawnConfirmation}, result=${result.slice(0, 100)}`);
-    if (isSpawnConfirmation) {
-      // Extract agent name from spawn confirmation for mailbox matching
+
+    // Detect auto-backgrounding: CC converts sync agents to background after 120s
+    const isAutoBackgrounded = /async_launched/i.test(result) || /status.*async/i.test(result);
+
+    this.logger?.debug({ toolUseId, isSpawnConfirmation, isAutoBackgrounded }, 'handleToolResult');
+
+    if (isSpawnConfirmation || isAutoBackgrounded) {
+      // Extract agent name from spawn confirmation for notification matching
       const nameMatch = result.match(/name:\s*(\S+)/);
       if (nameMatch && !info.agentName) info.agentName = nameMatch[1];
       const agentIdMatch = result.match(/agent_id:\s*(\S+)@/);
       if (agentIdMatch && !info.agentName) info.agentName = agentIdMatch[1];
 
+      // Extract outputFile path from auto-backgrounding result
+      const outputFileMatch = result.match(/outputFile['":\s]+([^\s'"]+\.md)/);
+      if (outputFileMatch) {
+        info.outputFile = outputFileMatch[1];
+        this.logger?.debug({ toolUseId, outputFile: info.outputFile }, 'Agent output file detected');
+      }
+
       const label = info.label || info.toolName;
-      const text = `🤖 ${escapeHtml(label)} — Spawned, waiting for results…`;
+      const statusText = isAutoBackgrounded
+        ? '🤖 %label% — Auto-backgrounded, waiting for results…'
+        : '🤖 %label% — Spawned, waiting for results…';
+      const text = statusText.replace('%label%', escapeHtml(label));
       this.sendQueue = this.sendQueue.then(async () => {
         try {
           await this.sender.editMessage(this.chatId, info.tgMessageId!, text, 'HTML');
@@ -723,32 +761,79 @@ export class SubAgentTracker {
       return;
     }
 
-    // Clear elapsed timer
+    // Normal tool result — mark completed
     this.clearElapsedTimer(info);
-
     info.status = 'completed';
 
     const label = info.label || info.toolName;
-    // Truncate result for blockquote (TG message limit ~4096 chars)
     const maxResultLen = 3500;
     const resultText = result.length > maxResultLen ? result.slice(0, maxResultLen) + '…' : result;
 
-    // Use expandable blockquote — collapsed shows "✅ label" + first line, tap to expand
     const text = `<blockquote expandable>✅ ${escapeHtml(label)}\n${escapeHtml(resultText)}</blockquote>`;
 
     this.sendQueue = this.sendQueue.then(async () => {
       try {
-        await this.sender.editMessage(
-          this.chatId,
-          info.tgMessageId!,
-          text,
-          'HTML',
-        );
-      } catch {
-        // Ignore edit failures
-      }
+        await this.sender.editMessage(this.chatId, info.tgMessageId!, text, 'HTML');
+      } catch { /* ignore */ }
     });
     await this.sendQueue;
+  }
+
+  /**
+   * Handle a background_agent_notification from CC's injected XML in user messages.
+   * This is the primary mechanism for detecting background agent completion.
+   */
+  async handleBackgroundNotification(xmlText: string): Promise<void> {
+    const notifications = parseBackgroundNotifications(xmlText);
+
+    for (const notif of notifications) {
+      this.logger?.debug({ notif }, 'Processing background agent notification');
+
+      // Match by parent_tool_use_id (most reliable)
+      let matched: SubAgentInfo | undefined = this.agents.get(notif.parentToolUseId);
+
+      // Fallback: match by agent name against dispatched agents
+      if (!matched && notif.agentName) {
+        matched = this.findAgentByName(notif.agentName) ?? undefined;
+      }
+
+      if (!matched) {
+        this.logger?.debug({ parentToolUseId: notif.parentToolUseId, agentName: notif.agentName }, 'No matching agent for notification');
+        continue;
+      }
+
+      if (matched.status !== 'dispatched') continue;
+
+      this.clearElapsedTimer(matched);
+
+      const isSuccess = notif.status === 'completed';
+      matched.status = isSuccess ? 'completed' : 'failed';
+
+      if (!matched.tgMessageId) continue;
+
+      const label = matched.label || matched.toolName;
+      const emoji = isSuccess ? '✅' : '❌';
+      const summary = notif.result || notif.status;
+      const maxLen = 1024;
+      const body = summary.length > maxLen ? summary.slice(0, maxLen) + '…' : summary;
+
+      const text = `<blockquote expandable>${emoji} ${escapeHtml(label)} — ${escapeHtml(notif.status)}\n${escapeHtml(body)}</blockquote>`;
+
+      const msgId = matched.tgMessageId;
+      this.sendQueue = this.sendQueue.then(async () => {
+        try {
+          await this.sender.editMessage(this.chatId, msgId, text, 'HTML');
+        } catch { /* ignore */ }
+      });
+    }
+
+    // Check if ALL dispatched agents are now completed
+    this.checkAllReported();
+  }
+
+  /** Set callback invoked when ALL dispatched sub-agents have reported. */
+  setOnAllReported(cb: AllAgentsReportedCallback | null): void {
+    this.onAllReported = cb;
   }
 
   private async onBlockStart(event: StreamContentBlockStart): Promise<void> {
@@ -768,12 +853,12 @@ export class SubAgentTracker {
       inputPreview: '',
       dispatchedAt: null,
       elapsedTimer: null,
+      outputFile: null,
     };
 
     this.agents.set(block.id, info);
     this.blockToAgent.set(event.index, block.id);
 
-    // Send standalone message (no reply_to — cleaner in private chat)
     this.sendQueue = this.sendQueue.then(async () => {
       try {
         const msgId = await this.sender.sendMessage(
@@ -782,7 +867,7 @@ export class SubAgentTracker {
           'HTML',
         );
         info.tgMessageId = msgId;
-      } catch (err) {
+      } catch {
         // Silently ignore — main stream continues regardless
       }
     });
@@ -798,7 +883,7 @@ export class SubAgentTracker {
 
     info.inputPreview += event.delta.partial_json;
 
-    // Extract agent name from input JSON (used for mailbox matching)
+    // Extract agent name from input JSON (used for notification matching)
     if (!info.agentName) {
       try {
         const parsed = JSON.parse(info.inputPreview);
@@ -806,18 +891,15 @@ export class SubAgentTracker {
           info.agentName = parsed.name.trim();
         }
       } catch {
-        // Partial JSON — try extracting name field
         const nameMatch = info.inputPreview.match(/"name"\s*:\s*"([^"]+)"/);
         if (nameMatch) info.agentName = nameMatch[1];
       }
     }
 
-    // Try to extract an agent label
     if (!info.label) {
       const label = extractAgentLabel(info.inputPreview);
       if (label) {
         info.label = label;
-        // Once we have a label, update the message to show it
         const displayLabel = info.label;
         this.sendQueue = this.sendQueue.then(async () => {
           try {
@@ -827,9 +909,7 @@ export class SubAgentTracker {
               `🤖 ${escapeHtml(displayLabel)} — Working…`,
               'HTML',
             );
-          } catch {
-            // Ignore edit failures
-          }
+          } catch { /* ignore */ }
         });
         await this.sendQueue;
       }
@@ -843,11 +923,9 @@ export class SubAgentTracker {
     const info = this.agents.get(toolUseId);
     if (!info || !info.tgMessageId) return;
 
-    // content_block_stop = input done, NOT sub-agent done. Mark as dispatched.
     info.status = 'dispatched';
     info.dispatchedAt = Date.now();
 
-    // Final chance to extract label from complete input
     if (!info.label) {
       const label = extractAgentLabel(info.inputPreview);
       if (label) info.label = label;
@@ -858,25 +936,16 @@ export class SubAgentTracker {
 
     this.sendQueue = this.sendQueue.then(async () => {
       try {
-        await this.sender.editMessage(
-          this.chatId,
-          info.tgMessageId!,
-          text,
-          'HTML',
-        );
-      } catch {
-        // Ignore edit failures
-      }
+        await this.sender.editMessage(this.chatId, info.tgMessageId!, text, 'HTML');
+      } catch { /* ignore */ }
     });
     await this.sendQueue;
 
-    // Start elapsed timer — update every 15s to show progress
     this.startElapsedTimer(info);
   }
 
-  /** Start a periodic timer that edits the message with elapsed time */
   private startElapsedTimer(info: SubAgentInfo): void {
-    if (info.elapsedTimer) return; // already running
+    if (info.elapsedTimer) return;
 
     const displayLabel = info.label || info.toolName;
 
@@ -891,20 +960,12 @@ export class SubAgentTracker {
 
       this.sendQueue = this.sendQueue.then(async () => {
         try {
-          await this.sender.editMessage(
-            this.chatId,
-            info.tgMessageId!,
-            text,
-            'HTML',
-          );
-        } catch {
-          // Ignore edit failures (rate limits, not modified, etc.)
-        }
+          await this.sender.editMessage(this.chatId, info.tgMessageId!, text, 'HTML');
+        } catch { /* ignore */ }
       });
     }, 15_000);
   }
 
-  /** Clear the elapsed timer for a sub-agent */
   private clearElapsedTimer(info: SubAgentInfo): void {
     if (info.elapsedTimer) {
       clearInterval(info.elapsedTimer);
@@ -912,165 +973,38 @@ export class SubAgentTracker {
     }
   }
 
-  /** Set callback invoked when ALL dispatched sub-agents have mailbox results. */
-  setOnAllReported(cb: AllAgentsReportedCallback | null): void {
-    this.onAllReported = cb;
-  }
-
-  /** Set the CC team name (extracted from spawn confirmation tool_result). */
-  setTeamName(name: string): void {
-    this.teamName = name;
-    this.mailboxPath = join(
-      homedir(),
-      '.claude', 'teams', name, 'inboxes', 'team-lead.json',
-    );
-  }
-
-  get currentTeamName(): string | null { return this.teamName; }
-  get isMailboxWatching(): boolean { return this.mailboxWatching; }
-
-  /** Start watching the mailbox file for sub-agent results. */
-  startMailboxWatch(): void {
-    if (this.mailboxWatching) {
-      console.log('[MAILBOX] Already watching, skipping');
-      return;
-    }
-    if (!this.mailboxPath) {
-      console.log('[MAILBOX] No mailbox path set, cannot watch');
-      return;
-    }
-    console.log(`[MAILBOX] Starting watch on ${this.mailboxPath}`);
-    this.mailboxWatching = true;
-
-    // Ensure directory exists so watchFile doesn't error
-    const dir = dirname(this.mailboxPath);
-    if (!existsSync(dir)) {
-      mkdirSync(dir, { recursive: true });
-    }
-
-    // Start from 0 — process all messages including pre-existing ones
-    // Background agents may finish before the watcher starts
-    this.lastMailboxCount = 0;
-
-    // Process immediately in case messages arrived before watching
-    this.processMailbox();
-
-    watchFile(this.mailboxPath, { interval: 2000 }, () => {
-      this.processMailbox();
-    });
-  }
-
-  /** Stop watching the mailbox file. */
-  stopMailboxWatch(): void {
-    if (!this.mailboxWatching || !this.mailboxPath) return;
-    try {
-      unwatchFile(this.mailboxPath);
-    } catch { /* ignore */ }
-    this.mailboxWatching = false;
-  }
-
-  /** Read and parse the mailbox file. Returns [] on any error. */
-  private readMailboxMessages(): MailboxMessage[] {
-    if (!this.mailboxPath || !existsSync(this.mailboxPath)) return [];
-    try {
-      const raw = readFileSync(this.mailboxPath, 'utf-8');
-      const parsed = JSON.parse(raw);
-      return Array.isArray(parsed) ? parsed : [];
-    } catch {
-      return [];
-    }
-  }
-
-  /** Process new mailbox messages and update sub-agent TG messages. */
-  private processMailbox(): void {
-    const messages = this.readMailboxMessages();
-    console.log(`[MAILBOX] processMailbox: ${messages.length} total, lastCount=${this.lastMailboxCount}, dispatched=${[...this.agents.values()].filter(a => a.status === 'dispatched').length}`);
-    if (messages.length <= this.lastMailboxCount) return;
-
-    const newMessages = messages.slice(this.lastMailboxCount);
-    this.lastMailboxCount = messages.length;
-
-    for (const msg of newMessages) {
-      // Don't filter by msg.read — CC may read its mailbox before our 2s poll fires
-      // We track by message count (lastMailboxCount) to avoid duplicates
-
-      // Skip idle notifications (JSON objects, not real results)
-      if (msg.text.startsWith('{')) continue;
-
-      // Match msg.from to a tracked sub-agent by label
-      const matched = this.findAgentByFrom(msg.from);
-      console.log(`[MAILBOX] Message from="${msg.from}", matched=${matched?.agentName || matched?.label || 'NONE'}, agents=[${[...this.agents.values()].map(a => `${a.agentName}/${a.label}/${a.status}`).join(', ')}]`);
-      if (!matched) continue;
-
-      // Clear elapsed timer
-      this.clearElapsedTimer(matched);
-      matched.status = 'completed';
-
-      if (!matched.tgMessageId) continue;
-
-      const label = matched.label || matched.toolName;
-      const summary = msg.summary || 'Done';
-      // Truncate text for blockquote (TG limit)
-      const maxTextLen = 1024;
-      const bodyText = msg.text.length > maxTextLen
-        ? msg.text.slice(0, maxTextLen) + '…'
-        : msg.text;
-
-      const colorEmoji = msg.color === 'green' ? '✅'
-        : msg.color === 'red' ? '❌'
-        : msg.color === 'yellow' ? '⚠️'
-        : '✅';
-
-      const text = `<blockquote expandable>${colorEmoji} ${escapeHtml(label)} — ${escapeHtml(summary)}\n${escapeHtml(bodyText)}</blockquote>`;
-
-      const msgId = matched.tgMessageId;
-      this.sendQueue = this.sendQueue.then(async () => {
-        try {
-          await this.sender.editMessage(this.chatId, msgId, text, 'HTML');
-        } catch { /* ignore */ }
-      });
-    }
-
-    // Check if ALL dispatched agents are now completed
-    if (this.onAllReported && !this.hasDispatchedAgents && this.agents.size > 0) {
-      // All done — invoke callback
-      const cb = this.onAllReported;
-      // Defer slightly to let edits flush
-      setTimeout(() => cb(), 500);
-    }
-  }
-
-  /** Find a tracked sub-agent whose label matches the mailbox message's `from` field. */
-  private findAgentByFrom(from: string): SubAgentInfo | null {
-    const fromLower = from.toLowerCase();
+  /** Find a dispatched sub-agent by its agentName. */
+  private findAgentByName(name: string): SubAgentInfo | null {
+    const nameLower = name.toLowerCase();
     for (const info of this.agents.values()) {
       if (info.status !== 'dispatched') continue;
-      // Primary match: agentName (CC's internal agent name, used as mailbox 'from')
-      if (info.agentName && info.agentName.toLowerCase() === fromLower) {
+      if (info.agentName && info.agentName.toLowerCase() === nameLower) {
         return info;
       }
       // Fallback: fuzzy label match
       const label = (info.label || info.toolName).toLowerCase();
-      if (label === fromLower || label.includes(fromLower) || fromLower.includes(label)) {
+      if (label === nameLower || label.includes(nameLower) || nameLower.includes(label)) {
         return info;
       }
     }
     return null;
   }
 
+  /** Check if all agents have completed and fire callback if so. */
+  private checkAllReported(): void {
+    if (this.onAllReported && !this.hasDispatchedAgents && this.agents.size > 0) {
+      const cb = this.onAllReported;
+      setTimeout(() => cb(), 500);
+    }
+  }
+
   reset(): void {
-    // Stop mailbox watching
-    this.stopMailboxWatch();
-    // Clear all elapsed timers before resetting
     for (const info of this.agents.values()) {
       this.clearElapsedTimer(info);
     }
     this.agents.clear();
     this.blockToAgent.clear();
     this.sendQueue = Promise.resolve();
-    this.teamName = null;
-    this.mailboxPath = null;
-    this.lastMailboxCount = 0;
     this.onAllReported = null;
   }
 }

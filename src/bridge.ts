@@ -21,7 +21,7 @@ import {
   type ResultEvent,
   type StreamInnerEvent,
 } from './cc-protocol.js';
-import { StreamAccumulator, SubAgentTracker, splitText, escapeHtml, type TelegramSender, type SubAgentSender, type MailboxMessage } from './streaming.js';
+import { StreamAccumulator, SubAgentTracker, splitText, escapeHtml, type TelegramSender, type SubAgentSender } from './streaming.js';
 import { TelegramBot, type TelegramMessage, type SlashCommand, type CallbackQuery } from './telegram.js';
 import { InlineKeyboard } from 'grammy';
 import { McpBridgeServer, type McpToolRequest, type McpToolResponse } from './mcp-bridge.js';
@@ -487,39 +487,31 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
       const resultText = typeof event.content === 'string' ? event.content : JSON.stringify(event.content);
 
-      // Try to extract team name from sub-agent spawn confirmation
-      if (!tracker.currentTeamName) {
-        const teamMatch = resultText.match(/agent_id:\s*\S+@(\S+)/);
-        if (teamMatch) {
-          const teamName = teamMatch[1];
-          this.logger.info({ agentId, teamName }, 'Extracted team name from tool_result');
-          tracker.setTeamName(teamName);
-
-          // Wire the "all agents reported" callback to send follow-up to CC
-          tracker.setOnAllReported(() => {
-            const ccProc = agent.processes.get(userId);
-            if (ccProc && ccProc.state === 'active') {
-              ccProc.sendMessage(createTextMessage(
-                'All background agents have reported back. Please read their results and provide a synthesis.',
-              ));
-            }
-          });
-
-          // Don't start watching here — wait until after handleToolResult
-          // sets agent names (needed for mailbox message matching)
-          console.log(`[BRIDGE] Team name set: ${teamName}, will start watch after handleToolResult`);
-        }
-      }
-
-      // Handle tool result FIRST (sets agentName for mailbox matching)
       if (event.tool_use_id) {
         tracker.handleToolResult(event.tool_use_id, resultText);
       }
 
-      // Start mailbox watch AFTER handleToolResult has set agent names
-      if (tracker.currentTeamName && tracker.hasDispatchedAgents && !tracker.isMailboxWatching) {
-        tracker.startMailboxWatch();
+      // Wire "all agents reported" callback to prompt CC for synthesis
+      if (tracker.hasDispatchedAgents && !tracker.activeAgents.every(a => a.status !== 'dispatched')) {
+        tracker.setOnAllReported(() => {
+          const ccProc = agent.processes.get(userId);
+          if (ccProc && ccProc.state === 'active') {
+            ccProc.sendMessage(createTextMessage(
+              'All background agents have reported back. Please read their results and provide a synthesis.',
+            ));
+          }
+        });
       }
+    });
+
+    // Handle background agent completion notifications from CC's injected XML
+    proc.on('background_notification', (xmlText: string) => {
+      const accKey = `${userId}:${chatId}`;
+      const tracker = agent.subAgentTrackers.get(accKey);
+      if (!tracker) return;
+
+      this.logger.debug({ agentId }, 'Received background agent notification');
+      tracker.handleBackgroundNotification(xmlText);
     });
 
     proc.on('assistant', (event: AssistantMessage) => {
@@ -599,10 +591,10 @@ export class Bridge extends EventEmitter implements CtlHandler {
         acc.finalize();
         agent.accumulators.delete(accKey);
       }
-      // Clean up sub-agent tracker (stops mailbox watch)
+      // Clean up sub-agent tracker
       const exitTracker = agent.subAgentTrackers.get(accKey);
       if (exitTracker) {
-        exitTracker.stopMailboxWatch();
+        exitTracker.reset();
       }
       agent.subAgentTrackers.delete(accKey);
     });
@@ -645,6 +637,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
       tracker = new SubAgentTracker({
         chatId,
         sender: subAgentSender,
+        logger: this.logger,
       });
       agent.subAgentTrackers.set(accKey, tracker);
     }
@@ -701,12 +694,11 @@ export class Bridge extends EventEmitter implements CtlHandler {
       agent.tgBot.sendText(chatId, `<i>Error: ${escapeHtml(String(event.result))}</i>`, 'HTML');
     }
 
-    // If background sub-agents are still running, mailbox watcher handles them.
-    // Ensure mailbox watch is started if we have a team name and dispatched agents.
+    // If background sub-agents are still running, they'll report via
+    // <background_agent_notification> XML on CC's next user turn.
     const tracker = agent.subAgentTrackers.get(accKey);
-    if (tracker?.hasDispatchedAgents && tracker.currentTeamName) {
-      this.logger.info({ agentId }, 'Turn ended with background sub-agents still running — mailbox watcher active');
-      tracker.startMailboxWatch();
+    if (tracker?.hasDispatchedAgents) {
+      this.logger.info({ agentId }, 'Turn ended with background sub-agents still running');
     }
   }
 
