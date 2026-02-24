@@ -448,6 +448,15 @@ export class TelegramBot {
     });
   }
 
+  async replyToMessage(chatId: number | string, text: string, replyToMessageId: number, parseMode?: string): Promise<number> {
+    const msg = await this.bot.api.sendMessage(Number(chatId), text, {
+      parse_mode: parseMode as 'Markdown' | 'MarkdownV2' | 'HTML' | undefined,
+      reply_parameters: { message_id: replyToMessageId },
+    });
+    this.trackBotMessage(Number(chatId), msg.message_id, text);
+    return msg.message_id;
+  }
+
   async sendTyping(chatId: number | string): Promise<void> {
     try {
       await this.bot.api.sendChatAction(Number(chatId), 'typing');

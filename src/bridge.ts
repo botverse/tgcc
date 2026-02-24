@@ -20,7 +20,7 @@ import {
   type ResultEvent,
   type StreamInnerEvent,
 } from './cc-protocol.js';
-import { StreamAccumulator, splitText, type TelegramSender } from './streaming.js';
+import { StreamAccumulator, SubAgentTracker, splitText, type TelegramSender, type SubAgentSender } from './streaming.js';
 import { TelegramBot, type TelegramMessage, type SlashCommand, type CallbackQuery } from './telegram.js';
 import { InlineKeyboard } from 'grammy';
 import { McpBridgeServer, type McpToolRequest, type McpToolResponse } from './mcp-bridge.js';
@@ -46,6 +46,7 @@ interface AgentInstance {
   tgBot: TelegramBot;
   processes: Map<string, CCProcess>;       // userId → CCProcess
   accumulators: Map<string, StreamAccumulator>; // `${userId}:${chatId}` → accumulator
+  subAgentTrackers: Map<string, SubAgentTracker>; // `${userId}:${chatId}` → tracker
   batchers: Map<string, MessageBatcher>;   // userId → batcher
   pendingTitles: Map<string, string>;      // userId → first message text for session title
 }
@@ -189,6 +190,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
       tgBot,
       processes: new Map(),
       accumulators: new Map(),
+      subAgentTrackers: new Map(),
       batchers: new Map(),
       pendingTitles: new Map(),
     };
@@ -500,6 +502,8 @@ export class Bridge extends EventEmitter implements CtlHandler {
         acc.finalize();
         agent.accumulators.delete(accKey);
       }
+      // Clean up sub-agent tracker
+      agent.subAgentTrackers.delete(accKey);
     });
 
     proc.on('error', (err: Error) => {
@@ -527,7 +531,28 @@ export class Bridge extends EventEmitter implements CtlHandler {
       agent.accumulators.set(accKey, acc);
     }
 
+    // Sub-agent tracker — create lazily alongside the accumulator
+    let tracker = agent.subAgentTrackers.get(accKey);
+    if (!tracker) {
+      const subAgentSender: SubAgentSender = {
+        replyToMessage: (cid, text, replyTo, parseMode) =>
+          agent.tgBot.replyToMessage(cid, text, replyTo, parseMode),
+        editMessage: (cid, msgId, text, parseMode) =>
+          agent.tgBot.editText(cid, msgId, text, parseMode),
+      };
+      tracker = new SubAgentTracker({
+        chatId,
+        sender: subAgentSender,
+        getMainMessageId: () => {
+          const ids = acc!.allMessageIds;
+          return ids.length > 0 ? ids[0] : null;
+        },
+      });
+      agent.subAgentTrackers.set(accKey, tracker);
+    }
+
     acc.handleEvent(event);
+    tracker.handleEvent(event);
   }
 
   private handleResult(agentId: string, userId: string, chatId: number, event: ResultEvent): void {

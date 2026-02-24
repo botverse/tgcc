@@ -1,6 +1,8 @@
 import type {
   StreamInnerEvent,
   StreamContentBlockStart,
+  StreamContentBlockStop,
+  StreamInputJsonDelta,
   StreamTextDelta,
 } from './cc-protocol.js';
 
@@ -275,6 +277,198 @@ function findSplitPoint(text: string, threshold: number): number {
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// ── Sub-agent detection patterns ──
+
+const SUB_AGENT_TOOL_PATTERNS = [/agent/i, /dispatch/i, /^task$/i];
+
+export function isSubAgentTool(toolName: string): boolean {
+  return SUB_AGENT_TOOL_PATTERNS.some(p => p.test(toolName));
+}
+
+// ── Sub-Agent Tracker ──
+
+export interface SubAgentInfo {
+  toolUseId: string;
+  toolName: string;
+  blockIndex: number;
+  tgMessageId: number | null;
+  status: 'running' | 'completed' | 'failed';
+  inputPreview: string;
+}
+
+export interface SubAgentSender {
+  replyToMessage(chatId: number | string, text: string, replyToMessageId: number, parseMode?: string): Promise<number>;
+  editMessage(chatId: number | string, messageId: number, text: string, parseMode?: string): Promise<void>;
+}
+
+export interface SubAgentTrackerOptions {
+  chatId: number | string;
+  sender: SubAgentSender;
+  /** Returns the main streaming message ID to reply to */
+  getMainMessageId: () => number | null;
+}
+
+export class SubAgentTracker {
+  private chatId: number | string;
+  private sender: SubAgentSender;
+  private getMainMessageId: () => number | null;
+  private agents = new Map<string, SubAgentInfo>();        // toolUseId → info
+  private blockToAgent = new Map<number, string>();         // blockIndex → toolUseId
+  private sendQueue: Promise<void> = Promise.resolve();
+
+  constructor(options: SubAgentTrackerOptions) {
+    this.chatId = options.chatId;
+    this.sender = options.sender;
+    this.getMainMessageId = options.getMainMessageId;
+  }
+
+  get activeAgents(): SubAgentInfo[] {
+    return [...this.agents.values()];
+  }
+
+  async handleEvent(event: StreamInnerEvent): Promise<void> {
+    switch (event.type) {
+      case 'content_block_start':
+        await this.onBlockStart(event as StreamContentBlockStart);
+        break;
+
+      case 'content_block_delta': {
+        const delta = event as StreamInputJsonDelta;
+        if (delta.delta?.type === 'input_json_delta') {
+          await this.onInputDelta(delta);
+        }
+        break;
+      }
+
+      case 'content_block_stop':
+        await this.onBlockStop(event as StreamContentBlockStop);
+        break;
+
+      case 'message_start':
+        // New turn — reset tracker
+        this.reset();
+        break;
+    }
+  }
+
+  private async onBlockStart(event: StreamContentBlockStart): Promise<void> {
+    if (event.content_block.type !== 'tool_use') return;
+
+    const block = event.content_block as { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> };
+    if (!isSubAgentTool(block.name)) return;
+
+    const info: SubAgentInfo = {
+      toolUseId: block.id,
+      toolName: block.name,
+      blockIndex: event.index,
+      tgMessageId: null,
+      status: 'running',
+      inputPreview: '',
+    };
+
+    this.agents.set(block.id, info);
+    this.blockToAgent.set(event.index, block.id);
+
+    // Send reply message
+    const mainMsgId = this.getMainMessageId();
+    if (mainMsgId) {
+      this.sendQueue = this.sendQueue.then(async () => {
+        try {
+          const msgId = await this.sender.replyToMessage(
+            this.chatId,
+            `🔄 Sub-agent spawned: \`${block.name}\``,
+            mainMsgId,
+            'Markdown',
+          );
+          info.tgMessageId = msgId;
+        } catch (err) {
+          // Silently ignore — main stream continues regardless
+        }
+      });
+      await this.sendQueue;
+    }
+  }
+
+  private async onInputDelta(event: StreamInputJsonDelta): Promise<void> {
+    const toolUseId = this.blockToAgent.get(event.index);
+    if (!toolUseId) return;
+
+    const info = this.agents.get(toolUseId);
+    if (!info || !info.tgMessageId) return;
+
+    info.inputPreview += event.delta.partial_json;
+
+    // Throttle: only update when we have a reasonable chunk (every 200 chars)
+    if (info.inputPreview.length % 200 > 50) return;
+
+    const preview = info.inputPreview.length > 300
+      ? info.inputPreview.slice(0, 300) + '…'
+      : info.inputPreview;
+
+    this.sendQueue = this.sendQueue.then(async () => {
+      try {
+        await this.sender.editMessage(
+          this.chatId,
+          info.tgMessageId!,
+          `🔄 Sub-agent: \`${info.toolName}\`\n\n\`\`\`\n${preview}\n\`\`\``,
+          'Markdown',
+        );
+      } catch {
+        // Ignore edit failures (rate limits, not modified, etc.)
+      }
+    });
+    await this.sendQueue;
+  }
+
+  private async onBlockStop(event: StreamContentBlockStop): Promise<void> {
+    const toolUseId = this.blockToAgent.get(event.index);
+    if (!toolUseId) return;
+
+    const info = this.agents.get(toolUseId);
+    if (!info || !info.tgMessageId) return;
+
+    info.status = 'completed';
+
+    // Extract a summary from the input preview (first ~100 chars)
+    let summary = '';
+    try {
+      const parsed = JSON.parse(info.inputPreview);
+      // Common patterns: { prompt: "..." }, { task: "..." }, { command: "..." }
+      summary = parsed.prompt || parsed.task || parsed.command || parsed.description || '';
+      if (typeof summary === 'string' && summary.length > 100) {
+        summary = summary.slice(0, 100) + '…';
+      }
+    } catch {
+      summary = info.inputPreview.slice(0, 100);
+      if (info.inputPreview.length > 100) summary += '…';
+    }
+
+    const text = summary
+      ? `✅ Sub-agent completed: \`${info.toolName}\`\n_${summary}_`
+      : `✅ Sub-agent completed: \`${info.toolName}\``;
+
+    this.sendQueue = this.sendQueue.then(async () => {
+      try {
+        await this.sender.editMessage(
+          this.chatId,
+          info.tgMessageId!,
+          text,
+          'Markdown',
+        );
+      } catch {
+        // Ignore edit failures
+      }
+    });
+    await this.sendQueue;
+  }
+
+  reset(): void {
+    this.agents.clear();
+    this.blockToAgent.clear();
+    this.sendQueue = Promise.resolve();
+  }
 }
 
 // ── Utility: split a completed text into TG-sized chunks ──
