@@ -719,7 +719,7 @@ export class SubAgentTracker {
     // Detect background agent spawn confirmations — keep as dispatched, don't mark completed
     // Spawn confirmations contain "agent_id:" and "Spawned" patterns
     const isSpawnConfirmation = /agent_id:\s*\S+@\S+/.test(result) || /[Ss]pawned\s+successfully/i.test(result);
-    console.log(`[SUBAGENT] handleToolResult: toolUseId=${toolUseId}, isSpawn=${isSpawnConfirmation}, result=${result.slice(0, 100)}`);
+    
     if (isSpawnConfirmation) {
       // Extract agent name from spawn confirmation for mailbox matching
       const nameMatch = result.match(/name:\s*(\S+)/);
@@ -905,6 +905,8 @@ export class SubAgentTracker {
       const text = `🤖 ${escapeHtml(displayLabel)} — Working… (${elapsedSec}s)`;
 
       this.sendQueue = this.sendQueue.then(async () => {
+        // Re-check status inside the queue — mailbox completion may have run first
+        if (info.status !== 'dispatched') return;
         try {
           await this.sender.editMessage(
             this.chatId,
@@ -947,14 +949,14 @@ export class SubAgentTracker {
   /** Start watching the mailbox file for sub-agent results. */
   startMailboxWatch(): void {
     if (this.mailboxWatching) {
-      console.log('[MAILBOX] Already watching, skipping');
+      
       return;
     }
     if (!this.mailboxPath) {
-      console.log('[MAILBOX] No mailbox path set, cannot watch');
+      
       return;
     }
-    console.log(`[MAILBOX] Starting watch on ${this.mailboxPath}`);
+    
     this.mailboxWatching = true;
 
     // Ensure directory exists so watchFile doesn't error
@@ -999,7 +1001,6 @@ export class SubAgentTracker {
   /** Process new mailbox messages and update sub-agent TG messages. */
   private processMailbox(): void {
     const messages = this.readMailboxMessages();
-    console.log(`[MAILBOX] processMailbox: ${messages.length} total, lastCount=${this.lastMailboxCount}, dispatched=${[...this.agents.values()].filter(a => a.status === 'dispatched').length}`);
     if (messages.length <= this.lastMailboxCount) return;
 
     const newMessages = messages.slice(this.lastMailboxCount);
@@ -1014,7 +1015,6 @@ export class SubAgentTracker {
 
       // Match msg.from to a tracked sub-agent by label
       const matched = this.findAgentByFrom(msg.from);
-      console.log(`[MAILBOX] Message from="${msg.from}", matched=${matched?.agentName || matched?.label || 'NONE'}, agents=[${[...this.agents.values()].map(a => `${a.agentName}/${a.label}/${a.status}`).join(', ')}]`);
       if (!matched) continue;
 
       // Clear elapsed timer

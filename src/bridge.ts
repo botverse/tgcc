@@ -507,7 +507,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
           // Don't start watching here — wait until after handleToolResult
           // sets agent names (needed for mailbox message matching)
-          console.log(`[BRIDGE] Team name set: ${teamName}, will start watch after handleToolResult`);
+          
         }
       }
 
