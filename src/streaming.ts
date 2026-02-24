@@ -56,6 +56,7 @@ export class StreamAccumulator {
   private toolIndicators: string[] = [];
   private messageIds: number[] = []; // all message IDs sent during this turn
   private finished = false;
+  private sendQueue: Promise<void> = Promise.resolve();
 
   constructor(options: StreamAccumulatorOptions) {
     this.chatId = options.chatId;
@@ -71,7 +72,8 @@ export class StreamAccumulator {
   async handleEvent(event: StreamInnerEvent): Promise<void> {
     switch (event.type) {
       case 'message_start':
-        // Response begins — reset state
+        // New assistant turn — reset buffer but keep tgMessageId to edit same message
+        this.softReset();
         break;
 
       case 'content_block_start':
@@ -127,6 +129,11 @@ export class StreamAccumulator {
   // ── TG message management ──
 
   private async sendOrEdit(text: string): Promise<void> {
+    this.sendQueue = this.sendQueue.then(() => this._doSendOrEdit(text));
+    return this.sendQueue;
+  }
+
+  private async _doSendOrEdit(text: string): Promise<void> {
     const safeText = makeMarkdownSafe(text) || '...';
     try {
       if (!this.tgMessageId) {
@@ -142,7 +149,7 @@ export class StreamAccumulator {
         const retryAfter = (err as { parameters?: { retry_after?: number } }).parameters?.retry_after ?? 5;
         this.editIntervalMs = Math.min(this.editIntervalMs * 2, 5000);
         await sleep(retryAfter * 1000);
-        return this.sendOrEdit(text);
+        return this._doSendOrEdit(text);
       }
       // Ignore "message is not modified" errors
       if (err instanceof Error && err.message.includes('message is not modified')) return;
@@ -224,8 +231,8 @@ export class StreamAccumulator {
     }
   }
 
-  reset(): void {
-    this.tgMessageId = null;
+  /** Soft reset: clear buffer/state but keep tgMessageId so next turn edits the same message */
+  softReset(): void {
     this.buffer = '';
     this.currentBlockType = null;
     this.lastEditTime = 0;
@@ -236,6 +243,14 @@ export class StreamAccumulator {
       clearTimeout(this.editTimer);
       this.editTimer = null;
     }
+  }
+
+  /** Full reset: also clears tgMessageId (next send creates a new message) */
+  reset(): void {
+    this.softReset();
+    this.tgMessageId = null;
+    this.messageIds = [];
+    this.sendQueue = Promise.resolve();
   }
 }
 

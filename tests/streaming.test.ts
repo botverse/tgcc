@@ -204,4 +204,133 @@ describe('StreamAccumulator', () => {
 
     expect(acc.allMessageIds.length).toBeGreaterThanOrEqual(1);
   });
+
+  it('serializes concurrent sendOrEdit calls via mutex (no duplicate messages)', async () => {
+    // Simulate a slow sendMessage to expose the race condition
+    let sendCount = 0;
+    let editCount = 0;
+    const slowSender: TelegramSender = {
+      async sendMessage(_chatId, _text, _parseMode) {
+        sendCount++;
+        // Simulate async delay (network latency)
+        await new Promise<void>(r => setTimeout(r, 50));
+        return 1;
+      },
+      async editMessage() {
+        editCount++;
+      },
+    };
+
+    const slowAcc = new StreamAccumulator({
+      chatId: 123,
+      sender: slowSender,
+      editIntervalMs: 0,
+    });
+
+    // Start text block
+    await slowAcc.handleEvent({
+      type: 'content_block_start',
+      index: 0,
+      content_block: { type: 'text', text: '' },
+    } as StreamInnerEvent);
+
+    // Fire two deltas rapidly WITHOUT awaiting (simulates sync event dispatch from bridge)
+    const p1 = slowAcc.handleEvent({
+      type: 'content_block_delta',
+      index: 0,
+      delta: { type: 'text_delta', text: 'Hello' },
+    } as StreamInnerEvent);
+
+    // Don't await p1 — fire second delta immediately while first is in-flight
+    const p2 = slowAcc.handleEvent({
+      type: 'content_block_delta',
+      index: 0,
+      delta: { type: 'text_delta', text: ' world' },
+    } as StreamInnerEvent);
+
+    await Promise.all([p1, p2]);
+
+    // With the mutex, only ONE sendMessage call should have been made
+    // The second delta should have been serialized and used editMessage instead
+    expect(sendCount).toBe(1);
+    expect(editCount).toBeGreaterThanOrEqual(1);
+  });
+
+  it('softReset keeps tgMessageId for multi-turn editing', async () => {
+    // First turn: send a message
+    await acc.handleEvent({
+      type: 'content_block_start',
+      index: 0,
+      content_block: { type: 'text', text: '' },
+    } as StreamInnerEvent);
+
+    await acc.handleEvent({
+      type: 'content_block_delta',
+      index: 0,
+      delta: { type: 'text_delta', text: 'Turn 1' },
+    } as StreamInnerEvent);
+
+    await acc.finalize();
+
+    expect(sender.sentMessages).toHaveLength(1);
+    const firstMsgId = sender.sentMessages[0].messageId;
+
+    // Simulate new turn: message_start triggers softReset
+    await acc.handleEvent({ type: 'message_start' } as StreamInnerEvent);
+
+    await acc.handleEvent({
+      type: 'content_block_start',
+      index: 0,
+      content_block: { type: 'text', text: '' },
+    } as StreamInnerEvent);
+
+    await acc.handleEvent({
+      type: 'content_block_delta',
+      index: 0,
+      delta: { type: 'text_delta', text: 'Turn 2' },
+    } as StreamInnerEvent);
+
+    // Should NOT have sent a new message — should have edited the existing one
+    expect(sender.sentMessages).toHaveLength(1);
+    expect(sender.editedMessages.length).toBeGreaterThanOrEqual(1);
+    // The edit should target the same message ID
+    const lastEdit = sender.editedMessages[sender.editedMessages.length - 1];
+    expect(lastEdit.messageId).toBe(firstMsgId);
+    expect(lastEdit.text).toContain('Turn 2');
+  });
+
+  it('full reset clears tgMessageId (new message on next send)', async () => {
+    // Send a message
+    await acc.handleEvent({
+      type: 'content_block_start',
+      index: 0,
+      content_block: { type: 'text', text: '' },
+    } as StreamInnerEvent);
+
+    await acc.handleEvent({
+      type: 'content_block_delta',
+      index: 0,
+      delta: { type: 'text_delta', text: 'First' },
+    } as StreamInnerEvent);
+
+    expect(sender.sentMessages).toHaveLength(1);
+
+    // Full reset (simulates process exit)
+    acc.reset();
+
+    // Next turn should create a new message
+    await acc.handleEvent({
+      type: 'content_block_start',
+      index: 0,
+      content_block: { type: 'text', text: '' },
+    } as StreamInnerEvent);
+
+    await acc.handleEvent({
+      type: 'content_block_delta',
+      index: 0,
+      delta: { type: 'text_delta', text: 'Second' },
+    } as StreamInnerEvent);
+
+    expect(sender.sentMessages).toHaveLength(2);
+  });
 });
