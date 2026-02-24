@@ -1,0 +1,16 @@
+# Source (dist/ is enough for consumers)
+src/
+tests/
+
+# Config
+tsconfig.json
+vitest.config.ts
+.github/
+.specs/
+docs/
+
+# Dev files
+.gitignore
+.eslintrc*
+.prettierrc*
+*.tgz
