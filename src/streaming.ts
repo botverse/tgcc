@@ -956,7 +956,8 @@ export class SubAgentTracker {
     this.lastMailboxCount = messages.length;
 
     for (const msg of newMessages) {
-      if (msg.read) continue; // Already read by CC
+      // Don't filter by msg.read — CC may read its mailbox before our 2s poll fires
+      // We track by message count (lastMailboxCount) to avoid duplicates
 
       // Match msg.from to a tracked sub-agent by label
       const matched = this.findAgentByFrom(msg.from);
