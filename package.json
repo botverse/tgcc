@@ -16,6 +16,9 @@
       "esbuild"
     ]
   },
+  "bin": {
+    "tgcc": "dist/cli.js"
+  },
   "author": "fnz",
   "license": "MIT",
   "private": true,

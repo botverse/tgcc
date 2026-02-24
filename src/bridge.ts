@@ -28,6 +28,12 @@ import {
   findMissedSessions,
   formatCatchupMessage,
 } from './session.js';
+import {
+  CtlServer,
+  type CtlHandler,
+  type CtlAckResponse,
+  type CtlStatusResponse,
+} from './ctl-server.js';
 
 // ── Types ──
 
@@ -123,10 +129,11 @@ const HELP_TEXT = `*TGCC Commands*
 
 // ── Bridge ──
 
-export class Bridge extends EventEmitter {
+export class Bridge extends EventEmitter implements CtlHandler {
   private config: TgccConfig;
   private agents = new Map<string, AgentInstance>();
   private mcpServer: McpBridgeServer;
+  private ctlServer: CtlServer;
   private sessionStore: SessionStore;
   private logger: pino.Logger;
 
@@ -139,6 +146,7 @@ export class Bridge extends EventEmitter {
       (req) => this.handleMcpToolRequest(req),
       this.logger,
     );
+    this.ctlServer = new CtlServer(this, this.logger);
   }
 
   // ── Startup ──
@@ -178,6 +186,10 @@ export class Bridge extends EventEmitter {
 
     this.agents.set(agentId, instance);
     await tgBot.start();
+
+    // Start control socket for CLI access
+    const ctlSocketPath = join('/tmp/tgcc/ctl', `${agentId}.sock`);
+    this.ctlServer.listen(ctlSocketPath);
   }
 
   // ── Hot reload ──
@@ -239,6 +251,10 @@ export class Bridge extends EventEmitter {
       const socketPath = join(this.config.global.socketDir, `${agentId}-${userId}.sock`);
       this.mcpServer.close(socketPath);
     }
+
+    // Close control socket
+    const ctlSocketPath = join('/tmp/tgcc/ctl', `${agentId}.sock`);
+    this.ctlServer.close(ctlSocketPath);
 
     this.agents.delete(agentId);
   }
@@ -668,6 +684,79 @@ export class Bridge extends EventEmitter {
     }
   }
 
+  // ── Control socket handlers (CLI interface) ──
+
+  handleCtlMessage(agentId: string, text: string, sessionId?: string): CtlAckResponse {
+    const agent = this.agents.get(agentId);
+    if (!agent) {
+      // Return error via the CtlAckResponse shape won't work — but the ctl-server
+      // protocol handles errors separately. We'll throw and let it catch.
+      throw new Error(`Unknown agent: ${agentId}`);
+    }
+
+    // Use the first allowed user as the "CLI user" identity
+    const userId = agent.config.allowedUsers[0];
+    const chatId = Number(userId);
+
+    // If explicit session requested, set it
+    if (sessionId) {
+      this.sessionStore.setCurrentSession(agentId, userId, sessionId);
+    }
+
+    // Route through the same sendToCC path as Telegram
+    this.sendToCC(agentId, userId, chatId, { text });
+
+    const proc = agent.processes.get(userId);
+    return {
+      type: 'ack',
+      sessionId: proc?.sessionId ?? this.sessionStore.getUser(agentId, userId).currentSessionId,
+      state: proc?.state ?? 'idle',
+    };
+  }
+
+  handleCtlStatus(agentId?: string): CtlStatusResponse {
+    const agents: CtlStatusResponse['agents'] = [];
+    const sessions: CtlStatusResponse['sessions'] = [];
+
+    const agentIds = agentId ? [agentId] : [...this.agents.keys()];
+
+    for (const id of agentIds) {
+      const agent = this.agents.get(id);
+      if (!agent) continue;
+
+      // Aggregate process state across users
+      let state = 'idle';
+      for (const [, proc] of agent.processes) {
+        if (proc.state === 'active') { state = 'active'; break; }
+        if (proc.state === 'spawning') state = 'spawning';
+      }
+
+      const userId = agent.config.allowedUsers[0];
+      const proc = agent.processes.get(userId);
+      const userConfig = resolveUserConfig(agent.config, userId);
+
+      agents.push({
+        id,
+        state,
+        sessionId: proc?.sessionId ?? null,
+        repo: this.sessionStore.getUser(id, userId).repo || userConfig.repo,
+      });
+
+      // List sessions for this agent
+      const userState = this.sessionStore.getUser(id, userId);
+      for (const sess of userState.sessions.slice(-5).reverse()) {
+        sessions.push({
+          id: sess.id,
+          agentId: id,
+          messageCount: sess.messageCount,
+          totalCostUsd: sess.totalCostUsd,
+        });
+      }
+    }
+
+    return { type: 'status', agents, sessions };
+  }
+
   // ── MCP tool handling ──
 
   private async handleMcpToolRequest(request: McpToolRequest): Promise<McpToolResponse> {
@@ -712,6 +801,7 @@ export class Bridge extends EventEmitter {
     }
 
     this.mcpServer.closeAll();
+    this.ctlServer.closeAll();
     this.logger.info('Bridge stopped');
   }
 }
