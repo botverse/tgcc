@@ -1,5 +1,5 @@
 {
-  "name": "tgcc",
+  "name": "@fonz/tgcc",
   "version": "0.1.0",
   "description": "Telegram ↔ Claude Code CLI bridge",
   "type": "module",
@@ -21,7 +21,11 @@
   },
   "author": "fnz",
   "license": "MIT",
-  "private": true,
+  "keywords": ["telegram", "claude", "claude-code", "cli", "bridge", "ai", "anthropic"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/fonzio/tgcc"
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.26.0",
     "grammy": "^1.40.0",
