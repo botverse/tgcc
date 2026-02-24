@@ -8,7 +8,7 @@ import type {
   AgentConfig,
   ConfigDiff,
 } from './config.js';
-import type { ApiErrorEvent, PermissionRequest } from './cc-protocol.js';
+import type { ApiErrorEvent, PermissionRequest, ToolResultEvent } from './cc-protocol.js';
 import { resolveUserConfig, resolveRepoPath, updateConfig, isValidRepoName, findRepoOwner } from './config.js';
 import { CCProcess, generateMcpConfig } from './cc-process.js';
 import {
@@ -480,6 +480,15 @@ export class Bridge extends EventEmitter implements CtlHandler {
       this.handleStreamEvent(agentId, userId, chatId, event);
     });
 
+    proc.on('tool_result', (event: ToolResultEvent) => {
+      const accKey = `${userId}:${chatId}`;
+      const tracker = agent.subAgentTrackers.get(accKey);
+      if (tracker && event.tool_use_id) {
+        const resultText = typeof event.content === 'string' ? event.content : JSON.stringify(event.content);
+        tracker.handleToolResult(event.tool_use_id, resultText);
+      }
+    });
+
     proc.on('assistant', (event: AssistantMessage) => {
       // Non-streaming fallback — only used if stream_events don't fire
       // In practice, stream_events handle the display
@@ -591,18 +600,14 @@ export class Bridge extends EventEmitter implements CtlHandler {
     let tracker = agent.subAgentTrackers.get(accKey);
     if (!tracker) {
       const subAgentSender: SubAgentSender = {
-        replyToMessage: (cid, text, replyTo, parseMode) =>
-          agent.tgBot.replyToMessage(cid, text, replyTo, parseMode),
+        sendMessage: (cid, text, parseMode) =>
+          agent.tgBot.sendText(cid, text, parseMode),
         editMessage: (cid, msgId, text, parseMode) =>
           agent.tgBot.editText(cid, msgId, text, parseMode),
       };
       tracker = new SubAgentTracker({
         chatId,
         sender: subAgentSender,
-        getMainMessageId: () => {
-          const ids = acc!.allMessageIds;
-          return ids.length > 0 ? ids[0] : null;
-        },
       });
       agent.subAgentTrackers.set(accKey, tracker);
     }

@@ -197,13 +197,13 @@ describe('Library API - StreamAccumulator with custom callbacks', () => {
 
 describe('Library API - SubAgentTracker with custom callbacks', () => {
   it('works with a custom sender', async () => {
-    const replies: { text: string; replyTo: number }[] = [];
+    const sends: { text: string }[] = [];
     const edits: { id: number; text: string }[] = [];
 
     const sender: SubAgentSender = {
-      replyToMessage: async (_chatId, text, replyToMessageId) => {
-        replies.push({ text, replyTo: replyToMessageId });
-        return replies.length + 100; // mock message ID
+      sendMessage: async (_chatId, text) => {
+        sends.push({ text });
+        return sends.length + 100; // mock message ID
       },
       editMessage: async (_chatId, messageId, text) => {
         edits.push({ id: messageId, text });
@@ -213,7 +213,6 @@ describe('Library API - SubAgentTracker with custom callbacks', () => {
     const options: SubAgentTrackerOptions = {
       chatId: 456,
       sender,
-      getMainMessageId: () => 42,
     };
 
     const tracker = new SubAgentTracker(options);
@@ -225,10 +224,9 @@ describe('Library API - SubAgentTracker with custom callbacks', () => {
       content_block: { type: 'tool_use', id: 'tu_1', name: 'dispatch_agent', input: {} },
     } as any);
 
-    // Should have sent a reply
-    expect(replies.length).toBe(1);
-    expect(replies[0].text).toContain('Sub-agent spawned');
-    expect(replies[0].replyTo).toBe(42);
+    // Should have sent a standalone message (no reply_to)
+    expect(sends.length).toBe(1);
+    expect(sends[0].text).toContain('Starting sub-agent');
   });
 });
 

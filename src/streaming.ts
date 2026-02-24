@@ -44,6 +44,48 @@ export function escapeHtml(text: string): string {
  * Handles code blocks, inline code, bold, italic, strikethrough, links.
  * Falls back to HTML-escaped plain text for anything it can't convert.
  */
+/**
+ * Convert a markdown table into Telegram-friendly list format.
+ * Tables use `<b>col1</b> — col2 — col3` per data row.
+ */
+function convertMarkdownTable(tableBlock: string): string {
+  const lines = tableBlock.split('\n').filter(l => l.trim().length > 0);
+  if (lines.length < 2) return tableBlock;
+
+  const parseRow = (line: string): string[] =>
+    line.replace(/^\|/, '').replace(/\|$/, '').split('|').map(c => c.trim());
+
+  // Detect separator row (e.g. |---|---|)
+  const isSeparator = (line: string) => /^\|?\s*[-:]+\s*(\|\s*[-:]+\s*)+\|?\s*$/.test(line);
+
+  let headerRow: string[] | null = null;
+  const dataRows: string[][] = [];
+
+  let i = 0;
+  // First non-separator row is header if followed by separator
+  if (i < lines.length && !isSeparator(lines[i])) {
+    if (i + 1 < lines.length && isSeparator(lines[i + 1])) {
+      headerRow = parseRow(lines[i]);
+      i += 2; // skip header + separator
+    }
+  }
+
+  for (; i < lines.length; i++) {
+    if (!isSeparator(lines[i])) {
+      dataRows.push(parseRow(lines[i]));
+    }
+  }
+
+  if (dataRows.length === 0) return tableBlock;
+
+  return dataRows.map(cols => {
+    if (cols.length === 0) return '';
+    const first = `<b>${escapeHtml(cols[0])}</b>`;
+    const rest = cols.slice(1).map(c => escapeHtml(c));
+    return rest.length > 0 ? `${first} — ${rest.join(' — ')}` : first;
+  }).join('\n');
+}
+
 export function markdownToHtml(text: string): string {
   // First, extract code blocks to protect them from other conversions
   const codeBlocks: string[] = [];
@@ -53,6 +95,21 @@ export function markdownToHtml(text: string): string {
     codeBlocks.push(`<pre><code${langAttr}>${escapeHtml(code.replace(/\n$/, ''))}</code></pre>`);
     return `\x00CODEBLOCK${idx}\x00`;
   });
+
+  // Convert markdown tables before HTML escaping (tables contain | which is safe)
+  const tableBlocks: string[] = [];
+  result = result.replace(
+    /(?:^|\n)((?:\|[^\n]+\|\s*\n?){2,})/g,
+    (_match, table, offset) => {
+      // Only treat as table if it has a separator row
+      if (/^\|?\s*[-:]+\s*(\|\s*[-:]+\s*)+\|?\s*$/m.test(table)) {
+        const idx = tableBlocks.length;
+        tableBlocks.push(convertMarkdownTable(table.trim()));
+        return `\n\x00TABLE${idx}\x00`;
+      }
+      return _match;
+    },
+  );
 
   // Extract inline code
   const inlineCodes: string[] = [];
@@ -80,9 +137,10 @@ export function markdownToHtml(text: string): string {
   // Links: [text](url)
   result = result.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>');
 
-  // Restore code blocks and inline code
+  // Restore code blocks, inline code, and tables
   result = result.replace(/\x00CODEBLOCK(\d+)\x00/g, (_match, idx) => codeBlocks[Number(idx)]);
   result = result.replace(/\x00INLINE(\d+)\x00/g, (_match, idx) => inlineCodes[Number(idx)]);
+  result = result.replace(/\x00TABLE(\d+)\x00/g, (_match, idx) => tableBlocks[Number(idx)]);
 
   return result;
 }
@@ -464,6 +522,51 @@ export function extractSubAgentSummary(jsonInput: string, maxLen = 150): string 
   return '';
 }
 
+/** Extract a meaningful agent label from the JSON tool input.
+ *  Looks for explicit name/role fields, then "You are a [role]" patterns in the prompt,
+ *  then falls back to the first ~30 chars of the prompt.
+ */
+export function extractAgentLabel(jsonInput: string): string {
+  // Try to extract from explicit fields first
+  const fieldPatterns = ['name', 'agent_name', 'role'];
+  for (const key of fieldPatterns) {
+    const re = new RegExp(`"${key}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)`, 'i');
+    const m = jsonInput.match(re);
+    if (m?.[1]) {
+      const val = m[1].replace(/\\n/g, ' ').replace(/\\"/g, '"').trim();
+      if (val.length > 0 && val.length <= 50) return val;
+    }
+  }
+
+  // Try to find "You are a [role]" or "your role is [role]" patterns in prompt text
+  const promptRe = /"(?:prompt|task|message)"\s*:\s*"((?:[^"\\]|\\.)*)"/i;
+  const promptMatch = jsonInput.match(promptRe);
+  const promptText = promptMatch?.[1]?.replace(/\\n/g, ' ').replace(/\\"/g, '"') ?? '';
+
+  if (promptText) {
+    // "You are a spec-reviewer" or "You are the code-reviewer"
+    const youAreMatch = promptText.match(/[Yy]ou are (?:a |an |the )?([a-zA-Z][a-zA-Z0-9_ -]{1,30}?)(?:\.|,|!|\s+(?:who|that|and|responsible|tasked|for))/);
+    if (youAreMatch?.[1]) return youAreMatch[1].trim();
+
+    // "your role is [role]"
+    const roleMatch = promptText.match(/[Yy]our role is (?:a |an |the )?([a-zA-Z][a-zA-Z0-9_ -]{1,30}?)(?:\.|,|!|\s)/);
+    if (roleMatch?.[1]) return roleMatch[1].trim();
+
+    // "Role: [role]" at start or after newline
+    const roleLabelMatch = promptText.match(/(?:^|\\n|\n)\s*[Rr]ole:\s*([a-zA-Z][a-zA-Z0-9_ -]{1,30}?)(?:\.|,|!|\s*(?:\\n|\n|$))/);
+    if (roleLabelMatch?.[1]) return roleLabelMatch[1].trim();
+  }
+
+  // Fallback: first ~30 chars of the prompt
+  if (promptText) {
+    const trimmed = promptText.trim();
+    if (trimmed.length > 30) return trimmed.slice(0, 30) + '…';
+    if (trimmed.length > 0) return trimmed;
+  }
+
+  return '';
+}
+
 // ── Sub-Agent Tracker ──
 
 export interface SubAgentInfo {
@@ -471,26 +574,24 @@ export interface SubAgentInfo {
   toolName: string;
   blockIndex: number;
   tgMessageId: number | null;
-  status: 'running' | 'completed' | 'failed';
+  status: 'running' | 'dispatched' | 'completed' | 'failed';
+  label: string;
   inputPreview: string;
 }
 
 export interface SubAgentSender {
-  replyToMessage(chatId: number | string, text: string, replyToMessageId: number, parseMode?: string): Promise<number>;
+  sendMessage(chatId: number | string, text: string, parseMode?: string): Promise<number>;
   editMessage(chatId: number | string, messageId: number, text: string, parseMode?: string): Promise<void>;
 }
 
 export interface SubAgentTrackerOptions {
   chatId: number | string;
   sender: SubAgentSender;
-  /** Returns the main streaming message ID to reply to */
-  getMainMessageId: () => number | null;
 }
 
 export class SubAgentTracker {
   private chatId: number | string;
   private sender: SubAgentSender;
-  private getMainMessageId: () => number | null;
   private agents = new Map<string, SubAgentInfo>();        // toolUseId → info
   private blockToAgent = new Map<number, string>();         // blockIndex → toolUseId
   private sendQueue: Promise<void> = Promise.resolve();
@@ -498,7 +599,6 @@ export class SubAgentTracker {
   constructor(options: SubAgentTrackerOptions) {
     this.chatId = options.chatId;
     this.sender = options.sender;
-    this.getMainMessageId = options.getMainMessageId;
   }
 
   get activeAgents(): SubAgentInfo[] {
@@ -530,6 +630,33 @@ export class SubAgentTracker {
     }
   }
 
+  /** Handle a tool_result event — marks the sub-agent as completed with results */
+  async handleToolResult(toolUseId: string, result: string): Promise<void> {
+    const info = this.agents.get(toolUseId);
+    if (!info || !info.tgMessageId) return;
+
+    info.status = 'completed';
+
+    const label = info.label || info.toolName;
+    const resultPreview = result.length > 300 ? result.slice(0, 300) + '…' : result;
+
+    const text = `✅ ${escapeHtml(label)}\n<i>${escapeHtml(resultPreview)}</i>`;
+
+    this.sendQueue = this.sendQueue.then(async () => {
+      try {
+        await this.sender.editMessage(
+          this.chatId,
+          info.tgMessageId!,
+          text,
+          'HTML',
+        );
+      } catch {
+        // Ignore edit failures
+      }
+    });
+    await this.sendQueue;
+  }
+
   private async onBlockStart(event: StreamContentBlockStart): Promise<void> {
     if (event.content_block.type !== 'tool_use') return;
 
@@ -542,30 +669,27 @@ export class SubAgentTracker {
       blockIndex: event.index,
       tgMessageId: null,
       status: 'running',
+      label: '',
       inputPreview: '',
     };
 
     this.agents.set(block.id, info);
     this.blockToAgent.set(event.index, block.id);
 
-    // Send reply message
-    const mainMsgId = this.getMainMessageId();
-    if (mainMsgId) {
-      this.sendQueue = this.sendQueue.then(async () => {
-        try {
-          const msgId = await this.sender.replyToMessage(
-            this.chatId,
-            `🔄 Sub-agent spawned: <code>${escapeHtml(block.name)}</code>`,
-            mainMsgId,
-            'HTML',
-          );
-          info.tgMessageId = msgId;
-        } catch (err) {
-          // Silently ignore — main stream continues regardless
-        }
-      });
-      await this.sendQueue;
-    }
+    // Send standalone message (no reply_to — cleaner in private chat)
+    this.sendQueue = this.sendQueue.then(async () => {
+      try {
+        const msgId = await this.sender.sendMessage(
+          this.chatId,
+          '🔄 Starting sub-agent…',
+          'HTML',
+        );
+        info.tgMessageId = msgId;
+      } catch (err) {
+        // Silently ignore — main stream continues regardless
+      }
+    });
+    await this.sendQueue;
   }
 
   private async onInputDelta(event: StreamInputJsonDelta): Promise<void> {
@@ -580,16 +704,24 @@ export class SubAgentTracker {
     // Throttle: only update when we have a reasonable chunk (every 200 chars)
     if (info.inputPreview.length % 200 > 50) return;
 
+    // Try to extract an agent label
+    if (!info.label) {
+      const label = extractAgentLabel(info.inputPreview);
+      if (label) info.label = label;
+    }
+
     // Try to extract a human-readable summary from the JSON input
     const summary = extractSubAgentSummary(info.inputPreview);
     if (!summary) return; // Don't update until we have something meaningful
+
+    const displayLabel = info.label || info.toolName;
 
     this.sendQueue = this.sendQueue.then(async () => {
       try {
         await this.sender.editMessage(
           this.chatId,
           info.tgMessageId!,
-          `🔄 Sub-agent: <code>${escapeHtml(info.toolName)}</code>\n<i>${escapeHtml(summary)}</i>`,
+          `🔄 ${escapeHtml(displayLabel)}\n<i>${escapeHtml(summary)}</i>`,
           'HTML',
         );
       } catch {
@@ -606,14 +738,17 @@ export class SubAgentTracker {
     const info = this.agents.get(toolUseId);
     if (!info || !info.tgMessageId) return;
 
-    info.status = 'completed';
+    // content_block_stop = input done, NOT sub-agent done. Mark as dispatched.
+    info.status = 'dispatched';
 
-    // Extract a human-readable summary from the tool input
-    const summary = extractSubAgentSummary(info.inputPreview, 100);
+    // Final chance to extract label from complete input
+    if (!info.label) {
+      const label = extractAgentLabel(info.inputPreview);
+      if (label) info.label = label;
+    }
 
-    const text = summary
-      ? `✅ Sub-agent completed: <code>${escapeHtml(info.toolName)}</code>\n<i>${escapeHtml(summary)}</i>`
-      : `✅ Sub-agent completed: <code>${escapeHtml(info.toolName)}</code>`;
+    const displayLabel = info.label || info.toolName;
+    const text = `⏳ ${escapeHtml(displayLabel)}\nWorking…`;
 
     this.sendQueue = this.sendQueue.then(async () => {
       try {
