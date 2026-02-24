@@ -736,8 +736,8 @@ export class SubAgentTracker {
       return;
     }
 
-    // Clear elapsed timer
-
+        // Skip if already completed (e.g. via mailbox)
+    if (info.status === 'completed') return;
 
     info.status = 'completed';
 
