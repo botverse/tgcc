@@ -67,8 +67,11 @@ describe('integration: CC stream → TG messages', () => {
     expect(allTexts.some(t => t.includes('Hello!'))).toBe(true);
     expect(allTexts.some(t => t.includes('Here is my response.'))).toBe(true);
 
-    // Thinking content should NOT appear
-    expect(allTexts.every(t => !t.includes('Let me think about this'))).toBe(true);
+    // Thinking content should now appear inside an expandable blockquote
+    const hasThinkingBlockquote = allTexts.some(t =>
+      t.includes('blockquote expandable') && t.includes('Let me think about this')
+    );
+    expect(hasThinkingBlockquote).toBe(true);
   });
 
   it('processes a turn with tool use', async () => {

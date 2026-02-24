@@ -102,6 +102,7 @@ export class StreamAccumulator {
   // State
   private tgMessageId: number | null = null;
   private buffer = '';
+  private thinkingBuffer = '';
   private currentBlockType: 'text' | 'thinking' | 'tool_use' | null = null;
   private lastEditTime = 0;
   private editTimer: ReturnType<typeof setTimeout> | null = null;
@@ -138,6 +139,10 @@ export class StreamAccumulator {
         break;
 
       case 'content_block_stop':
+        if (this.currentBlockType === 'thinking' && this.thinkingBuffer) {
+          // Thinking block complete — store for later rendering with text
+          // Will be prepended as expandable blockquote when text starts or on finalize
+        }
         this.currentBlockType = null;
         break;
 
@@ -175,8 +180,13 @@ export class StreamAccumulator {
         this.buffer += delta.text;
         await this.throttledEdit();
       }
+    } else if (this.currentBlockType === 'thinking' && 'delta' in event) {
+      const delta = (event as any).delta;
+      if (delta?.type === 'thinking_delta' && delta.thinking) {
+        this.thinkingBuffer += delta.thinking;
+      }
     }
-    // Ignore thinking_delta and input_json_delta content
+    // Ignore input_json_delta content
   }
 
   // ── TG message management ──
@@ -238,16 +248,32 @@ export class StreamAccumulator {
     }
   }
 
+  /** Build the full message text including thinking blockquote prefix */
+  private buildFullText(): string {
+    let text = '';
+    if (this.thinkingBuffer) {
+      // Truncate thinking to 1024 chars max for the expandable blockquote
+      const thinkingPreview = this.thinkingBuffer.length > 1024
+        ? this.thinkingBuffer.slice(0, 1024) + '…'
+        : this.thinkingBuffer;
+      text += `<blockquote expandable>💭 Thinking\n${escapeHtml(thinkingPreview)}</blockquote>\n`;
+    }
+    text += this.buffer;
+    return text;
+  }
+
   private async doEdit(): Promise<void> {
     if (!this.buffer) return;
 
+    const fullText = this.buildFullText();
+
     // Check if we need to split
-    if (this.buffer.length > this.splitThreshold) {
+    if (fullText.length > this.splitThreshold) {
       await this.splitMessage();
       return;
     }
 
-    await this.sendOrEdit(this.buffer);
+    await this.sendOrEdit(fullText);
   }
 
   private async splitMessage(): Promise<void> {
@@ -278,17 +304,25 @@ export class StreamAccumulator {
     }
 
     if (this.buffer) {
-      // Final edit with complete text — no markdown safety needed (complete content)
-      await this.sendOrEdit(this.buffer);
-    } else if (this.thinkingIndicatorShown && !this.buffer) {
-      // Only thinking indicator was shown, no actual text — remove it
-      // This can happen on tool-only responses
+      // Final edit with complete text including thinking blockquote
+      const fullText = this.buildFullText();
+      await this.sendOrEdit(fullText);
+    } else if (this.thinkingBuffer && this.thinkingIndicatorShown) {
+      // Only thinking happened, no text — show thinking as expandable blockquote
+      const thinkingPreview = this.thinkingBuffer.length > 1024
+        ? this.thinkingBuffer.slice(0, 1024) + '…'
+        : this.thinkingBuffer;
+      await this.sendOrEdit(
+        `<blockquote expandable>💭 Thinking\n${escapeHtml(thinkingPreview)}</blockquote>`,
+        true,
+      );
     }
   }
 
   /** Soft reset: clear buffer/state but keep tgMessageId so next turn edits the same message */
   softReset(): void {
     this.buffer = '';
+    this.thinkingBuffer = '';
     this.currentBlockType = null;
     this.lastEditTime = 0;
     this.thinkingIndicatorShown = false;

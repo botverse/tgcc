@@ -203,7 +203,7 @@ describe('StreamAccumulator', () => {
     expect(allTexts.some(t => t.includes('Bash'))).toBe(true);
   });
 
-  it('ignores thinking delta content', async () => {
+  it('accumulates thinking content for expandable blockquote', async () => {
     await acc.handleEvent({
       type: 'content_block_start',
       index: 0,
@@ -213,15 +213,39 @@ describe('StreamAccumulator', () => {
     await acc.handleEvent({
       type: 'content_block_delta',
       index: 0,
-      delta: { type: 'thinking_delta', thinking: 'secret thoughts' } as any,
+      delta: { type: 'thinking_delta', thinking: 'analyzing the problem' } as any,
     } as StreamInnerEvent);
 
-    // None of the sent messages should contain thinking content
+    // Thinking indicator should show but not the thinking content yet (no text block yet)
+    expect(sender.sentMessages).toHaveLength(1);
+    expect(sender.sentMessages[0].text).toContain('💭 Thinking...');
+
+    // End thinking block, start text block
+    await acc.handleEvent({ type: 'content_block_stop', index: 0 } as StreamInnerEvent);
+
+    await acc.handleEvent({
+      type: 'content_block_start',
+      index: 1,
+      content_block: { type: 'text', text: '' },
+    } as StreamInnerEvent);
+
+    await acc.handleEvent({
+      type: 'content_block_delta',
+      index: 1,
+      delta: { type: 'text_delta', text: 'Here is the answer' },
+    } as StreamInnerEvent);
+
+    await acc.handleEvent({ type: 'message_stop' } as StreamInnerEvent);
+
+    // Final message should contain the expandable blockquote with thinking AND the text
     const allTexts = [
       ...sender.sentMessages.map(m => m.text),
       ...sender.editedMessages.map(m => m.text),
     ];
-    expect(allTexts.every(t => !t.includes('secret thoughts'))).toBe(true);
+    const finalText = allTexts[allTexts.length - 1];
+    expect(finalText).toContain('blockquote expandable');
+    expect(finalText).toContain('analyzing the problem');
+    expect(finalText).toContain('Here is the answer');
   });
 
   it('tracks all message IDs', async () => {
