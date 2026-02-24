@@ -1,6 +1,6 @@
 {
   "name": "@fonz/tgcc",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Telegram ↔ Claude Code CLI bridge",
   "type": "module",
   "main": "dist/index.js",
@@ -29,10 +29,18 @@
   },
   "typesVersions": {
     "*": {
-      "process": ["dist/cc-process.d.ts"],
-      "protocol": ["dist/cc-protocol.d.ts"],
-      "session": ["dist/session.d.ts"],
-      "streaming": ["dist/streaming.d.ts"]
+      "process": [
+        "dist/cc-process.d.ts"
+      ],
+      "protocol": [
+        "dist/cc-protocol.d.ts"
+      ],
+      "session": [
+        "dist/session.d.ts"
+      ],
+      "streaming": [
+        "dist/streaming.d.ts"
+      ]
     }
   },
   "scripts": {
@@ -52,7 +60,15 @@
   },
   "author": "fnz",
   "license": "MIT",
-  "keywords": ["telegram", "claude", "claude-code", "cli", "bridge", "ai", "anthropic"],
+  "keywords": [
+    "telegram",
+    "claude",
+    "claude-code",
+    "cli",
+    "bridge",
+    "ai",
+    "anthropic"
+  ],
   "repository": {
     "type": "git",
     "url": "https://github.com/fonzio/tgcc"
