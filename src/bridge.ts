@@ -505,21 +505,20 @@ export class Bridge extends EventEmitter implements CtlHandler {
             }
           });
 
-          // Start watching if we have dispatched agents
-          console.log(`[BRIDGE] After team name set: hasDispatched=${tracker.hasDispatchedAgents}, isWatching=${tracker.isMailboxWatching}`);
-          if (tracker.hasDispatchedAgents) {
-            tracker.startMailboxWatch();
-          }
+          // Don't start watching here — wait until after handleToolResult
+          // sets agent names (needed for mailbox message matching)
+          console.log(`[BRIDGE] Team name set: ${teamName}, will start watch after handleToolResult`);
         }
       }
 
-      // Start mailbox watch once we have team name + dispatched agents
-      if (tracker.currentTeamName && tracker.hasDispatchedAgents && !tracker.isMailboxWatching) {
-        tracker.startMailboxWatch();
-      }
-
+      // Handle tool result FIRST (sets agentName for mailbox matching)
       if (event.tool_use_id) {
         tracker.handleToolResult(event.tool_use_id, resultText);
+      }
+
+      // Start mailbox watch AFTER handleToolResult has set agent names
+      if (tracker.currentTeamName && tracker.hasDispatchedAgents && !tracker.isMailboxWatching) {
+        tracker.startMailboxWatch();
       }
     });
 

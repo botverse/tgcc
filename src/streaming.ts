@@ -994,8 +994,12 @@ export class SubAgentTracker {
       // Don't filter by msg.read — CC may read its mailbox before our 2s poll fires
       // We track by message count (lastMailboxCount) to avoid duplicates
 
+      // Skip idle notifications (JSON objects, not real results)
+      if (msg.text.startsWith('{')) continue;
+
       // Match msg.from to a tracked sub-agent by label
       const matched = this.findAgentByFrom(msg.from);
+      console.log(`[MAILBOX] Message from="${msg.from}", matched=${matched?.agentName || matched?.label || 'NONE'}, agents=[${[...this.agents.values()].map(a => `${a.agentName}/${a.label}/${a.status}`).join(', ')}]`);
       if (!matched) continue;
 
       // Clear elapsed timer
