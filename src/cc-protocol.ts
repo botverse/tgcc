@@ -362,6 +362,10 @@ export function parseCCOutputLine(line: string): CCOutputEvent | null {
       case 'control_request':
         return parsed as CCOutputEvent;
       default:
+        // Log unknown event types for discovery
+        if (typeof parsed.type === 'string') {
+          console.log(`[CC-RAW] Unknown event type: ${parsed.type}`, JSON.stringify(parsed).slice(0, 200));
+        }
         return null;
     }
   } catch {

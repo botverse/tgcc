@@ -727,6 +727,10 @@ export class SubAgentTracker {
       const agentIdMatch = result.match(/agent_id:\s*(\S+)@/);
       if (agentIdMatch && !info.agentName) info.agentName = agentIdMatch[1];
 
+      // Mark as dispatched — this enables mailbox watching and prevents idle timeout
+      info.status = 'dispatched';
+      info.dispatchedAt = Date.now();
+
       const label = info.label || info.toolName;
       const text = `🤖 ${escapeHtml(label)} — Spawned, waiting for results…`;
       this.sendQueue = this.sendQueue.then(async () => {

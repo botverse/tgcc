@@ -249,6 +249,20 @@ export class CCProcess extends EventEmitter {
     const event = parseCCOutputLine(line);
     if (!event) return;
 
+    // Log ALL events for debugging
+    const extra: Record<string, unknown> = { subtype: (event as { subtype?: string }).subtype };
+    if (event.type === 'user' || event.type === 'tool_result') {
+      extra.contentPreview = JSON.stringify(event).slice(0, 300);
+    }
+    if (event.type === 'stream_event') {
+      const inner = (event as { event?: { type?: string } }).event;
+      extra.innerType = inner?.type;
+    }
+    if (event.type === 'assistant') {
+      extra.contentPreview = JSON.stringify(event).slice(0, 400);
+    }
+    this.logger.debug({ eventType: event.type, ...extra }, 'CC event');
+
     // Reset hang timer on any output
     this.resetHangTimer();
 
