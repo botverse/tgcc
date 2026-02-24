@@ -273,8 +273,28 @@ export class CCProcess extends EventEmitter {
         this.emit('assistant', event);
         break;
 
+      case 'user':
+        // User messages can contain tool_result content blocks (sub-agent results)
+        if (event.message?.content) {
+          for (const block of event.message.content) {
+            if (block.type === 'tool_result' && block.tool_use_id) {
+              const resultText = typeof block.content === 'string'
+                ? block.content
+                : Array.isArray(block.content)
+                  ? block.content.map((c: { text?: string }) => c.text ?? '').join('\n')
+                  : JSON.stringify(block.content);
+              this.emit('tool_result', {
+                type: 'tool_result' as const,
+                tool_use_id: block.tool_use_id,
+                content: resultText,
+              });
+            }
+          }
+        }
+        break;
+
       case 'tool_result':
-        // Tool result sent back to CC → CC will call API with result
+        // Direct tool result event
         this._ccActivity = 'waiting_for_api';
         this.emit('tool_result', event);
         break;

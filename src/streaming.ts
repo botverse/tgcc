@@ -545,7 +545,8 @@ export function extractAgentLabel(jsonInput: string): string {
 
   if (promptText) {
     // "You are a spec-reviewer" or "You are the code-reviewer"
-    const youAreMatch = promptText.match(/[Yy]ou are (?:a |an |the )?([a-zA-Z][a-zA-Z0-9_ -]{1,30}?)(?:\.|,|!|\s+(?:who|that|and|responsible|tasked|for))/);
+    // Terminators: punctuation, or words like who/that/and/on/in/responsible/tasked/for/your
+    const youAreMatch = promptText.match(/[Yy]ou are (?:a |an |the )?([a-zA-Z][a-zA-Z0-9_-]{1,30}?)(?:\.|,|!|\s+(?:who|that|and|on|in|responsible|tasked|for|your))/);
     if (youAreMatch?.[1]) return youAreMatch[1].trim();
 
     // "your role is [role]"

@@ -46,6 +46,7 @@ export {
   type AssistantContentBlock,
   type AssistantMessage,
   type ToolResultEvent,
+  type UserOutputMessage,
   type ResultEvent,
   type ApiErrorEvent,
   type CCOutputEvent,

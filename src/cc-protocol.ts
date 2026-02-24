@@ -316,9 +316,24 @@ export interface ApiErrorEvent {
 
 // ── Union of all CC output events ──
 
+/** User output message — wraps tool_result content blocks (sub-agent results). */
+export interface UserOutputMessage {
+  type: 'user';
+  message: {
+    role: 'user';
+    content: Array<{
+      type: string;
+      tool_use_id?: string;
+      content?: string | Array<{ type: string; text?: string }>;
+      is_error?: boolean;
+    }>;
+  };
+}
+
 export type CCOutputEvent =
   | InitEvent
   | AssistantMessage
+  | UserOutputMessage
   | ToolResultEvent
   | ResultEvent
   | StreamEvent
@@ -339,6 +354,7 @@ export function parseCCOutputLine(line: string): CCOutputEvent | null {
     switch (parsed.type) {
       case 'system':
       case 'assistant':
+      case 'user':
       case 'tool_result':
       case 'result':
       case 'stream_event':
