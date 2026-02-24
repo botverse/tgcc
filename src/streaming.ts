@@ -629,6 +629,28 @@ export class SubAgentTracker {
     return [...this.agents.values()].some(a => a.status === 'dispatched');
   }
 
+  /** Mark all dispatched agents as completed — used when CC reports results
+   *  in its main text response rather than via tool_result events.
+   */
+  markDispatchedAsReportedInMain(): void {
+    for (const [, info] of this.agents) {
+      if (info.status !== 'dispatched' || !info.tgMessageId) continue;
+      info.status = 'completed';
+      // Clear elapsed timer
+      if (info.elapsedTimer) {
+        clearInterval(info.elapsedTimer);
+        info.elapsedTimer = null;
+      }
+      const label = info.label || info.toolName;
+      const text = `✅ ${escapeHtml(label)} — see main message`;
+      this.sendQueue = this.sendQueue.then(async () => {
+        try {
+          await this.sender.editMessage(this.chatId, info.tgMessageId!, text, 'HTML');
+        } catch { /* ignore */ }
+      });
+    }
+  }
+
   async handleEvent(event: StreamInnerEvent): Promise<void> {
     switch (event.type) {
       case 'content_block_start':

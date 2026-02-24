@@ -665,14 +665,17 @@ export class Bridge extends EventEmitter implements CtlHandler {
     // Check if background sub-agents are still running (dispatched but no result)
     const tracker = agent.subAgentTrackers.get(accKey);
     if (tracker?.hasDispatchedAgents) {
-      this.logger.info({ agentId }, 'Turn ended with background sub-agents still running — sending follow-up');
-      // Wait a moment then ask CC to collect the background agent results
+      this.logger.info({ agentId }, 'Turn ended with background sub-agents still running');
+      // Mark dispatched agents as "results in main response" since background agents
+      // report through CC's text, not through tool_result events
+      tracker.markDispatchedAsReportedInMain();
+      // Send follow-up after 15s to collect remaining results
       setTimeout(() => {
         const proc = agent.processes.get(userId);
         if (proc && proc.state === 'active') {
-          proc.sendMessage(createTextMessage('The background agents should have finished by now. Please check on their results and share the findings.'));
+          proc.sendMessage(createTextMessage('Please check on the remaining background agents and report their findings.'));
         }
-      }, 5000); // 5s delay to let agents finish
+      }, 15000);
     }
   }
 
