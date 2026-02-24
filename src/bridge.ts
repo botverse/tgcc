@@ -656,6 +656,8 @@ export class Bridge extends EventEmitter implements CtlHandler {
           agent.tgBot.sendText(cid, text, parseMode),
         editMessage: (cid, msgId, text, parseMode) =>
           agent.tgBot.editText(cid, msgId, text, parseMode),
+        setReaction: (cid, msgId, emoji) =>
+          agent.tgBot.setReaction(cid, msgId, emoji),
       };
       tracker = new SubAgentTracker({
         chatId,

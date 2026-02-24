@@ -430,6 +430,10 @@ export class TelegramBot {
     this.trackBotMessage(Number(chatId), messageId, text);
   }
 
+  async setReaction(chatId: number | string, messageId: number, emoji: string): Promise<void> {
+    await this.bot.api.setMessageReaction(Number(chatId), messageId, [{ type: 'emoji', emoji }]);
+  }
+
   async sendFile(chatId: number | string, filePath: string, caption?: string): Promise<void> {
     await this.bot.api.sendDocument(Number(chatId), new InputFile(filePath), {
       caption,

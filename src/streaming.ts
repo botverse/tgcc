@@ -599,6 +599,7 @@ export interface SubAgentInfo {
 export interface SubAgentSender {
   sendMessage(chatId: number | string, text: string, parseMode?: string): Promise<number>;
   editMessage(chatId: number | string, messageId: number, text: string, parseMode?: string): Promise<void>;
+  setReaction?(chatId: number | string, messageId: number, emoji: string): Promise<void>;
 }
 
 export interface SubAgentTrackerOptions {
@@ -987,29 +988,15 @@ export class SubAgentTracker {
 
       matched.status = 'completed';
 
-
       if (!matched.tgMessageId) continue;
 
-      const label = matched.label || matched.toolName;
-      const summary = msg.summary || 'Done';
-      // Truncate text for blockquote (TG limit)
-      const maxTextLen = 1024;
-      const bodyText = msg.text.length > maxTextLen
-        ? msg.text.slice(0, maxTextLen) + '…'
-        : msg.text;
-
-      const colorEmoji = msg.color === 'green' ? '✅'
-        : msg.color === 'red' ? '❌'
-        : msg.color === 'yellow' ? '⚠️'
-        : '✅';
-
-      const text = `<blockquote expandable>${colorEmoji} ${escapeHtml(label)} — ${escapeHtml(summary)}\n${escapeHtml(bodyText)}</blockquote>`;
-
+      // React with ✅ instead of editing — avoids race conditions
       const msgId = matched.tgMessageId;
+      const emoji = msg.color === 'red' ? '👎' : '✅';
       this.sendQueue = this.sendQueue.then(async () => {
         try {
-          await this.sender.editMessage(this.chatId, msgId, text, 'HTML');
-        } catch { /* ignore */ }
+          await this.sender.setReaction?.(this.chatId, msgId, emoji);
+        } catch { /* ignore — reaction might not be supported */ }
       });
     }
 

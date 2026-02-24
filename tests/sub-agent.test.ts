@@ -18,6 +18,7 @@ function createMockSubAgentSender() {
     async editMessage(chatId: number | string, messageId: number, text: string, _parseMode?: string): Promise<void> {
       this.edits.push({ chatId, messageId, text });
     },
+    setReaction: vi.fn(async (_chatId: number | string, _messageId: number, _emoji: string): Promise<void> => {}),
   };
 }
 
@@ -436,12 +437,8 @@ describe('SubAgentTracker — mailbox watching', () => {
     const agents = tracker.activeAgents;
     expect(agents[0].status).toBe('completed');
 
-    const lastEdit = sender.edits[sender.edits.length - 1];
-    expect(lastEdit.text).toContain('<blockquote expandable>');
-    expect(lastEdit.text).toContain('✅');
-    expect(lastEdit.text).toContain('spec-reviewer');
-    expect(lastEdit.text).toContain('Spec review complete');
-    expect(lastEdit.text).toContain('Findings Report');
+    // Agent should be completed — reaction sent instead of edit
+    expect(sender.setReaction).toHaveBeenCalled();
   });
 
   it('processMailbox calls onAllReported when all agents complete', async () => {
@@ -615,8 +612,10 @@ describe('SubAgentTracker — mailbox watching', () => {
 
     await (tracker as any).sendQueue;
 
-    const lastEdit = sender.edits[sender.edits.length - 1];
-    expect(lastEdit.text).toContain('❌');
+    // Red color → 👎 reaction
+    expect(sender.setReaction).toHaveBeenCalledWith(
+      expect.anything(), expect.anything(), '👎'
+    );
   });
 });
 
