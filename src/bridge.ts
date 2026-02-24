@@ -1,5 +1,5 @@
 import { join } from 'node:path';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { EventEmitter } from 'node:events';
 import pino from 'pino';
@@ -28,6 +28,8 @@ import {
   SessionStore,
   findMissedSessions,
   formatCatchupMessage,
+  getSessionJsonlPath,
+  summarizeJsonlDelta,
 } from './session.js';
 import {
   CtlServer,
@@ -328,6 +330,19 @@ export class Bridge extends EventEmitter implements CtlHandler {
       agent.processes.delete(userId);
       proc = undefined;
     }
+
+    // Staleness check: detect if session was modified by another client
+    if (proc && proc.state !== 'idle') {
+      const staleInfo = this.checkSessionStaleness(agentId, userId);
+      if (staleInfo) {
+        this.logger.info({ agentId, userId }, 'Session stale — killing process for reconnect');
+        proc.destroy();
+        agent.processes.delete(userId);
+        proc = undefined;
+        agent.tgBot.sendText(chatId, staleInfo.summary, 'Markdown');
+      }
+    }
+
     if (!proc || proc.state === 'idle') {
       // Save first message text as pending session title
       if (data.text) {
@@ -342,6 +357,61 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
     proc.sendMessage(ccMsg);
     this.sessionStore.updateSessionActivity(agentId, userId);
+  }
+
+  /** Check if the session JSONL was modified externally since we last tracked it. */
+  private checkSessionStaleness(agentId: string, userId: string): { summary: string } | null {
+    const userState = this.sessionStore.getUser(agentId, userId);
+    const sessionId = userState.currentSessionId;
+    if (!sessionId) return null;
+
+    const repo = userState.repo || resolveUserConfig(
+      this.agents.get(agentId)!.config, userId,
+    ).repo;
+
+    const jsonlPath = getSessionJsonlPath(sessionId, repo);
+    const tracking = this.sessionStore.getJsonlTracking(agentId, userId);
+
+    // No tracking yet (first message or new session) — not stale
+    if (!tracking) return null;
+
+    try {
+      const stat = statSync(jsonlPath);
+      // File grew or was modified since we last tracked
+      if (stat.size <= tracking.size && stat.mtimeMs <= tracking.mtimeMs) {
+        return null;
+      }
+
+      // Session is stale — build a summary of what happened
+      const summary = summarizeJsonlDelta(jsonlPath, tracking.size)
+        ?? '_ℹ️ Session was updated from another client. Reconnecting..._';
+
+      return { summary };
+    } catch {
+      // File doesn't exist or stat failed — skip check
+      return null;
+    }
+  }
+
+  /** Update JSONL tracking from the current file state. */
+  private updateJsonlTracking(agentId: string, userId: string): void {
+    const userState = this.sessionStore.getUser(agentId, userId);
+    const sessionId = userState.currentSessionId;
+    if (!sessionId) return;
+
+    const repo = userState.repo || resolveUserConfig(
+      this.agents.get(agentId)!.config, userId,
+    ).repo;
+
+    const jsonlPath = getSessionJsonlPath(sessionId, repo);
+
+    try {
+      const stat = statSync(jsonlPath);
+      this.sessionStore.updateJsonlTracking(agentId, userId, stat.size, stat.mtimeMs);
+    } catch {
+      // File doesn't exist yet — clear tracking
+      this.sessionStore.clearJsonlTracking(agentId, userId);
+    }
   }
 
   private spawnCCProcess(agentId: string, userId: string, chatId: number): CCProcess {
@@ -390,6 +460,8 @@ export class Bridge extends EventEmitter implements CtlHandler {
         this.sessionStore.setSessionTitle(agentId, userId, event.session_id, pendingTitle);
         agent.pendingTitles.delete(userId);
       }
+      // Initialize JSONL tracking for staleness detection
+      this.updateJsonlTracking(agentId, userId);
     });
 
     proc.on('stream_event', (event: StreamInnerEvent) => {
@@ -474,6 +546,10 @@ export class Bridge extends EventEmitter implements CtlHandler {
     if (event.total_cost_usd) {
       this.sessionStore.updateSessionActivity(agentId, userId, event.total_cost_usd);
     }
+
+    // Update JSONL tracking after our own CC turn completes
+    // This prevents false-positive staleness on our own writes
+    this.updateJsonlTracking(agentId, userId);
 
     // Handle errors
     if (event.is_error && event.result) {

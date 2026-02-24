@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import type pino from 'pino';
@@ -14,6 +14,11 @@ export interface SessionInfo {
   totalCostUsd: number;
 }
 
+export interface JsonlTracking {
+  size: number;
+  mtimeMs: number;
+}
+
 export interface UserState {
   currentSessionId: string | null;
   lastActivity: string;
@@ -22,6 +27,7 @@ export interface UserState {
   permissionMode: string;      // session override for permission mode (empty = use agent default)
   sessions: SessionInfo[];
   knownSessionIds: string[];  // session IDs created/used by TGCC
+  jsonlTracking?: JsonlTracking; // track session JSONL file size/mtime for staleness detection
 }
 
 export interface AgentState {
@@ -153,9 +159,27 @@ export class SessionStore {
     }
   }
 
+  updateJsonlTracking(agentId: string, userId: string, size: number, mtimeMs: number): void {
+    const user = this.ensureUser(agentId, userId);
+    user.jsonlTracking = { size, mtimeMs };
+    this.save();
+  }
+
+  getJsonlTracking(agentId: string, userId: string): JsonlTracking | undefined {
+    const user = this.ensureUser(agentId, userId);
+    return user.jsonlTracking;
+  }
+
+  clearJsonlTracking(agentId: string, userId: string): void {
+    const user = this.ensureUser(agentId, userId);
+    delete user.jsonlTracking;
+    this.save();
+  }
+
   clearSession(agentId: string, userId: string): void {
     const user = this.ensureUser(agentId, userId);
     user.currentSessionId = null;
+    delete user.jsonlTracking;
     this.save();
   }
 
@@ -180,6 +204,158 @@ export class SessionStore {
   getFullState(): StateStore {
     return this.state;
   }
+}
+
+// ── Session JSONL path resolution ──
+
+/**
+ * Get the path to a CC session's JSONL file.
+ * CC stores sessions at ~/.claude/projects/<repo-slug>/<sessionId>.jsonl
+ */
+export function getSessionJsonlPath(sessionId: string, repo: string): string {
+  const slug = computeProjectSlug(repo);
+  return join(homedir(), '.claude', 'projects', slug, `${sessionId}.jsonl`);
+}
+
+// ── Staleness summary ──
+
+interface JsonlTurn {
+  role: 'user' | 'assistant';
+  text?: string;
+  tools?: string[];
+}
+
+/**
+ * Read new JSONL entries from a byte offset and summarize the turns.
+ * Returns a formatted catch-up message or null if nothing meaningful was found.
+ */
+export function summarizeJsonlDelta(jsonlPath: string, fromByteOffset: number, maxChars = 2000): string | null {
+  let rawBytes: Buffer;
+  try {
+    const stat = statSync(jsonlPath);
+    if (stat.size <= fromByteOffset) return null;
+
+    const bytesToRead = stat.size - fromByteOffset;
+    rawBytes = Buffer.alloc(bytesToRead);
+    const fd = openSync(jsonlPath, 'r');
+    try {
+      readSync(fd, rawBytes, 0, bytesToRead, fromByteOffset);
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return null;
+  }
+
+  const lines = rawBytes.toString('utf-8').split('\n').filter(Boolean);
+  const turns: JsonlTurn[] = [];
+
+  // Track seen assistant message UUIDs to deduplicate partial updates
+  const seenAssistantUuids = new Map<string, number>(); // uuid → index in turns
+
+  for (const line of lines) {
+    let entry: Record<string, unknown>;
+    try {
+      entry = JSON.parse(line);
+    } catch {
+      continue;
+    }
+
+    const entryType = entry.type as string;
+    const msg = entry.message as Record<string, unknown> | undefined;
+    if (!msg) continue;
+
+    if (entryType === 'user' && msg.role === 'user') {
+      const content = msg.content;
+      let text: string | undefined;
+      if (typeof content === 'string') {
+        text = content;
+      } else if (Array.isArray(content)) {
+        const textBlock = content.find((b: Record<string, unknown>) => b.type === 'text');
+        if (textBlock) text = (textBlock as Record<string, unknown>).text as string;
+      }
+      if (text) {
+        turns.push({ role: 'user', text: text.slice(0, 200) });
+      }
+    } else if (entryType === 'assistant' && msg.role === 'assistant') {
+      const uuid = entry.uuid as string | undefined;
+      const content = msg.content as Array<Record<string, unknown>> | undefined;
+      if (!content || !Array.isArray(content)) continue;
+
+      // Extract text and tools from this assistant message
+      const texts: string[] = [];
+      const tools: string[] = [];
+      for (const block of content) {
+        if (block.type === 'text' && typeof block.text === 'string') {
+          const trimmed = (block.text as string).trim();
+          if (trimmed) texts.push(trimmed);
+        } else if (block.type === 'tool_use') {
+          tools.push(block.name as string);
+        }
+      }
+
+      // Deduplicate: CC emits partial assistant messages with the same UUID
+      // as it streams. Keep updating the same turn entry.
+      if (uuid && seenAssistantUuids.has(uuid)) {
+        const idx = seenAssistantUuids.get(uuid)!;
+        const existing = turns[idx];
+        if (texts.length > 0) existing.text = texts.join(' ').slice(0, 200);
+        if (tools.length > 0) existing.tools = [...new Set([...(existing.tools ?? []), ...tools])];
+      } else {
+        const turn: JsonlTurn = { role: 'assistant' };
+        if (texts.length > 0) turn.text = texts.join(' ').slice(0, 200);
+        if (tools.length > 0) turn.tools = tools;
+        if (uuid) seenAssistantUuids.set(uuid, turns.length);
+        turns.push(turn);
+      }
+    }
+  }
+
+  // Filter out empty assistant turns (only had thinking blocks, etc.)
+  const meaningful = turns.filter(t => t.text || (t.tools && t.tools.length > 0));
+  if (meaningful.length === 0) return null;
+
+  return formatStaleSummary(meaningful, maxChars);
+}
+
+function formatStaleSummary(turns: JsonlTurn[], maxChars: number): string {
+  const turnCount = turns.filter(t => t.role === 'assistant').length;
+  const header = `ℹ️ *Session was updated from another client* (${turnCount} CC turn${turnCount !== 1 ? 's' : ''} since your last message here):\n\n`;
+
+  const lines: string[] = [];
+  // Build from newest to oldest so we can truncate old ones
+  for (const turn of turns) {
+    if (turn.role === 'user') {
+      const preview = truncateText(turn.text ?? '', 80);
+      lines.push(`• *You:* "${preview}"`);
+    } else {
+      const parts: string[] = [];
+      if (turn.tools && turn.tools.length > 0) {
+        parts.push(`Used ${turn.tools.join(', ')}`);
+      }
+      if (turn.text) {
+        const preview = truncateText(turn.text, 120);
+        parts.push(`"${preview}"`);
+      }
+      lines.push(`• *CC:* ${parts.join(' — ') || '(no text)'}`);
+    }
+  }
+
+  // Truncate from the front (oldest) if too long
+  let body = lines.join('\n');
+  while (body.length + header.length + 20 > maxChars && lines.length > 2) {
+    lines.shift();
+    body = `…\n${lines.join('\n')}`;
+  }
+
+  return header + body + '\n\n_Reconnecting..._';
+}
+
+function truncateText(text: string, maxLen: number): string {
+  // Collapse whitespace
+  const clean = text.replace(/\s+/g, ' ').trim();
+  if (clean.length <= maxLen) return clean;
+  return clean.slice(0, maxLen - 1) + '…';
 }
 
 // ── /catchup — find CC sessions done outside TGCC ──
