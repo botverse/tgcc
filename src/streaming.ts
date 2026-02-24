@@ -658,6 +658,7 @@ export class SubAgentTracker {
   private blockToAgent = new Map<number, string>();         // blockIndex → toolUseId
   private sendQueue: Promise<void> = Promise.resolve();
   private onAllReported: AllAgentsReportedCallback | null = null;
+  isPollingForResults = false;
 
   constructor(options: SubAgentTrackerOptions) {
     this.chatId = options.chatId;

@@ -270,11 +270,21 @@ export class CCProcess extends EventEmitter {
         if (event.message.stop_reason === 'tool_use') {
           this._ccActivity = 'tool_executing';
         }
+        // Check assistant text for background notifications too
+        if (event.message?.content) {
+          for (const block of event.message.content) {
+            const text = block.type === 'text' ? ((block as { text?: string }).text ?? '') : '';
+            if (typeof text === 'string' && text.includes('background_agent')) {
+              this.logger.info({ textSnippet: text.slice(0, 200) }, 'Background agent mention in assistant message');
+            }
+          }
+        }
         this.emit('assistant', event);
         break;
 
       case 'user':
         // User messages can contain tool_result content blocks (sub-agent results)
+        this.logger.debug({ contentTypes: event.message?.content?.map((b: { type: string }) => b.type), contentLength: JSON.stringify(event.message?.content).length }, 'User message received');
         if (event.message?.content) {
           for (const block of event.message.content) {
             if (block.type === 'tool_result' && block.tool_use_id) {

@@ -698,7 +698,8 @@ export class Bridge extends EventEmitter implements CtlHandler {
     // to CC stdin after a delay. This triggers CC to dequeue its message queue,
     // which contains <background_agent_notification> XML for completed agents.
     const tracker = agent.subAgentTrackers.get(accKey);
-    if (tracker?.hasDispatchedAgents) {
+    if (tracker?.hasDispatchedAgents && !tracker.isPollingForResults) {
+      tracker.isPollingForResults = true;
       this.logger.info({ agentId }, 'Turn ended with background sub-agents still running — scheduling follow-up');
       // Get the CC process for this user
       const ccProcess = agent.processes.get(userId);
@@ -710,18 +711,20 @@ export class Bridge extends EventEmitter implements CtlHandler {
       const pollInterval = setInterval(() => {
         if (!tracker.hasDispatchedAgents) {
           clearInterval(pollInterval);
+          tracker.isPollingForResults = false;
           return;
         }
         const proc = agent.processes.get(userId);
-        if (!proc) { clearInterval(pollInterval); return; }
+        if (!proc) { clearInterval(pollInterval); tracker.isPollingForResults = false; return; }
         this.logger.info({ agentId }, 'Sending follow-up to check on background agents');
         proc.sendMessage(createTextMessage('Check on the background agents. Are they done? Report their results.'));
       }, 30_000);
       // Safety: stop polling after 10 min
-      setTimeout(() => clearInterval(pollInterval), 600_000);
+      setTimeout(() => { clearInterval(pollInterval); tracker.isPollingForResults = false; }, 600_000);
       // Set callback to clean up when all agents report
       tracker.setOnAllReported(() => {
         clearInterval(pollInterval);
+        tracker.isPollingForResults = false;
       });
     }
   }
