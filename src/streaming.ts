@@ -992,7 +992,7 @@ export class SubAgentTracker {
 
       // React with ✅ instead of editing — avoids race conditions
       const msgId = matched.tgMessageId;
-      const emoji = msg.color === 'red' ? '👎' : '✅';
+      const emoji = msg.color === 'red' ? '👎' : '👍';
       this.sendQueue = this.sendQueue.then(async () => {
         try {
           await this.sender.setReaction?.(this.chatId, msgId, emoji);

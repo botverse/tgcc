@@ -273,9 +273,13 @@ export class CCProcess extends EventEmitter {
         this.emit('assistant', event);
         break;
 
-      case 'user':
+      case 'user': {
         // User messages can contain tool_result content blocks (sub-agent results)
         // The raw event also has a top-level `tool_use_result` with rich structured data
+        const rawMeta = (event as { tool_use_result?: Record<string, unknown> }).tool_use_result;
+        if (rawMeta) {
+          this.logger.info({ status: rawMeta.status, name: rawMeta.name }, 'User event has tool_use_result');
+        }
         if (event.message?.content) {
           for (const block of event.message.content) {
             if (block.type === 'tool_result' && block.tool_use_id) {
@@ -295,6 +299,7 @@ export class CCProcess extends EventEmitter {
           }
         }
         break;
+      }
 
       case 'tool_result':
         // Direct tool result event

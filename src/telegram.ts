@@ -431,7 +431,8 @@ export class TelegramBot {
   }
 
   async setReaction(chatId: number | string, messageId: number, emoji: string): Promise<void> {
-    await this.bot.api.setMessageReaction(Number(chatId), messageId, [{ type: 'emoji', emoji }]);
+    // Cast needed because Grammy's emoji type is a fixed union
+    await this.bot.api.setMessageReaction(Number(chatId), messageId, [{ type: 'emoji', emoji: emoji as '👍' }]);
   }
 
   async sendFile(chatId: number | string, filePath: string, caption?: string): Promise<void> {
