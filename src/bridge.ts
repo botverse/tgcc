@@ -124,6 +124,7 @@ const HELP_TEXT = `*TGCC Commands*
 *Control*
 /cancel — Abort current CC turn
 /model <name> — Switch model
+/permissions — Set permission mode
 /repo — List repos (buttons)
 /repo help — Repo management commands
 /repo add <name> <path> — Register a repo
@@ -347,10 +348,13 @@ export class Bridge extends EventEmitter implements CtlHandler {
     const agent = this.agents.get(agentId)!;
     const userConfig = resolveUserConfig(agent.config, userId);
 
-    // Check session store for model/repo overrides
+    // Check session store for model/repo/permission overrides
     const userState = this.sessionStore.getUser(agentId, userId);
     if (userState.model) userConfig.model = userState.model;
     if (userState.repo) userConfig.repo = userState.repo;
+    if (userState.permissionMode) {
+      userConfig.permissionMode = userState.permissionMode as typeof userConfig.permissionMode;
+    }
 
     // Generate MCP config
     const mcpServerPath = join(import.meta.dirname ?? '.', 'mcp-server.js');
@@ -801,6 +805,43 @@ export class Bridge extends EventEmitter implements CtlHandler {
         await agent.tgBot.sendText(cmd.chatId, message, 'Markdown');
         break;
       }
+
+      case 'permissions': {
+        const validModes = ['dangerously-skip', 'acceptEdits', 'default', 'plan'];
+        const userState = this.sessionStore.getUser(agentId, cmd.userId);
+        const agentDefault = agent.config.defaults.permissionMode;
+        const currentMode = userState.permissionMode || agentDefault;
+
+        if (cmd.args) {
+          const mode = cmd.args.trim();
+          if (!validModes.includes(mode)) {
+            await agent.tgBot.sendText(cmd.chatId, `Invalid mode. Valid: ${validModes.join(', ')}`);
+            break;
+          }
+          this.sessionStore.setPermissionMode(agentId, cmd.userId, mode);
+          // Kill current process so new mode takes effect on next spawn
+          const proc = agent.processes.get(cmd.userId);
+          if (proc) {
+            proc.destroy();
+            agent.processes.delete(cmd.userId);
+          }
+          await agent.tgBot.sendText(cmd.chatId, `Permission mode set to \`${mode}\`. Takes effect on next message.`, 'Markdown');
+          break;
+        }
+
+        // No args — show current mode + inline keyboard
+        const keyboard = new InlineKeyboard();
+        keyboard.text('🔓 Bypass', 'permissions:dangerously-skip').text('✏️ Accept Edits', 'permissions:acceptEdits').row();
+        keyboard.text('🔒 Default', 'permissions:default').text('📋 Plan', 'permissions:plan').row();
+
+        await agent.tgBot.sendTextWithKeyboard(
+          cmd.chatId,
+          `Current: \`${currentMode}\`\nDefault: \`${agentDefault}\`\n\nSelect a mode for this session:`,
+          keyboard,
+          'Markdown',
+        );
+        break;
+      }
     }
   }
 
@@ -865,6 +906,29 @@ export class Bridge extends EventEmitter implements CtlHandler {
       case 'repo_add': {
         await agent.tgBot.answerCallbackQuery(query.callbackQueryId, 'Usage below');
         await agent.tgBot.sendText(query.chatId, 'Send: `/repo add <name> <path>`', 'Markdown');
+        break;
+      }
+
+      case 'permissions': {
+        const validModes = ['dangerously-skip', 'acceptEdits', 'default', 'plan'];
+        const mode = query.data;
+        if (!validModes.includes(mode)) {
+          await agent.tgBot.answerCallbackQuery(query.callbackQueryId, 'Invalid mode');
+          break;
+        }
+        this.sessionStore.setPermissionMode(agentId, query.userId, mode);
+        // Kill current process so new mode takes effect on next spawn
+        const proc = agent.processes.get(query.userId);
+        if (proc) {
+          proc.destroy();
+          agent.processes.delete(query.userId);
+        }
+        await agent.tgBot.answerCallbackQuery(query.callbackQueryId, `Mode: ${mode}`);
+        await agent.tgBot.sendText(
+          query.chatId,
+          `Permission mode set to \`${mode}\`. Takes effect on next message.`,
+          'Markdown',
+        );
         break;
       }
 

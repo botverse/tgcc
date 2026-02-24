@@ -189,8 +189,17 @@ export class CCProcess extends EventEmitter {
       '--max-turns', String(cfg.maxTurns),
     ];
 
-    if (cfg.permissionMode === 'dangerously-skip') {
-      args.push('--dangerously-skip-permissions');
+    switch (cfg.permissionMode) {
+      case 'dangerously-skip':
+        args.push('--dangerously-skip-permissions');
+        break;
+      case 'acceptEdits':
+        args.push('--permission-mode', 'acceptEdits');
+        break;
+      case 'plan':
+        args.push('--permission-mode', 'plan');
+        break;
+      // 'default' → no flag (CC's built-in flow)
     }
 
     if (cfg.model) {

@@ -19,6 +19,7 @@ export interface UserState {
   lastActivity: string;
   model: string;
   repo: string;
+  permissionMode: string;      // session override for permission mode (empty = use agent default)
   sessions: SessionInfo[];
   knownSessionIds: string[];  // session IDs created/used by TGCC
 }
@@ -75,6 +76,7 @@ export class SessionStore {
         lastActivity: new Date().toISOString(),
         model: '',
         repo: '',
+        permissionMode: '',
         sessions: [],
         knownSessionIds: [],
       };
@@ -133,6 +135,12 @@ export class SessionStore {
   setRepo(agentId: string, userId: string, repo: string): void {
     const user = this.ensureUser(agentId, userId);
     user.repo = repo;
+    this.save();
+  }
+
+  setPermissionMode(agentId: string, userId: string, mode: string): void {
+    const user = this.ensureUser(agentId, userId);
+    user.permissionMode = mode;
     this.save();
   }
 

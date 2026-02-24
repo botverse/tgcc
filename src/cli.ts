@@ -357,6 +357,53 @@ function cmdAgentRepo(args: string[]): void {
   console.log(`Agent "${name}" repo set to "${repoArg}".`);
 }
 
+function cmdAgentRename(args: string[]): void {
+  const oldName = args[0];
+  const newName = args[1];
+
+  if (!oldName || !newName) {
+    console.error('Usage: tgcc agent rename <old-name> <new-name>');
+    process.exit(1);
+  }
+
+  const raw = readRawConfig();
+  const agents = (raw.agents ?? {}) as Record<string, unknown>;
+
+  if (!agents[oldName]) {
+    console.error(`Error: Agent "${oldName}" not found.`);
+    process.exit(1);
+  }
+
+  if (agents[newName]) {
+    console.error(`Error: Agent "${newName}" already exists.`);
+    process.exit(1);
+  }
+
+  // Move agent config to new key
+  agents[newName] = agents[oldName];
+  delete agents[oldName];
+  raw.agents = agents;
+  writeRawConfig(raw);
+
+  // Update session state file (rename agent key if present)
+  const globalRaw = (raw.global ?? {}) as Record<string, string>;
+  const stateFile = globalRaw.stateFile ?? join(homedir(), '.tgcc', 'state.json');
+  if (existsSync(stateFile)) {
+    try {
+      const state = JSON.parse(readFileSync(stateFile, 'utf-8'));
+      if (state.agents && state.agents[oldName]) {
+        state.agents[newName] = state.agents[oldName];
+        delete state.agents[oldName];
+        writeFileSync(stateFile, JSON.stringify(state, null, 2));
+      }
+    } catch (err) {
+      console.warn(`Warning: Could not update state file: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+
+  console.log(`Agent "${oldName}" renamed to "${newName}".`);
+}
+
 function cmdAgent(args: string[]): void {
   const subcommand = args[0];
 
@@ -368,6 +415,10 @@ function cmdAgent(args: string[]): void {
     case 'rm':
       cmdAgentRemove(args.slice(1));
       break;
+    case 'rename':
+    case 'mv':
+      cmdAgentRename(args.slice(1));
+      break;
     case 'list':
     case 'ls':
       cmdAgentList();
@@ -376,10 +427,11 @@ function cmdAgent(args: string[]): void {
       cmdAgentRepo(args.slice(1));
       break;
     default:
-      console.error('Usage: tgcc agent <add|remove|list|repo>');
+      console.error('Usage: tgcc agent <add|remove|rename|list|repo>');
       console.error('');
       console.error('  add <name> --bot-token <token> [--repo <path>]');
       console.error('  remove <name>');
+      console.error('  rename <old> <new>');
       console.error('  list');
       console.error('  repo <name> <path>');
       process.exit(1);
@@ -574,6 +626,86 @@ function cmdRepo(args: string[]): void {
   }
 }
 
+// ── Permissions management commands ──
+
+function cmdPermissionsList(): void {
+  const raw = readRawConfig();
+  const agents = (raw.agents ?? {}) as Record<string, Record<string, unknown>>;
+
+  const entries = Object.entries(agents);
+  if (entries.length === 0) {
+    console.log('No agents configured.');
+    return;
+  }
+
+  for (const [name, agent] of entries) {
+    const defaults = (agent.defaults ?? {}) as Record<string, unknown>;
+    const mode = (defaults.permissionMode as string) ?? 'dangerously-skip';
+    console.log(`${name}: ${mode}`);
+  }
+}
+
+function cmdPermissionsSet(args: string[]): void {
+  const agentName = args[0];
+  const mode = args[1];
+
+  if (!agentName || !mode) {
+    console.error('Usage: tgcc permissions set <agent> <mode>');
+    console.error('Modes: dangerously-skip, acceptEdits, default, plan');
+    process.exit(1);
+  }
+
+  const validModes = ['dangerously-skip', 'acceptEdits', 'default', 'plan'];
+  if (!validModes.includes(mode)) {
+    console.error(`Invalid mode: ${mode}`);
+    console.error(`Valid modes: ${validModes.join(', ')}`);
+    process.exit(1);
+  }
+
+  const raw = readRawConfig();
+  const agents = (raw.agents ?? {}) as Record<string, Record<string, unknown>>;
+
+  if (!agents[agentName]) {
+    console.error(`Agent "${agentName}" not found.`);
+    process.exit(1);
+  }
+
+  updateConfig((cfg) => {
+    const a = (cfg.agents ?? {}) as Record<string, Record<string, unknown>>;
+    const agentCfg = a[agentName];
+    if (agentCfg) {
+      const defaults = (agentCfg.defaults ?? {}) as Record<string, unknown>;
+      defaults.permissionMode = mode;
+      agentCfg.defaults = defaults;
+    }
+  });
+
+  console.log(`Permission mode for "${agentName}" set to "${mode}".`);
+}
+
+function cmdPermissions(args: string[]): void {
+  const subcommand = args[0];
+
+  switch (subcommand) {
+    case 'set':
+      cmdPermissionsSet(args.slice(1));
+      break;
+    case undefined:
+    case 'list':
+    case 'ls':
+      cmdPermissionsList();
+      break;
+    default:
+      console.error('Usage: tgcc permissions [set <agent> <mode>]');
+      console.error('');
+      console.error('  (no args)                  Show permission mode for all agents');
+      console.error('  set <agent> <mode>         Set agent default permissionMode');
+      console.error('');
+      console.error('Modes: dangerously-skip, acceptEdits, default, plan');
+      process.exit(1);
+  }
+}
+
 // ── Main ──
 
 async function main(): Promise<void> {
@@ -596,6 +728,10 @@ async function main(): Promise<void> {
 
     case 'repo':
       cmdRepo(args.slice(1));
+      break;
+
+    case 'permissions':
+      cmdPermissions(args.slice(1));
       break;
 
     case 'help':
@@ -621,16 +757,18 @@ function printHelp(): void {
 Usage:
   tgcc message [--agent <name>] [--session <id>] "your message"
   tgcc status [--agent <name>]
-  tgcc agent add|remove|list|repo
+  tgcc agent add|remove|rename|list|repo
   tgcc repo [add|remove|assign|clear|list]
+  tgcc permissions [set <agent> <mode>]
   tgcc help
 
 Commands:
-  message   Send a message to a running agent
-  status    Show running agents and active sessions
-  agent     Manage agent registrations
-  repo      Manage repo registry
-  help      Show this help message
+  message       Send a message to a running agent
+  status        Show running agents and active sessions
+  agent         Manage agent registrations
+  repo          Manage repo registry
+  permissions   View/set agent permission modes
+  help          Show this help message
 
 Options:
   --agent    Specify agent by name (auto-detected from cwd if omitted)

@@ -50,6 +50,7 @@ export const COMMANDS = [
   { command: 'catchup', description: 'Summarize external CC activity' },
   { command: 'cancel', description: 'Abort current CC turn' },
   { command: 'model', description: 'Switch model' },
+  { command: 'permissions', description: 'Set permission mode' },
   { command: 'repo', description: 'Manage repos & switch working directory' },
   { command: 'ping', description: 'Quick liveness check' },
   { command: 'help', description: 'List all commands' },

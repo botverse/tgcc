@@ -20,7 +20,7 @@ export interface AgentDefaults {
   maxTurns: number;
   idleTimeoutMs: number;
   hangTimeoutMs: number;
-  permissionMode: 'dangerously-skip' | 'default' | 'allowlist';
+  permissionMode: 'dangerously-skip' | 'acceptEdits' | 'default' | 'plan';
 }
 
 export interface AgentUserOverride {
@@ -146,7 +146,7 @@ export function validateConfig(raw: unknown): TgccConfig {
       maxTurns: typeof defaultsRaw.maxTurns === 'number' ? defaultsRaw.maxTurns : DEFAULT_AGENT_DEFAULTS.maxTurns,
       idleTimeoutMs: typeof defaultsRaw.idleTimeoutMs === 'number' ? defaultsRaw.idleTimeoutMs : DEFAULT_AGENT_DEFAULTS.idleTimeoutMs,
       hangTimeoutMs: typeof defaultsRaw.hangTimeoutMs === 'number' ? defaultsRaw.hangTimeoutMs : DEFAULT_AGENT_DEFAULTS.hangTimeoutMs,
-      permissionMode: ['dangerously-skip', 'default', 'allowlist'].includes(defaultsRaw.permissionMode as string)
+      permissionMode: ['dangerously-skip', 'acceptEdits', 'default', 'plan'].includes(defaultsRaw.permissionMode as string)
         ? (defaultsRaw.permissionMode as AgentDefaults['permissionMode'])
         : DEFAULT_AGENT_DEFAULTS.permissionMode,
     };
