@@ -315,6 +315,12 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
     // Get or create CC process
     let proc = agent.processes.get(userId);
+    if (proc?.takenOver) {
+      // Session was taken over externally — discard old process
+      proc.destroy();
+      agent.processes.delete(userId);
+      proc = undefined;
+    }
     if (!proc || proc.state === 'idle') {
       // Save first message text as pending session title
       if (data.text) {
@@ -391,6 +397,17 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
     proc.on('hang', () => {
       agent.tgBot.sendText(chatId, '_CC session paused. Send a message to continue._', 'Markdown');
+    });
+
+    proc.on('takeover', () => {
+      this.logger.warn({ agentId, userId }, 'Session takeover detected');
+      // Clear session so next message starts fresh instead of --resume
+      this.sessionStore.clearSession(agentId, userId);
+      agent.tgBot.sendText(
+        chatId,
+        '_Session was picked up by another client. Next message will start a fresh session._',
+        'Markdown',
+      );
     });
 
     proc.on('exit', () => {

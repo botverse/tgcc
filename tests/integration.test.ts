@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { spawn } from 'node:child_process';
 import {
   createTextMessage,
   createImageMessage,
@@ -11,7 +12,7 @@ import {
 import { StreamAccumulator, type TelegramSender } from '../src/streaming.js';
 import { validateConfig } from '../src/config.js';
 import { SessionStore } from '../src/session.js';
-import { hasActiveChildren } from '../src/cc-process.js';
+import { hasActiveChildren, CCProcess } from '../src/cc-process.js';
 import { mkdirSync, existsSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -285,5 +286,122 @@ describe('integration: full message construction', () => {
     expect(blocks[1].source.type).toBe('base64');
     expect(blocks[1].source.media_type).toBe('image/png');
     expect(blocks[1].source.data).toBe('base64data');
+  });
+});
+
+describe('integration: session takeover detection', () => {
+  const mockLogger = {
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+    debug: vi.fn(),
+    child: vi.fn().mockReturnThis(),
+  } as any;
+
+  it('emits takeover event on unexpected exit (non-zero code)', async () => {
+    // Spawn a process that exits with code 1 (simulating external kill)
+    const proc = new CCProcess({
+      agentId: 'test',
+      userId: '123',
+      ccBinaryPath: 'bash',
+      userConfig: {
+        model: 'claude-opus-4-6',
+        repo: '/tmp',
+        maxTurns: 1,
+        idleTimeoutMs: 300_000,
+        hangTimeoutMs: 300_000,
+        permissionMode: 'dangerously-skip',
+      },
+      continueSession: false,
+      logger: mockLogger,
+    });
+
+    // Override buildArgs to make the process exit with code 1
+    (proc as any).buildArgs = () => ['-c', 'exit 1'];
+    // Skip the initialize request (bash won't handle it)
+    (proc as any).sendInitializeRequest = () => {};
+
+    const takeover = vi.fn();
+    proc.on('takeover', takeover);
+
+    await proc.start();
+    // Wait for the process to exit
+    await new Promise<void>((resolve) => {
+      proc.on('exit', () => resolve());
+    });
+
+    expect(takeover).toHaveBeenCalled();
+    expect(proc.takenOver).toBe(true);
+  });
+
+  it('does NOT emit takeover when killed by us', async () => {
+    const proc = new CCProcess({
+      agentId: 'test',
+      userId: '123',
+      ccBinaryPath: 'bash',
+      userConfig: {
+        model: 'claude-opus-4-6',
+        repo: '/tmp',
+        maxTurns: 1,
+        idleTimeoutMs: 300_000,
+        hangTimeoutMs: 300_000,
+        permissionMode: 'dangerously-skip',
+      },
+      continueSession: false,
+      logger: mockLogger,
+    });
+
+    // Override to make it sleep (so we can kill it ourselves)
+    (proc as any).buildArgs = () => ['-c', 'sleep 60'];
+    (proc as any).sendInitializeRequest = () => {};
+
+    const takeover = vi.fn();
+    proc.on('takeover', takeover);
+
+    await proc.start();
+    // Give it a moment to start
+    await new Promise(r => setTimeout(r, 100));
+
+    // Kill it ourselves
+    proc.kill();
+
+    await new Promise<void>((resolve) => {
+      proc.on('exit', () => resolve());
+    });
+
+    expect(takeover).not.toHaveBeenCalled();
+    expect(proc.takenOver).toBe(false);
+  });
+
+  it('does NOT emit takeover on clean exit (code 0)', async () => {
+    const proc = new CCProcess({
+      agentId: 'test',
+      userId: '123',
+      ccBinaryPath: 'bash',
+      userConfig: {
+        model: 'claude-opus-4-6',
+        repo: '/tmp',
+        maxTurns: 1,
+        idleTimeoutMs: 300_000,
+        hangTimeoutMs: 300_000,
+        permissionMode: 'dangerously-skip',
+      },
+      continueSession: false,
+      logger: mockLogger,
+    });
+
+    (proc as any).buildArgs = () => ['-c', 'exit 0'];
+    (proc as any).sendInitializeRequest = () => {};
+
+    const takeover = vi.fn();
+    proc.on('takeover', takeover);
+
+    await proc.start();
+    await new Promise<void>((resolve) => {
+      proc.on('exit', () => resolve());
+    });
+
+    expect(takeover).not.toHaveBeenCalled();
+    expect(proc.takenOver).toBe(false);
   });
 });

@@ -91,6 +91,8 @@ export class CCProcess extends EventEmitter {
   private _sessionId: string | null = null;
   private _totalCostUsd = 0;
   private _spawnedAt: Date | null = null;
+  private _killedByUs = false;
+  private _takenOver = false;
 
   constructor(options: CCProcessOptions) {
     super();
@@ -106,6 +108,7 @@ export class CCProcess extends EventEmitter {
   get totalCostUsd(): number { return this._totalCostUsd; }
   get spawnedAt(): Date | null { return this._spawnedAt; }
   get pid(): number | undefined { return this.process?.pid; }
+  get takenOver(): boolean { return this._takenOver; }
 
   // ── Spawn ──
 
@@ -147,7 +150,15 @@ export class CCProcess extends EventEmitter {
     });
 
     child.on('exit', (code, signal) => {
-      this.logger.info({ code, signal }, 'CC process exited');
+      this.logger.info({ code, signal, killedByUs: this._killedByUs }, 'CC process exited');
+
+      // Detect session takeover: unexpected exit not initiated by us
+      if (!this._killedByUs && (code !== 0 || signal)) {
+        this._takenOver = true;
+        this.logger.warn({ code, signal }, 'CC exited unexpectedly — possible session takeover');
+        this.emit('takeover', code, signal);
+      }
+
       this.cleanup();
       this.emit('exit', code, signal);
     });
@@ -399,6 +410,7 @@ export class CCProcess extends EventEmitter {
   kill(): void {
     if (!this.process) return;
 
+    this._killedByUs = true;
     this.logger.info('Sending SIGTERM to CC process');
     this.process.kill('SIGTERM');
 
@@ -426,6 +438,7 @@ export class CCProcess extends EventEmitter {
     this.clearHangTimer();
     this._state = 'idle';
     this._ccActivity = 'idle';
+    this._killedByUs = false;
     this.process = null;
     this.emit('stateChange', 'idle');
   }
