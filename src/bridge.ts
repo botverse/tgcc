@@ -360,7 +360,7 @@ export class Bridge extends EventEmitter {
     });
 
     proc.on('hang', () => {
-      agent.tgBot.sendText(chatId, '_CC process hung — restarting..._', 'Markdown');
+      agent.tgBot.sendText(chatId, '_CC session paused. Send a message to continue._', 'Markdown');
     });
 
     proc.on('exit', () => {
