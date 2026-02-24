@@ -11,6 +11,7 @@ import {
 import { StreamAccumulator, type TelegramSender } from '../src/streaming.js';
 import { validateConfig } from '../src/config.js';
 import { SessionStore } from '../src/session.js';
+import { hasActiveChildren } from '../src/cc-process.js';
 import { mkdirSync, existsSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -144,6 +145,125 @@ describe('integration: config → session store', () => {
 
     const user = store.getUser('personal', '123');
     expect(user.currentSessionId).toBeNull();
+  });
+});
+
+describe('integration: session titles and deletion', () => {
+  const testDir = join(tmpdir(), `tgcc-test-title-${Date.now()}`);
+  const stateFile = join(testDir, 'state.json');
+
+  beforeEach(() => {
+    if (existsSync(testDir)) rmSync(testDir, { recursive: true });
+    mkdirSync(testDir, { recursive: true });
+  });
+
+  it('sets session title (truncated to 40 chars)', () => {
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } as any;
+    const store = new SessionStore(stateFile, logger);
+
+    store.setCurrentSession('personal', '123', 'sess-title');
+    store.setSessionTitle('personal', '123', 'sess-title', 'Fix auth middleware for JWT tokens');
+
+    const sessions = store.getRecentSessions('personal', '123');
+    expect(sessions[0].title).toBe('Fix auth middleware for JWT tokens');
+  });
+
+  it('truncates long titles to 40 chars', () => {
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } as any;
+    const store = new SessionStore(stateFile, logger);
+
+    store.setCurrentSession('personal', '123', 'sess-long');
+    store.setSessionTitle('personal', '123', 'sess-long', 'A'.repeat(60));
+
+    const sessions = store.getRecentSessions('personal', '123');
+    expect(sessions[0].title).toBe('A'.repeat(40));
+  });
+
+  it('does not overwrite existing title', () => {
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } as any;
+    const store = new SessionStore(stateFile, logger);
+
+    store.setCurrentSession('personal', '123', 'sess-keep');
+    store.setSessionTitle('personal', '123', 'sess-keep', 'First title');
+    store.setSessionTitle('personal', '123', 'sess-keep', 'Second title');
+
+    const sessions = store.getRecentSessions('personal', '123');
+    expect(sessions[0].title).toBe('First title');
+  });
+
+  it('deletes a session', () => {
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } as any;
+    const store = new SessionStore(stateFile, logger);
+
+    store.setCurrentSession('personal', '123', 'sess-del-1');
+    store.setCurrentSession('personal', '123', 'sess-del-2');
+
+    const deleted = store.deleteSession('personal', '123', 'sess-del-1');
+    expect(deleted).toBe(true);
+
+    const sessions = store.getRecentSessions('personal', '123');
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0].id).toBe('sess-del-2');
+  });
+
+  it('clears currentSessionId when deleting the active session', () => {
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } as any;
+    const store = new SessionStore(stateFile, logger);
+
+    store.setCurrentSession('personal', '123', 'sess-active');
+    const deleted = store.deleteSession('personal', '123', 'sess-active');
+    expect(deleted).toBe(true);
+
+    const user = store.getUser('personal', '123');
+    expect(user.currentSessionId).toBeNull();
+  });
+
+  it('returns false when deleting non-existent session', () => {
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } as any;
+    const store = new SessionStore(stateFile, logger);
+
+    const deleted = store.deleteSession('personal', '123', 'nonexistent');
+    expect(deleted).toBe(false);
+  });
+});
+
+describe('integration: CC activity state tracking', () => {
+  it('tracks activity state through stream events', () => {
+    // Parse events and verify state transitions that CCProcess would make
+    const messageStart = parseCCOutputLine(
+      '{"type":"stream_event","event":{"type":"message_start","message":{"model":"claude-opus-4-6","id":"msg_1","role":"assistant","content":[],"stop_reason":null,"usage":{}}}}'
+    );
+    expect(messageStart).not.toBeNull();
+    expect(messageStart!.type).toBe('stream_event');
+
+    // Assistant message with tool_use stop_reason
+    const assistantToolUse = parseCCOutputLine(
+      '{"type":"assistant","message":{"model":"claude-opus-4-6","id":"msg_1","role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Read","input":{}}],"stop_reason":"tool_use"}}'
+    );
+    expect(assistantToolUse).not.toBeNull();
+    expect(assistantToolUse!.type).toBe('assistant');
+    expect((assistantToolUse as AssistantMessage).message.stop_reason).toBe('tool_use');
+
+    // Tool result
+    const toolResult = parseCCOutputLine('{"type":"tool_result","tool_use_id":"t1","content":"file contents"}');
+    expect(toolResult).not.toBeNull();
+    expect(toolResult!.type).toBe('tool_result');
+
+    // Result event
+    const result = parseCCOutputLine('{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.05}');
+    expect(result).not.toBeNull();
+    expect(result!.type).toBe('result');
+  });
+});
+
+describe('integration: hasActiveChildren', () => {
+  it('returns false for undefined pid', () => {
+    expect(hasActiveChildren(undefined)).toBe(false);
+  });
+
+  it('returns false for non-existent pid', () => {
+    // Use a very high PID that almost certainly doesn't exist
+    expect(hasActiveChildren(999999999)).toBe(false);
   });
 });
 

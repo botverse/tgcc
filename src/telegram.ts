@@ -1,4 +1,4 @@
-import { Bot, InputFile, type Context } from 'grammy';
+import { Bot, InlineKeyboard, InputFile, type Context } from 'grammy';
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { join, extname } from 'node:path';
 import type pino from 'pino';
@@ -25,8 +25,17 @@ export interface SlashCommand {
   userId: string;
 }
 
+export interface CallbackQuery {
+  action: string;
+  data: string;
+  chatId: number;
+  userId: string;
+  callbackQueryId: string;
+}
+
 export type MessageHandler = (msg: TelegramMessage) => void;
 export type CommandHandler = (cmd: SlashCommand) => void;
+export type CallbackHandler = (query: CallbackQuery) => void;
 
 // ── Slash command definitions ──
 
@@ -86,6 +95,7 @@ export class TelegramBot {
   private mediaDir: string;
   private onMessage: MessageHandler;
   private onCommand: CommandHandler;
+  private onCallback: CallbackHandler | null;
   private replyMaps = new Map<number, ReplyMap>(); // per-chat reply maps
   private running = false;
 
@@ -96,6 +106,7 @@ export class TelegramBot {
     onMessage: MessageHandler,
     onCommand: CommandHandler,
     logger: pino.Logger,
+    onCallback?: CallbackHandler,
   ) {
     this.agentId = agentId;
     this.config = config;
@@ -103,6 +114,7 @@ export class TelegramBot {
     this.logger = logger.child({ agentId, component: 'telegram' });
     this.onMessage = onMessage;
     this.onCommand = onCommand;
+    this.onCallback = onCallback ?? null;
 
     this.bot = new Bot(config.botToken);
     this.setupHandlers();
@@ -131,6 +143,9 @@ export class TelegramBot {
       this.bot.command(command, (ctx) => this.handleCommand(ctx, command));
     }
 
+    // ── Callback queries (inline button presses) ──
+    this.bot.on('callback_query:data', (ctx) => this.handleCallbackQuery(ctx));
+
     // ── Text messages ──
     this.bot.on('message:text', (ctx) => this.handleText(ctx));
 
@@ -145,6 +160,28 @@ export class TelegramBot {
 
     // ── Video ──
     this.bot.on('message:video', (ctx) => this.handleVideo(ctx));
+  }
+
+  private handleCallbackQuery(ctx: Context): void {
+    const userId = ctx.from?.id;
+    if (!userId || !this.isAllowed(userId)) return;
+    if (!ctx.callbackQuery?.data) return;
+    if (!this.onCallback) return;
+
+    const data = ctx.callbackQuery.data;
+    const colonIdx = data.indexOf(':');
+    if (colonIdx === -1) return;
+
+    const action = data.slice(0, colonIdx);
+    const payload = data.slice(colonIdx + 1);
+
+    this.onCallback({
+      action,
+      data: payload,
+      chatId: ctx.chat!.id,
+      userId: String(userId),
+      callbackQueryId: ctx.callbackQuery.id,
+    });
   }
 
   private handleCommand(ctx: Context, command: string): void {
@@ -369,6 +406,19 @@ export class TelegramBot {
     });
     this.trackBotMessage(Number(chatId), msg.message_id, text);
     return msg.message_id;
+  }
+
+  async sendTextWithKeyboard(chatId: number | string, text: string, keyboard: InlineKeyboard, parseMode?: string): Promise<number> {
+    const msg = await this.bot.api.sendMessage(Number(chatId), text, {
+      parse_mode: parseMode as 'Markdown' | 'MarkdownV2' | 'HTML' | undefined,
+      reply_markup: keyboard,
+    });
+    this.trackBotMessage(Number(chatId), msg.message_id, text);
+    return msg.message_id;
+  }
+
+  async answerCallbackQuery(callbackQueryId: string, text?: string): Promise<void> {
+    await this.bot.api.answerCallbackQuery(callbackQueryId, { text });
   }
 
   async editText(chatId: number | string, messageId: number, text: string, parseMode?: string): Promise<void> {

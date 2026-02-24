@@ -7,6 +7,7 @@ import type pino from 'pino';
 
 export interface SessionInfo {
   id: string;
+  title?: string;
   startedAt: string;
   lastActivity: string;
   messageCount: number;
@@ -135,10 +136,32 @@ export class SessionStore {
     this.save();
   }
 
+  setSessionTitle(agentId: string, userId: string, sessionId: string, title: string): void {
+    const user = this.ensureUser(agentId, userId);
+    const session = user.sessions.find(s => s.id === sessionId);
+    if (session && !session.title) {
+      session.title = title.slice(0, 40);
+      this.save();
+    }
+  }
+
   clearSession(agentId: string, userId: string): void {
     const user = this.ensureUser(agentId, userId);
     user.currentSessionId = null;
     this.save();
+  }
+
+  deleteSession(agentId: string, userId: string, sessionId: string): boolean {
+    const user = this.ensureUser(agentId, userId);
+    const idx = user.sessions.findIndex(s => s.id === sessionId);
+    if (idx === -1) return false;
+    user.sessions.splice(idx, 1);
+    user.knownSessionIds = user.knownSessionIds.filter(id => id !== sessionId);
+    if (user.currentSessionId === sessionId) {
+      user.currentSessionId = null;
+    }
+    this.save();
+    return true;
   }
 
   getRecentSessions(agentId: string, userId: string, limit: number = 10): SessionInfo[] {

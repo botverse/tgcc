@@ -20,7 +20,8 @@ import {
   type StreamInnerEvent,
 } from './cc-protocol.js';
 import { StreamAccumulator, splitText, type TelegramSender } from './streaming.js';
-import { TelegramBot, type TelegramMessage, type SlashCommand } from './telegram.js';
+import { TelegramBot, type TelegramMessage, type SlashCommand, type CallbackQuery } from './telegram.js';
+import { InlineKeyboard } from 'grammy';
 import { McpBridgeServer, type McpToolRequest, type McpToolResponse } from './mcp-bridge.js';
 import {
   SessionStore,
@@ -37,6 +38,7 @@ interface AgentInstance {
   processes: Map<string, CCProcess>;       // userId → CCProcess
   accumulators: Map<string, StreamAccumulator>; // `${userId}:${chatId}` → accumulator
   batchers: Map<string, MessageBatcher>;   // userId → batcher
+  pendingTitles: Map<string, string>;      // userId → first message text for session title
 }
 
 // ── Message Batcher ──
@@ -161,6 +163,7 @@ export class Bridge extends EventEmitter {
       (msg) => this.handleTelegramMessage(agentId, msg),
       (cmd) => this.handleSlashCommand(agentId, cmd),
       this.logger,
+      (query) => this.handleCallbackQuery(agentId, query),
     );
 
     const instance: AgentInstance = {
@@ -170,6 +173,7 @@ export class Bridge extends EventEmitter {
       processes: new Map(),
       accumulators: new Map(),
       batchers: new Map(),
+      pendingTitles: new Map(),
     };
 
     this.agents.set(agentId, instance);
@@ -296,6 +300,10 @@ export class Bridge extends EventEmitter {
     // Get or create CC process
     let proc = agent.processes.get(userId);
     if (!proc || proc.state === 'idle') {
+      // Save first message text as pending session title
+      if (data.text) {
+        agent.pendingTitles.set(userId, data.text);
+      }
       proc = this.spawnCCProcess(agentId, userId, chatId);
       agent.processes.set(userId, proc);
     }
@@ -344,6 +352,12 @@ export class Bridge extends EventEmitter {
 
     proc.on('init', (event: InitEvent) => {
       this.sessionStore.setCurrentSession(agentId, userId, event.session_id);
+      // Set session title from the first user message
+      const pendingTitle = agent.pendingTitles.get(userId);
+      if (pendingTitle) {
+        this.sessionStore.setSessionTitle(agentId, userId, event.session_id, pendingTitle);
+        agent.pendingTitles.delete(userId);
+      }
     });
 
     proc.on('stream_event', (event: StreamInnerEvent) => {
@@ -486,10 +500,29 @@ export class Bridge extends EventEmitter {
           await agent.tgBot.sendText(cmd.chatId, 'No recent sessions.');
           break;
         }
-        const lines = sessions.map(s =>
-          `\`${s.id.slice(0, 8)}\` — ${s.messageCount} msgs, $${s.totalCostUsd.toFixed(4)} (${s.lastActivity})`
+        const currentSessionId = this.sessionStore.getUser(agentId, cmd.userId).currentSessionId;
+
+        const lines: string[] = [];
+        const keyboard = new InlineKeyboard();
+
+        sessions.forEach((s, i) => {
+          const title = s.title ? `"${s.title}"` : `\`${s.id.slice(0, 8)}\``;
+          const age = formatAge(new Date(s.lastActivity));
+          const isCurrent = s.id === currentSessionId;
+          lines.push(`${i + 1}. ${title} — ${s.messageCount} msgs, $${s.totalCostUsd.toFixed(2)} (${age})${isCurrent ? ' ✓' : ''}`);
+
+          if (!isCurrent) {
+            keyboard.text('Resume', `resume:${s.id}`);
+          }
+          keyboard.text('Delete', `delete:${s.id}`).row();
+        });
+
+        await agent.tgBot.sendTextWithKeyboard(
+          cmd.chatId,
+          `📋 *Recent sessions:*\n\n${lines.join('\n')}`,
+          keyboard,
+          'Markdown',
         );
-        await agent.tgBot.sendText(cmd.chatId, `*Recent sessions:*\n\n${lines.join('\n')}`, 'Markdown');
         break;
       }
 
@@ -581,6 +614,49 @@ export class Bridge extends EventEmitter {
     }
   }
 
+  // ── Callback query handling (inline buttons) ──
+
+  private async handleCallbackQuery(agentId: string, query: CallbackQuery): Promise<void> {
+    const agent = this.agents.get(agentId);
+    if (!agent) return;
+
+    this.logger.debug({ agentId, action: query.action, data: query.data }, 'Callback query');
+
+    switch (query.action) {
+      case 'resume': {
+        const sessionId = query.data;
+        const proc = agent.processes.get(query.userId);
+        if (proc) {
+          proc.destroy();
+          agent.processes.delete(query.userId);
+        }
+        this.sessionStore.setCurrentSession(agentId, query.userId, sessionId);
+        await agent.tgBot.answerCallbackQuery(query.callbackQueryId, 'Session set');
+        await agent.tgBot.sendText(
+          query.chatId,
+          `Will resume session \`${sessionId.slice(0, 8)}\` on next message.`,
+          'Markdown',
+        );
+        break;
+      }
+
+      case 'delete': {
+        const sessionId = query.data;
+        const deleted = this.sessionStore.deleteSession(agentId, query.userId, sessionId);
+        if (deleted) {
+          await agent.tgBot.answerCallbackQuery(query.callbackQueryId, 'Session deleted');
+          await agent.tgBot.sendText(query.chatId, `Session \`${sessionId.slice(0, 8)}\` deleted.`, 'Markdown');
+        } else {
+          await agent.tgBot.answerCallbackQuery(query.callbackQueryId, 'Session not found');
+        }
+        break;
+      }
+
+      default:
+        await agent.tgBot.answerCallbackQuery(query.callbackQueryId);
+    }
+  }
+
   // ── MCP tool handling ──
 
   private async handleMcpToolRequest(request: McpToolRequest): Promise<McpToolResponse> {
@@ -638,4 +714,14 @@ function formatDuration(ms: number): string {
   if (mins < 60) return `${mins}m`;
   const hours = Math.floor(mins / 60);
   return `${hours}h ${mins % 60}m`;
+}
+
+function formatAge(date: Date): string {
+  const diffMs = Date.now() - date.getTime();
+  const mins = Math.floor(diffMs / 60000);
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
 }
