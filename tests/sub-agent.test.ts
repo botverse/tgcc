@@ -35,32 +35,43 @@ describe('isSubAgentTool', () => {
 });
 
 describe('extractAgentLabel', () => {
-  it('extracts from explicit name field', () => {
+  it('extracts from explicit name field (highest priority)', () => {
     expect(extractAgentLabel('{"name": "spec-reviewer", "prompt": "Review the spec"}')).toBe('spec-reviewer');
   });
 
-  it('extracts from role field', () => {
-    expect(extractAgentLabel('{"role": "code-reviewer", "prompt": "Review code"}')).toBe('code-reviewer');
+  it('extracts from description field', () => {
+    expect(extractAgentLabel('{"description": "Review code quality", "prompt": "Check..."}')).toBe('Review code quality');
   });
 
-  it('extracts "You are a [role]" pattern', () => {
-    expect(extractAgentLabel('{"prompt": "You are a spec-reviewer. Check all weights."}')).toBe('spec-reviewer');
-    expect(extractAgentLabel('{"prompt": "You are the hci-reviewer who validates..."}')).toBe('hci-reviewer');
-    expect(extractAgentLabel('{"prompt": "You are an integration-tester that runs..."}')).toBe('integration-tester');
+  it('extracts from subagent_type field', () => {
+    expect(extractAgentLabel('{"subagent_type": "code-reviewer", "prompt": "Review code"}')).toBe('code-reviewer');
   });
 
-  it('extracts "your role is [role]" pattern', () => {
-    expect(extractAgentLabel('{"prompt": "your role is code-reviewer. Do it well."}')).toBe('code-reviewer');
+  it('extracts from team_name field', () => {
+    expect(extractAgentLabel('{"team_name": "review-team", "prompt": "Review all the things"}')).toBe('review-team');
   });
 
-  it('falls back to first 30 chars of prompt', () => {
+  it('falls back to first line of prompt', () => {
     const label = extractAgentLabel('{"prompt": "Analyze the authentication middleware for vulnerabilities in the codebase"}');
-    expect(label).toBe('Analyze the authentication mid…');
+    expect(label).toBe('Analyze the authentication middleware for vulnerabilities in…');
+  });
+
+  it('handles partial JSON during streaming (name field complete)', () => {
+    expect(extractAgentLabel('{"name": "spec-reviewer", "prompt": "You are')).toBe('spec-reviewer');
+  });
+
+  it('handles partial JSON during streaming (description field)', () => {
+    expect(extractAgentLabel('{"description": "Verify weights", "prompt": "incomplete')).toBe('Verify weights');
   });
 
   it('returns empty for no parseable content', () => {
     expect(extractAgentLabel('')).toBe('');
     expect(extractAgentLabel('{}')).toBe('');
+  });
+
+  it('prioritizes name over description over subagent_type', () => {
+    expect(extractAgentLabel('{"name": "alice", "description": "helper", "subagent_type": "reviewer"}')).toBe('alice');
+    expect(extractAgentLabel('{"description": "helper", "subagent_type": "reviewer"}')).toBe('helper');
   });
 });
 

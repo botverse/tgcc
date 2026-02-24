@@ -522,50 +522,61 @@ export function extractSubAgentSummary(jsonInput: string, maxLen = 150): string 
   return '';
 }
 
-/** Extract a meaningful agent label from the JSON tool input.
- *  Looks for explicit name/role fields, then "You are a [role]" patterns in the prompt,
- *  then falls back to the first ~30 chars of the prompt.
+/**
+ * Extract a human-readable label for a sub-agent from its JSON tool input.
+ * Uses CC's Task tool structured fields: name, description, subagent_type, team_name.
+ * No regex guessing — purely structural JSON field extraction.
  */
 export function extractAgentLabel(jsonInput: string): string {
-  // Try to extract from explicit fields first
-  const fieldPatterns = ['name', 'agent_name', 'role'];
-  for (const key of fieldPatterns) {
-    const re = new RegExp(`"${key}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)`, 'i');
-    const m = jsonInput.match(re);
-    if (m?.[1]) {
-      const val = m[1].replace(/\\n/g, ' ').replace(/\\"/g, '"').trim();
-      if (val.length > 0 && val.length <= 50) return val;
+  // Priority order of CC Task tool fields
+  const labelFields = ['name', 'description', 'subagent_type', 'team_name'];
+  const summaryField = 'prompt'; // last resort — first line of prompt
+
+  try {
+    const parsed = JSON.parse(jsonInput);
+    for (const key of labelFields) {
+      const val = parsed[key];
+      if (typeof val === 'string' && val.trim()) {
+        return val.trim().slice(0, 80);
+      }
+    }
+    if (typeof parsed[summaryField] === 'string' && parsed[summaryField].trim()) {
+      const firstLine = parsed[summaryField].trim().split('\n')[0];
+      return firstLine.length > 60 ? firstLine.slice(0, 60) + '…' : firstLine;
+    }
+    return '';
+  } catch {
+    // JSON incomplete during streaming — extract first complete field value
+    return extractFieldFromPartialJson(jsonInput, labelFields) ?? '';
+  }
+}
+
+/** Extract the first complete string value for any of the given keys from partial JSON. */
+function extractFieldFromPartialJson(input: string, keys: string[]): string | null {
+  for (const key of keys) {
+    const idx = input.indexOf(`"${key}"`);
+    if (idx === -1) continue;
+    const afterKey = input.slice(idx + key.length + 2);
+    const colonIdx = afterKey.indexOf(':');
+    if (colonIdx === -1) continue;
+    const afterColon = afterKey.slice(colonIdx + 1).trimStart();
+    if (!afterColon.startsWith('"')) continue;
+    // Walk the string handling escapes
+    let i = 1, value = '';
+    while (i < afterColon.length) {
+      if (afterColon[i] === '\\' && i + 1 < afterColon.length) {
+        value += afterColon[i + 1] === 'n' ? ' ' : afterColon[i + 1];
+        i += 2;
+      } else if (afterColon[i] === '"') {
+        if (value.trim()) return value.trim().slice(0, 80);
+        break;
+      } else {
+        value += afterColon[i];
+        i++;
+      }
     }
   }
-
-  // Try to find "You are a [role]" or "your role is [role]" patterns in prompt text
-  const promptRe = /"(?:prompt|task|message)"\s*:\s*"((?:[^"\\]|\\.)*)"/i;
-  const promptMatch = jsonInput.match(promptRe);
-  const promptText = promptMatch?.[1]?.replace(/\\n/g, ' ').replace(/\\"/g, '"') ?? '';
-
-  if (promptText) {
-    // "You are a spec-reviewer" or "You are the code-reviewer"
-    // Terminators: punctuation, or words like who/that/and/on/in/responsible/tasked/for/your
-    const youAreMatch = promptText.match(/[Yy]ou are (?:a |an |the )?([a-zA-Z][a-zA-Z0-9_-]{1,30}?)(?:\.|,|!|\s+(?:who|that|and|on|in|responsible|tasked|for|your))/);
-    if (youAreMatch?.[1]) return youAreMatch[1].trim();
-
-    // "your role is [role]"
-    const roleMatch = promptText.match(/[Yy]our role is (?:a |an |the )?([a-zA-Z][a-zA-Z0-9_ -]{1,30}?)(?:\.|,|!|\s)/);
-    if (roleMatch?.[1]) return roleMatch[1].trim();
-
-    // "Role: [role]" at start or after newline
-    const roleLabelMatch = promptText.match(/(?:^|\\n|\n)\s*[Rr]ole:\s*([a-zA-Z][a-zA-Z0-9_ -]{1,30}?)(?:\.|,|!|\s*(?:\\n|\n|$))/);
-    if (roleLabelMatch?.[1]) return roleLabelMatch[1].trim();
-  }
-
-  // Fallback: first ~30 chars of the prompt
-  if (promptText) {
-    const trimmed = promptText.trim();
-    if (trimmed.length > 30) return trimmed.slice(0, 30) + '…';
-    if (trimmed.length > 0) return trimmed;
-  }
-
-  return '';
+  return null;
 }
 
 // ── Sub-Agent Tracker ──
