@@ -604,12 +604,17 @@ export class Bridge extends EventEmitter implements CtlHandler {
         if (!cmd.args) {
           const current = this.sessionStore.getUser(agentId, cmd.userId).repo
             || resolveUserConfig(agent.config, cmd.userId).repo;
-          // Show available repos from registry
+          // Show available repos as inline keyboard buttons
           const repoEntries = Object.entries(this.config.repos);
           if (repoEntries.length > 0) {
-            const lines = repoEntries.map(([name, path]) => `• \`${name}\` → ${path}`);
-            await agent.tgBot.sendText(cmd.chatId,
-              `Current repo: ${current}\n\n*Available repos:*\n${lines.join('\n')}\n\nUsage: /repo <name or path>`,
+            const keyboard = new InlineKeyboard();
+            for (const [name] of repoEntries) {
+              keyboard.text(name, `repo:${name}`).row();
+            }
+            await agent.tgBot.sendTextWithKeyboard(
+              cmd.chatId,
+              `Current repo: \`${current}\`\n\nSelect a repo:`,
+              keyboard,
               'Markdown',
             );
           } else {
@@ -693,6 +698,26 @@ export class Bridge extends EventEmitter implements CtlHandler {
         } else {
           await agent.tgBot.answerCallbackQuery(query.callbackQueryId, 'Session not found');
         }
+        break;
+      }
+
+      case 'repo': {
+        const repoName = query.data;
+        const repoPath = resolveRepoPath(this.config.repos, repoName);
+        if (!existsSync(repoPath)) {
+          await agent.tgBot.answerCallbackQuery(query.callbackQueryId, 'Path not found');
+          break;
+        }
+        // Kill current process (different CWD needs new process)
+        const proc = agent.processes.get(query.userId);
+        if (proc) {
+          proc.destroy();
+          agent.processes.delete(query.userId);
+        }
+        this.sessionStore.setRepo(agentId, query.userId, repoPath);
+        this.sessionStore.clearSession(agentId, query.userId);
+        await agent.tgBot.answerCallbackQuery(query.callbackQueryId, `Repo: ${repoName}`);
+        await agent.tgBot.sendText(query.chatId, `Repo set to \`${repoPath}\`. Session cleared.`, 'Markdown');
         break;
       }
 
