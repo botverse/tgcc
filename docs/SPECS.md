@@ -11,21 +11,26 @@
 
 ### CLI Interface
 ```
-tgcc message "fix the tests"                    # auto-detect agent from cwd repo
+tgcc message "fix the tests"                    # auto-detect agent from cwd repo (must match an agent's default repo)
 tgcc message --agent test "fix the tests"       # explicit agent
-tgcc message --repo ~/project "fix the tests"   # explicit repo (for /repo override)
 tgcc message --session <id> "fix the tests"     # resume specific session
 tgcc status                                     # show running agents and active sessions
 tgcc status --agent test                        # show specific agent status
 ```
 
+### Agent Resolution from cwd
+- Match `cwd` against all agents' `defaults.repo` paths
+- Each repo is exclusive to one agent — no two agents share a default repo
+- If `cwd` is inside an agent's repo → use that agent
+- If `cwd` doesn't match any agent's repo → error: "No agent configured for this repo"
+
 ### Control Socket Protocol (NDJSON over Unix socket)
 ```jsonc
 // Request
-{"type": "message", "text": "fix the tests", "agent": "test", "repo": "/path", "session": "uuid"}
+{"type": "message", "text": "fix the tests", "agent": "test", "session": "uuid"}
 {"type": "status", "agent": "test"}
 
-// Response
+// Response  
 {"type": "ack", "sessionId": "uuid", "state": "active|spawning"}
 {"type": "status", "agents": [...], "sessions": [...]}
 {"type": "error", "message": "..."}
@@ -40,27 +45,36 @@ tgcc status --agent test                        # show specific agent status
 
 ## 2. Agent Registration CLI
 
-**Goal:** Register new agents from CLI, not just by editing config JSON.
+**Goal:** Register and manage agents from CLI.
 
 ### CLI Interface
 ```
-tgcc agent add myagent --bot-token <token> --repo ~/project
-tgcc agent add myagent --bot-token <token>       # no default repo
-tgcc agent remove myagent
+tgcc agent add <name> --bot-token <token> --repo <path>    # with default repo
+tgcc agent add <name> --bot-token <token>                   # generic agent (no default repo)
+tgcc agent remove <name>
 tgcc agent list
-tgcc agent repo myagent ~/new-project            # set/change default repo
+tgcc agent repo <name> <path>                               # set/change default repo
 ```
 
-### Behavior
-- Writes to `~/.tgcc/config.json`
-- Triggers hot-reload (config watcher picks it up)
-- For `agent repo`: sets `defaults.repo` in the agent config. If agent has a default repo and user changes it via `/repo` in Telegram, the change lasts until session idle timeout, then reverts to default.
+### Generic Agents (no default repo)
+- When a generic agent receives a message with no active `/repo` override, it prompts the user to select a repo from a list
+- List comes from: all registered agent default repos + any repos defined in a top-level `repos` config array
+- Once selected, the repo persists for the session
+
+### `/repo` Override Behavior
+- **Agent with default repo:** `/repo <other-path>` switches temporarily. Reverts to default repo after session idle timeout.
+- **Generic agent:** `/repo <path>` sets the active repo. Persists until changed or session ends.
+
+### Writes to Config
+- Edits `~/.tgcc/config.json` directly
+- Hot-reload picks up the change automatically (config watcher, 1s poll)
+- Service creates/destroys Telegram bot instances for new/removed agents
 
 ---
 
 ## 3. `/sessions` with Inline Buttons
 
-**Goal:** Make sessions clickable for resume, show titles.
+**Goal:** Make sessions clickable for resume, show titles and stats.
 
 ### Current
 ```
@@ -71,10 +85,10 @@ tgcc agent repo myagent ~/new-project            # set/change default repo
 ```
 📋 Recent sessions:
 
-1. `a1b2c3d4` — "Fix auth middleware" — 5 msgs, $0.02 (2 min ago)
+1. "Fix auth middleware" — 5 msgs, $0.02 (2 min ago)
    [Resume] [Delete]
 
-2. `b2c3d4e5` — "Update tests" — 3 msgs, $0.01 (1h ago)
+2. "Update tests" — 3 msgs, $0.01 (1h ago)
    [Resume]
 ```
 
@@ -91,20 +105,53 @@ tgcc agent repo myagent ~/new-project            # set/change default repo
 - **Hang timer** (5 min): kills CC if no stdout for 5 minutes. Too aggressive — CC doing long tool calls (builds, web fetches) can be silent for minutes.
 - **Idle timer** (5 min): kills CC if no new user message in 5 minutes after a turn completes. This is reasonable.
 - **On exit:** process goes to `idle`, next message spawns with `--continue`. This is correct.
-- **No session takeover detection:** If user opens the same session in VS Code or CLI, TGCC and the other client fight over the session.
+- **On hang → "restarting":** Kills hung process and immediately restarts. Wrong — should take over naturally.
+- **No session takeover detection:** If user opens the same session in VS Code or CLI, TGCC doesn't know.
+
+### CC Extension Architecture (from deobfuscated source at ~/Botverse/cc-deobfuscated/)
+
+Key findings from the CC CLI v2.1.50 source:
+
+1. **Session persistence** uses a remote API with PUT and UUID-based last-write-wins conflict resolution. 409 responses indicate concurrent modification — CC adopts the server's `lastUuid` and retries.
+
+2. **The stream-json SDK protocol** supports:
+   - `control_request` / `control_response` for initialization and permission grants
+   - `control_cancel_request` for aborting pending requests
+   - `user`, `assistant`, `system` message types for the conversation
+
+3. **SessionsWebSocket** class (`pQ8`) manages remote session connections with ping/reconnect. It sends/receives control requests and user messages over WebSocket.
+
+4. **RemoteSessionManager** (`QQ8`) wraps the WebSocket with higher-level session lifecycle: connected/disconnected events, permission request handling, and message routing.
+
+5. **No local lock file mechanism found.** Session conflict is handled at the API level (409 responses), not via local filesystem locks. This means we can't check for local locks to detect VS Code takeover.
+
+6. **Session exit signals:** CC listens for SIGINT, SIGTERM, SIGHUP and handles graceful shutdown.
 
 ### Proposed Changes
 
-#### 4a. Smart Hang Detection (replace blunt 5-min timer)
+#### 4a. Smart Hang Detection
 
-Adopt OpenClaw's approach from `runner.ts`:
+Track CC's state from stream-json events to avoid false kills:
 
-1. **Track CC state machine:**
-   - `waitingForApiResponse`: between `message_stop` and next `message_start` — silence expected
-   - `executingTool`: between `stop_reason: "tool_use"` and next `user` tool_result — silence expected
-   - Only start hang timer when CC is in neither state (truly stuck)
+1. **CC State Machine (derived from stream events):**
+   - `idle` → no active turn
+   - `thinking` → between `message_start` and first content/tool_use
+   - `responding` → producing text content blocks
+   - `tool_executing` → CC emitted `stop_reason: "tool_use"`, waiting for tool result  
+   - `waiting_for_api` → sent request, waiting for API response (long silence expected)
 
-2. **Check for active children:**
+2. **Hang detection logic:**
+   ```
+   CC silent for N seconds →
+     if tool_executing → check hasActiveChildren(cc.pid)
+       if yes → extend timeout by 5 min (subprocess is working)
+       if no → wait another 60s, then declare hung
+     if waiting_for_api → extend timeout (API can be slow)
+     if thinking/responding → likely truly hung after 5 min
+     if idle → shouldn't have hang timer running
+   ```
+
+3. **hasActiveChildren check:**
    ```typescript
    function hasActiveChildren(pid: number): boolean {
      try {
@@ -113,69 +160,99 @@ Adopt OpenClaw's approach from `runner.ts`:
      } catch { return false; }
    }
    ```
-   Before killing on hang timeout, check if CC has child processes (running bash commands, etc). If yes, extend the timeout.
 
-3. **Hang timer flow:**
-   ```
-   CC produces output → reset hang timer
-   Hang timer fires →
-     if waitingForApiResponse || executingTool → don't kill, extend
-     else if hasActiveChildren(cc.pid) → don't kill, extend by 5 min
-     else → truly hung, kill with SIGTERM, wait 5s, SIGKILL if needed
-   ```
+Reference: OpenClaw's `runner.ts` uses similar state tracking at lines 93-110, 400-480.
 
-#### 4b. Let CC Exit Naturally
+#### 4b. Natural Takeover (not restart)
 
-**Principle:** Don't restart CC after timeouts. Let CC exit when it's done, and `--continue` on the next message.
+When CC is hung or idle timeout fires:
 
-Current behavior: On hang, TGCC kills CC then tells user "restarting...". This is wrong — if CC is hung, restarting it won't help. Better to:
+1. **Kill the process** (SIGTERM, wait 5s, SIGKILL if needed)
+2. **Keep the session ID** — don't discard it
+3. **Notify user:** "CC session paused. Send a message to continue."
+4. **On next message:** spawn CC with `--resume <sessionId>` — seamless continuation
+5. **The user roaming between devices (laptop ↔ phone) should feel transparent** — TGCC is just another client that `--resume`s the session when needed
 
-1. Kill the hung process
-2. Tell user "CC process was unresponsive and was stopped. Send a new message to continue."
-3. On next user message, spawn with `--continue` using the same session ID
-
-Remove the "restarting" language. The process died; the session lives on.
+Remove "CC process hung — restarting..." messaging. There is no restart. The session lives; the process is ephemeral.
 
 #### 4c. Session Takeover Detection
 
-**Problem:** User opens CC in VS Code or terminal on the same session. TGCC's CC process gets confused or fails silently.
+**Problem:** User opens the session in VS Code or CC CLI while TGCC's CC process is active.
 
-**Detection method:** CC uses a session lock file at `~/.claude/sessions/{sessionId}.lock` (or similar). When another client takes over:
+**Detection signals (from CC source analysis):**
 
-1. CC may emit an error event about session conflict
-2. CC may exit with a specific code
-3. CC may simply stop producing output (looks like a hang)
+1. **CC exits unexpectedly** — VS Code or CLI taking over may cause the existing CC process to fail or get killed
+2. **Remote API 409 conflicts** — CC logs "session_persist_fail_concurrent_modification" when another client modifies the same session
+3. **CC stdout goes silent + process exits** — the other client wins
 
 **Proposed approach:**
 
-1. **On CC exit with session conflict:** Parse the exit code/error. If it indicates session takeover:
-   - Don't try to `--continue` — the session is owned by another client
-   - Notify user: "Session was opened in another client. Send a new message to start fresh."
-   - Clear the session from `SessionStore`
+1. **On CC unexpected exit (non-zero code, signal):**
+   - Check if exit was due to SIGTERM from us (expected) vs external signal (takeover)
+   - If external: mark session as "externally owned", stop managing it
+   - Notify user: "Session was picked up by another client."
 
-2. **Proactive check:** Before spawning CC with `--resume`, check if the session lock file exists and is held by another process:
-   ```typescript
-   function isSessionLocked(sessionId: string): boolean {
-     const lockPath = path.join(os.homedir(), '.claude', 'sessions', sessionId, '.lock');
-     // Check if lock file exists and if the holding PID is alive
-   }
-   ```
+2. **On next Telegram message after takeover:**
+   - Don't try to `--resume` the same session (the other client owns it)
+   - Start a fresh session OR ask user which session to use
 
-3. **On lock detection:** Start a fresh session instead of `--resume`.
+3. **Graceful yield:** When TGCC detects competition, it should yield rather than fight. The VS Code/CLI user experience is richer, so TGCC should defer.
 
-### Implementation Notes
+4. **Future: WebSocket integration** — CC's `SessionsWebSocket` class could theoretically be used by TGCC to participate in the session lifecycle properly, but this is a v2 feature.
 
-- State tracking (`waitingForApiResponse`, `executingTool`) requires parsing the stream-json events in `cc-protocol.ts`. The `assistant` events contain `stop_reason`, and `system` events with `subtype: "init"` mark the start.
-- The `hasActiveChildren` check is a simple `pgrep --parent` — import `execSync` from `child_process`.
-- Session lock path needs investigation — check CC source or test empirically what files CC creates per session.
+---
+
+## 5. Repo Registry
+
+**Goal:** Central repo registry that agents reference.
+
+### Config Structure
+```json
+{
+  "repos": {
+    "tgcc": "/home/fonz/Botverse/tgcc",
+    "kyo": "/home/fonz/Botverse/KYO",
+    "sentinella": "/home/fonz/Botverse/sentinella",
+    "openclaw": "/home/fonz/Projects/openclaw"
+  },
+  "agents": {
+    "test": {
+      "botToken": "...",
+      "allowedUsers": ["7016073156"],
+      "defaults": {
+        "repo": "tgcc",
+        "model": "claude-opus-4-6"
+      }
+    },
+    "dev": {
+      "botToken": "...",
+      "allowedUsers": ["7016073156"],
+      "defaults": {
+        "model": "claude-opus-4-6"
+      }
+    }
+  }
+}
+```
+
+- Agent `defaults.repo` references a key from `repos` (exclusive — one agent per repo)
+- Generic agents (no `defaults.repo`) can `/repo <name>` to pick from the registry
+- CLI resolves cwd against the `repos` map for agent auto-detection
 
 ---
 
 ## Priority Order
 
 1. **4a. Smart hang detection** — highest impact, prevents false kills
-2. **4b. Natural exit flow** — improves UX, removes misleading "restarting" message  
+2. **4b. Natural takeover** — improves UX, removes misleading "restarting"
 3. **3. /sessions buttons** — quick UX win
 4. **1. CLI command** — enables BossBot/external integration
-5. **2. Agent registration** — convenience, config editing works for now
-6. **4c. Session takeover** — needs CC behavior investigation first
+5. **5. Repo registry** — foundation for multi-repo management
+6. **2. Agent registration** — convenience CLI
+7. **4c. Session takeover** — needs more CC behavior testing
+
+## Reference Material
+
+- **Deobfuscated CC source:** `~/Botverse/cc-deobfuscated/cli-beautified.js` (502K lines, js-beautify formatted)
+- **OpenClaw CC runner:** `~/Projects/openclaw/src/agents/claude-code/runner.ts` (state tracking, hang detection)
+- **TGCC source:** `~/Botverse/tgcc/src/` (current implementation)
