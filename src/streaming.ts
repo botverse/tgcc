@@ -593,9 +593,7 @@ export interface SubAgentInfo {
   label: string;
   agentName: string;  // CC's agent name (used as 'from' in mailbox)
   inputPreview: string;
-  dispatchedAt: number | null;         // timestamp when dispatched (for elapsed timer)
-  elapsedTimer: ReturnType<typeof setInterval> | null;  // periodic edit timer
-  editVersion: number;  // incremented on completion — timer checks this to avoid overwriting
+  dispatchedAt: number | null;         // timestamp when dispatched
 }
 
 export interface SubAgentSender {
@@ -660,11 +658,6 @@ export class SubAgentTracker {
     for (const [, info] of this.agents) {
       if (info.status !== 'dispatched' || !info.tgMessageId) continue;
       info.status = 'completed';
-      // Clear elapsed timer
-      if (info.elapsedTimer) {
-        clearInterval(info.elapsedTimer);
-        info.elapsedTimer = null;
-      }
       const label = info.label || info.toolName;
       const text = `✅ ${escapeHtml(label)} — see main message`;
       this.sendQueue = this.sendQueue.then(async () => {
@@ -704,7 +697,7 @@ export class SubAgentTracker {
     const info = this.agents.get(toolUseId);
     if (!info || info.status === 'completed') return;
     info.status = 'completed';
-    if (info.elapsedTimer) { clearInterval(info.elapsedTimer); info.elapsedTimer = null; }
+
     // Check if all agents are done
     const allDone = ![...this.agents.values()].some(a => a.status === 'dispatched');
     if (allDone && this.onAllReported) {
@@ -744,7 +737,7 @@ export class SubAgentTracker {
     }
 
     // Clear elapsed timer
-    this.clearElapsedTimer(info);
+
 
     info.status = 'completed';
 
@@ -787,8 +780,6 @@ export class SubAgentTracker {
       agentName: '',
       inputPreview: '',
       dispatchedAt: null,
-      elapsedTimer: null,
-      editVersion: 0,
     };
 
     this.agents.set(block.id, info);
@@ -892,52 +883,10 @@ export class SubAgentTracker {
     await this.sendQueue;
 
     // Start elapsed timer — update every 15s to show progress
-    this.startElapsedTimer(info);
+
   }
 
   /** Start a periodic timer that edits the message with elapsed time */
-  private startElapsedTimer(info: SubAgentInfo): void {
-    if (info.elapsedTimer) return; // already running
-
-    const displayLabel = info.label || info.toolName;
-
-    info.elapsedTimer = setInterval(() => {
-      // Strict check: don't touch completed agents
-      if (info.status !== 'dispatched') {
-        this.clearElapsedTimer(info);
-        return;
-      }
-      if (!info.tgMessageId || !info.dispatchedAt) return;
-
-      const elapsedSec = Math.round((Date.now() - info.dispatchedAt) / 1000);
-      const versionAtQueue = info.editVersion;
-
-      this.sendQueue = this.sendQueue.then(async () => {
-        // If version changed, a completion edit was queued — don't overwrite it
-        if (info.status !== 'dispatched' || info.editVersion !== versionAtQueue) return;
-        const text = `🤖 ${escapeHtml(displayLabel)} — Working… (${elapsedSec}s)`;
-        try {
-          await this.sender.editMessage(
-            this.chatId,
-            info.tgMessageId!,
-            text,
-            'HTML',
-          );
-        } catch {
-          // Ignore edit failures (rate limits, not modified, etc.)
-        }
-      });
-    }, 15_000);
-  }
-
-  /** Clear the elapsed timer for a sub-agent */
-  private clearElapsedTimer(info: SubAgentInfo): void {
-    if (info.elapsedTimer) {
-      clearInterval(info.elapsedTimer);
-      info.elapsedTimer = null;
-    }
-  }
-
   /** Set callback invoked when ALL dispatched sub-agents have mailbox results. */
   setOnAllReported(cb: AllAgentsReportedCallback | null): void {
     this.onAllReported = cb;
@@ -1027,10 +976,10 @@ export class SubAgentTracker {
       if (!matched) continue;
 
       // CRITICAL ORDER: set status + bump version FIRST, then clear timer
-      // In-flight timer callbacks check editVersion and bail if it changed
+
       matched.status = 'completed';
-      matched.editVersion++;
-      this.clearElapsedTimer(matched);
+
+
 
       if (!matched.tgMessageId) continue;
 
@@ -1089,7 +1038,7 @@ export class SubAgentTracker {
     this.stopMailboxWatch();
     // Clear all elapsed timers before resetting
     for (const info of this.agents.values()) {
-      this.clearElapsedTimer(info);
+  
     }
     this.agents.clear();
     this.blockToAgent.clear();
