@@ -694,11 +694,35 @@ export class Bridge extends EventEmitter implements CtlHandler {
       agent.tgBot.sendText(chatId, `<i>Error: ${escapeHtml(String(event.result))}</i>`, 'HTML');
     }
 
-    // If background sub-agents are still running, they'll report via
-    // <background_agent_notification> XML on CC's next user turn.
+    // If background sub-agents are still running, send a follow-up message
+    // to CC stdin after a delay. This triggers CC to dequeue its message queue,
+    // which contains <background_agent_notification> XML for completed agents.
     const tracker = agent.subAgentTrackers.get(accKey);
     if (tracker?.hasDispatchedAgents) {
-      this.logger.info({ agentId }, 'Turn ended with background sub-agents still running');
+      this.logger.info({ agentId }, 'Turn ended with background sub-agents still running — scheduling follow-up');
+      // Get the CC process for this user
+      const ccProcess = agent.processes.get(userId);
+      if (ccProcess) {
+        // Clear idle timer — don't kill CC while agents are working
+        ccProcess.clearIdleTimer();
+      }
+      // Poll every 30s until all agents report
+      const pollInterval = setInterval(() => {
+        if (!tracker.hasDispatchedAgents) {
+          clearInterval(pollInterval);
+          return;
+        }
+        const proc = agent.processes.get(userId);
+        if (!proc) { clearInterval(pollInterval); return; }
+        this.logger.info({ agentId }, 'Sending follow-up to check on background agents');
+        proc.sendMessage(createTextMessage('Check on the background agents. Are they done? Report their results.'));
+      }, 30_000);
+      // Safety: stop polling after 10 min
+      setTimeout(() => clearInterval(pollInterval), 600_000);
+      // Set callback to clean up when all agents report
+      tracker.setOnAllReported(() => {
+        clearInterval(pollInterval);
+      });
     }
   }
 

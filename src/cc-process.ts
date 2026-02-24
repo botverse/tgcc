@@ -408,7 +408,7 @@ export class CCProcess extends EventEmitter {
     }, this.options.userConfig.idleTimeoutMs);
   }
 
-  private clearIdleTimer(): void {
+  clearIdleTimer(): void {
     if (this.idleTimer) {
       clearTimeout(this.idleTimer);
       this.idleTimer = null;
