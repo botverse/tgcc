@@ -11,6 +11,7 @@ import type {
 export interface TelegramSender {
   sendMessage(chatId: number | string, text: string, parseMode?: string): Promise<number>;
   editMessage(chatId: number | string, messageId: number, text: string, parseMode?: string): Promise<void>;
+  sendPhoto?(chatId: number | string, imageBuffer: Buffer, caption?: string): Promise<number>;
 }
 
 export interface TurnUsage {
@@ -111,7 +112,8 @@ export class StreamAccumulator {
   private tgMessageId: number | null = null;
   private buffer = '';
   private thinkingBuffer = '';
-  private currentBlockType: 'text' | 'thinking' | 'tool_use' | null = null;
+  private imageBase64Buffer = '';
+  private currentBlockType: 'text' | 'thinking' | 'tool_use' | 'image' | null = null;
   private lastEditTime = 0;
   private editTimer: ReturnType<typeof setTimeout> | null = null;
   private thinkingIndicatorShown = false;
@@ -156,6 +158,8 @@ export class StreamAccumulator {
         if (this.currentBlockType === 'thinking' && this.thinkingBuffer) {
           // Thinking block complete — store for later rendering with text
           // Will be prepended as expandable blockquote when text starts or on finalize
+        } else if (this.currentBlockType === 'image' && this.imageBase64Buffer) {
+          await this.sendImage();
         }
         this.currentBlockType = null;
         break;
@@ -184,6 +188,9 @@ export class StreamAccumulator {
       const name = (event.content_block as { type: 'tool_use'; name: string }).name;
       this.toolIndicators.push(name);
       await this.showToolIndicator(name);
+    } else if (blockType === 'image') {
+      this.currentBlockType = 'image';
+      this.imageBase64Buffer = '';
     }
   }
 
@@ -198,6 +205,11 @@ export class StreamAccumulator {
       const delta = (event as any).delta;
       if (delta?.type === 'thinking_delta' && delta.thinking) {
         this.thinkingBuffer += delta.thinking;
+      }
+    } else if (this.currentBlockType === 'image' && 'delta' in event) {
+      const delta = (event as any).delta;
+      if (delta?.type === 'image_delta' && delta.data) {
+        this.imageBase64Buffer += delta.data;
       }
     }
     // Ignore input_json_delta content
@@ -233,6 +245,20 @@ export class StreamAccumulator {
       if (err instanceof Error && err.message.includes('message is not modified')) return;
       throw err;
     }
+  }
+
+  private async sendImage(): Promise<void> {
+    if (!this.sender.sendPhoto || !this.imageBase64Buffer) return;
+
+    try {
+      const imageBuffer = Buffer.from(this.imageBase64Buffer, 'base64');
+      const msgId = await this.sender.sendPhoto(this.chatId, imageBuffer);
+      this.messageIds.push(msgId);
+    } catch (err) {
+      // Fall back to text indicator on failure
+      this.buffer += '\n[Image could not be sent]';
+    }
+    this.imageBase64Buffer = '';
   }
 
   private async showToolIndicator(toolName: string): Promise<void> {
@@ -340,6 +366,7 @@ export class StreamAccumulator {
   softReset(): void {
     this.buffer = '';
     this.thinkingBuffer = '';
+    this.imageBase64Buffer = '';
     this.currentBlockType = null;
     this.lastEditTime = 0;
     this.thinkingIndicatorShown = false;

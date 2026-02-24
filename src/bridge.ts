@@ -581,6 +581,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
       const sender: TelegramSender = {
         sendMessage: (cid, text, parseMode) => agent.tgBot.sendText(cid, text, parseMode),
         editMessage: (cid, msgId, text, parseMode) => agent.tgBot.editText(cid, msgId, text, parseMode),
+        sendPhoto: (cid, buffer, caption) => agent.tgBot.sendPhotoBuffer(cid, buffer, caption),
       };
       acc = new StreamAccumulator({ chatId, sender });
       agent.accumulators.set(accKey, acc);

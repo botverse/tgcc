@@ -442,6 +442,13 @@ export class TelegramBot {
     });
   }
 
+  async sendPhotoBuffer(chatId: number | string, buffer: Buffer, caption?: string): Promise<number> {
+    const msg = await this.bot.api.sendPhoto(Number(chatId), new InputFile(buffer, 'image.png'), {
+      caption,
+    });
+    return msg.message_id;
+  }
+
   async sendVoice(chatId: number | string, filePath: string, caption?: string): Promise<void> {
     await this.bot.api.sendVoice(Number(chatId), new InputFile(filePath), {
       caption,
