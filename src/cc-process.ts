@@ -221,7 +221,12 @@ export class CCProcess extends EventEmitter {
         break;
 
       case 'control_response':
-        this.logger.debug({ response: event }, 'Received control_response');
+        this.logger.info('Received control_response — CC initialized');
+        if (this._state === 'spawning') {
+          this._state = 'active';
+          this.emit('stateChange', 'active');
+          this.flushQueue();
+        }
         break;
     }
 
