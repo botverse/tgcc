@@ -60,6 +60,33 @@ export function serializeMessage(msg: UserMessage): string {
   return JSON.stringify(msg);
 }
 
+// ── Control request/response (SDK initialize handshake) ──
+
+export interface ControlRequest {
+  type: 'control_request';
+  request_id: string;
+  request: {
+    subtype: 'initialize';
+  };
+}
+
+export interface ControlResponse {
+  type: 'control_response';
+  request_id: string;
+  response: {
+    subtype: 'success' | 'error';
+    [key: string]: unknown;
+  };
+}
+
+export function createInitializeRequest(): ControlRequest {
+  return {
+    type: 'control_request',
+    request_id: uuidv4(),
+    request: { subtype: 'initialize' },
+  };
+}
+
 // ── Output event types (CC stdout → parse) ──
 
 export interface InitEvent {
@@ -221,7 +248,8 @@ export type CCOutputEvent =
   | AssistantMessage
   | ToolResultEvent
   | ResultEvent
-  | StreamEvent;
+  | StreamEvent
+  | ControlResponse;
 
 // ── Parser ──
 
@@ -239,6 +267,7 @@ export function parseCCOutputLine(line: string): CCOutputEvent | null {
       case 'tool_result':
       case 'result':
       case 'stream_event':
+      case 'control_response':
         return parsed as CCOutputEvent;
       default:
         return null;

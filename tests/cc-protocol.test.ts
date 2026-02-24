@@ -10,10 +10,12 @@ import {
   isStreamTextDelta,
   isStreamThinkingDelta,
   getStreamBlockType,
+  createInitializeRequest,
   type AssistantMessage,
   type InitEvent,
   type ResultEvent,
   type StreamEvent,
+  type ControlResponse,
 } from '../src/cc-protocol.js';
 
 describe('cc-protocol input construction', () => {
@@ -215,5 +217,34 @@ describe('cc-protocol output parsing', () => {
 
   it('returns null for unknown event type', () => {
     expect(parseCCOutputLine('{"type":"unknown_type"}')).toBeNull();
+  });
+
+  it('parses control_response event', () => {
+    const line = JSON.stringify({
+      type: 'control_response',
+      request_id: 'req-123',
+      response: { subtype: 'success' },
+    });
+    const event = parseCCOutputLine(line) as ControlResponse;
+    expect(event).not.toBeNull();
+    expect(event.type).toBe('control_response');
+    expect(event.request_id).toBe('req-123');
+    expect(event.response.subtype).toBe('success');
+  });
+});
+
+describe('cc-protocol initialize handshake', () => {
+  it('creates an initialize control_request', () => {
+    const req = createInitializeRequest();
+    expect(req.type).toBe('control_request');
+    expect(req.request.subtype).toBe('initialize');
+    expect(typeof req.request_id).toBe('string');
+    expect(req.request_id.length).toBeGreaterThan(0);
+  });
+
+  it('generates unique request_ids', () => {
+    const req1 = createInitializeRequest();
+    const req2 = createInitializeRequest();
+    expect(req1.request_id).not.toBe(req2.request_id);
   });
 });

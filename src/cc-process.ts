@@ -9,6 +9,7 @@ import {
   type UserMessage,
   parseCCOutputLine,
   serializeMessage,
+  createInitializeRequest,
 } from './cc-protocol.js';
 import type { ResolvedUserConfig } from './config.js';
 
@@ -131,6 +132,20 @@ export class CCProcess extends EventEmitter {
       this.cleanup();
       this.emit('exit', code, signal);
     });
+
+    // Send SDK initialize handshake (required by CC v2.1.50+ stream-json mode)
+    this.sendInitializeRequest();
+  }
+
+  private sendInitializeRequest(): void {
+    if (!this.process?.stdin?.writable) {
+      this.logger.error('Cannot send initialize request — stdin not writable');
+      return;
+    }
+    const req = createInitializeRequest();
+    const line = JSON.stringify(req) + '\n';
+    this.process.stdin.write(line);
+    this.logger.info({ request_id: req.request_id }, 'Sent initialize control_request');
   }
 
   private buildArgs(): string[] {
@@ -203,6 +218,10 @@ export class CCProcess extends EventEmitter {
 
       case 'stream_event':
         this.emit('stream_event', event.event);
+        break;
+
+      case 'control_response':
+        this.logger.debug({ response: event }, 'Received control_response');
         break;
     }
 
