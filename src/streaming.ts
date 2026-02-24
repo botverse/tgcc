@@ -631,6 +631,7 @@ export class SubAgentTracker {
   private mailboxWatching = false;
   private lastMailboxCount = 0;
   private onAllReported: AllAgentsReportedCallback | null = null;
+  hasPendingFollowUp = false;
 
   constructor(options: SubAgentTrackerOptions) {
     this.chatId = options.chatId;
@@ -697,6 +698,20 @@ export class SubAgentTracker {
   }
 
   /** Handle a tool_result event — marks the sub-agent as completed with collapsible result */
+  /** Mark an agent as completed externally (e.g. from bridge follow-up) */
+  markCompleted(toolUseId: string, _reason: string): void {
+    const info = this.agents.get(toolUseId);
+    if (!info || info.status === 'completed') return;
+    info.status = 'completed';
+    if (info.elapsedTimer) { clearInterval(info.elapsedTimer); info.elapsedTimer = null; }
+    // Check if all agents are done
+    const allDone = ![...this.agents.values()].some(a => a.status === 'dispatched');
+    if (allDone && this.onAllReported) {
+      this.onAllReported();
+      this.stopMailboxWatch();
+    }
+  }
+
   async handleToolResult(toolUseId: string, result: string): Promise<void> {
     const info = this.agents.get(toolUseId);
     if (!info || !info.tgMessageId) return;

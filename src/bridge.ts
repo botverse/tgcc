@@ -705,11 +705,30 @@ export class Bridge extends EventEmitter implements CtlHandler {
     // Ensure mailbox watch is started if we have a team name and dispatched agents.
     const tracker = agent.subAgentTrackers.get(accKey);
     if (tracker?.hasDispatchedAgents && tracker.currentTeamName) {
-      this.logger.info({ agentId }, 'Turn ended with background sub-agents still running — mailbox watcher active');
+      this.logger.info({ agentId }, 'Turn ended with background sub-agents still running');
       // Clear idle timer — don't kill CC while background agents are working
       const ccProcess = agent.processes.get(userId);
       if (ccProcess) ccProcess.clearIdleTimer();
+      // Start mailbox watcher (works for general-purpose agents that have SendMessage)
       tracker.startMailboxWatch();
+      // Fallback: send ONE follow-up after 60s if mailbox hasn't resolved all agents
+      // This handles bash-type agents that can't write to mailbox
+      if (!tracker.hasPendingFollowUp) {
+        tracker.hasPendingFollowUp = true;
+        setTimeout(() => {
+          if (!tracker.hasDispatchedAgents) return; // already resolved via mailbox
+          const proc = agent.processes.get(userId);
+          if (!proc) return;
+          this.logger.info({ agentId }, 'Mailbox timeout — sending single follow-up for remaining agents');
+          // Mark all remaining dispatched agents as completed (CC already has the results)
+          for (const info of tracker.activeAgents) {
+            if (info.status === 'dispatched') {
+              tracker.markCompleted(info.toolUseId, '(results delivered in CC response)');
+            }
+          }
+          proc.sendMessage(createTextMessage('The background agents should be done by now. Please report their results.'));
+        }, 60_000);
+      }
     }
   }
 
