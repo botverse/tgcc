@@ -21,7 +21,7 @@ import {
   type ResultEvent,
   type StreamInnerEvent,
 } from './cc-protocol.js';
-import { StreamAccumulator, SubAgentTracker, splitText, escapeHtml, type TelegramSender, type SubAgentSender } from './streaming.js';
+import { StreamAccumulator, SubAgentTracker, splitText, escapeHtml, type TelegramSender, type SubAgentSender, type MailboxMessage } from './streaming.js';
 import { TelegramBot, type TelegramMessage, type SlashCommand, type CallbackQuery } from './telegram.js';
 import { InlineKeyboard } from 'grammy';
 import { McpBridgeServer, type McpToolRequest, type McpToolResponse } from './mcp-bridge.js';
@@ -487,31 +487,39 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
       const resultText = typeof event.content === 'string' ? event.content : JSON.stringify(event.content);
 
+      // Try to extract team name from sub-agent spawn confirmation
+      if (!tracker.currentTeamName) {
+        const teamMatch = resultText.match(/agent_id:\s*\S+@(\S+)/);
+        if (teamMatch) {
+          const teamName = teamMatch[1];
+          this.logger.info({ agentId, teamName }, 'Extracted team name from tool_result');
+          tracker.setTeamName(teamName);
+
+          // Wire the "all agents reported" callback to send follow-up to CC
+          tracker.setOnAllReported(() => {
+            const ccProc = agent.processes.get(userId);
+            if (ccProc && ccProc.state === 'active') {
+              ccProc.sendMessage(createTextMessage(
+                'All background agents have reported back. Please read their results and provide a synthesis.',
+              ));
+            }
+          });
+
+          // Don't start watching here — wait until after handleToolResult
+          // sets agent names (needed for mailbox message matching)
+          console.log(`[BRIDGE] Team name set: ${teamName}, will start watch after handleToolResult`);
+        }
+      }
+
+      // Handle tool result FIRST (sets agentName for mailbox matching)
       if (event.tool_use_id) {
         tracker.handleToolResult(event.tool_use_id, resultText);
       }
 
-      // Wire "all agents reported" callback to prompt CC for synthesis
-      if (tracker.hasDispatchedAgents && !tracker.activeAgents.every(a => a.status !== 'dispatched')) {
-        tracker.setOnAllReported(() => {
-          const ccProc = agent.processes.get(userId);
-          if (ccProc && ccProc.state === 'active') {
-            ccProc.sendMessage(createTextMessage(
-              'All background agents have reported back. Please read their results and provide a synthesis.',
-            ));
-          }
-        });
+      // Start mailbox watch AFTER handleToolResult has set agent names
+      if (tracker.currentTeamName && tracker.hasDispatchedAgents && !tracker.isMailboxWatching) {
+        tracker.startMailboxWatch();
       }
-    });
-
-    // Handle background agent completion notifications from CC's injected XML
-    proc.on('background_notification', (xmlText: string) => {
-      const accKey = `${userId}:${chatId}`;
-      const tracker = agent.subAgentTrackers.get(accKey);
-      if (!tracker) return;
-
-      this.logger.debug({ agentId }, 'Received background agent notification');
-      tracker.handleBackgroundNotification(xmlText);
     });
 
     proc.on('assistant', (event: AssistantMessage) => {
@@ -591,10 +599,10 @@ export class Bridge extends EventEmitter implements CtlHandler {
         acc.finalize();
         agent.accumulators.delete(accKey);
       }
-      // Clean up sub-agent tracker
+      // Clean up sub-agent tracker (stops mailbox watch)
       const exitTracker = agent.subAgentTrackers.get(accKey);
       if (exitTracker) {
-        exitTracker.reset();
+        exitTracker.stopMailboxWatch();
       }
       agent.subAgentTrackers.delete(accKey);
     });
@@ -637,7 +645,6 @@ export class Bridge extends EventEmitter implements CtlHandler {
       tracker = new SubAgentTracker({
         chatId,
         sender: subAgentSender,
-        logger: this.logger,
       });
       agent.subAgentTrackers.set(accKey, tracker);
     }
@@ -694,38 +701,15 @@ export class Bridge extends EventEmitter implements CtlHandler {
       agent.tgBot.sendText(chatId, `<i>Error: ${escapeHtml(String(event.result))}</i>`, 'HTML');
     }
 
-    // If background sub-agents are still running, send a follow-up message
-    // to CC stdin after a delay. This triggers CC to dequeue its message queue,
-    // which contains <background_agent_notification> XML for completed agents.
+    // If background sub-agents are still running, mailbox watcher handles them.
+    // Ensure mailbox watch is started if we have a team name and dispatched agents.
     const tracker = agent.subAgentTrackers.get(accKey);
-    if (tracker?.hasDispatchedAgents && !tracker.isPollingForResults) {
-      tracker.isPollingForResults = true;
-      this.logger.info({ agentId }, 'Turn ended with background sub-agents still running — scheduling follow-up');
-      // Get the CC process for this user
+    if (tracker?.hasDispatchedAgents && tracker.currentTeamName) {
+      this.logger.info({ agentId }, 'Turn ended with background sub-agents still running — mailbox watcher active');
+      // Clear idle timer — don't kill CC while background agents are working
       const ccProcess = agent.processes.get(userId);
-      if (ccProcess) {
-        // Clear idle timer — don't kill CC while agents are working
-        ccProcess.clearIdleTimer();
-      }
-      // Poll every 30s until all agents report
-      const pollInterval = setInterval(() => {
-        if (!tracker.hasDispatchedAgents) {
-          clearInterval(pollInterval);
-          tracker.isPollingForResults = false;
-          return;
-        }
-        const proc = agent.processes.get(userId);
-        if (!proc) { clearInterval(pollInterval); tracker.isPollingForResults = false; return; }
-        this.logger.info({ agentId }, 'Sending follow-up to check on background agents');
-        proc.sendMessage(createTextMessage('Check on the background agents. Are they done? Report their results.'));
-      }, 30_000);
-      // Safety: stop polling after 10 min
-      setTimeout(() => { clearInterval(pollInterval); tracker.isPollingForResults = false; }, 600_000);
-      // Set callback to clean up when all agents report
-      tracker.setOnAllReported(() => {
-        clearInterval(pollInterval);
-        tracker.isPollingForResults = false;
-      });
+      if (ccProcess) ccProcess.clearIdleTimer();
+      tracker.startMailboxWatch();
     }
   }
 
