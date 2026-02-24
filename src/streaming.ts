@@ -595,6 +595,7 @@ export interface SubAgentInfo {
   inputPreview: string;
   dispatchedAt: number | null;         // timestamp when dispatched (for elapsed timer)
   elapsedTimer: ReturnType<typeof setInterval> | null;  // periodic edit timer
+  editVersion: number;  // incremented on completion — timer checks this to avoid overwriting
 }
 
 export interface SubAgentSender {
@@ -787,6 +788,7 @@ export class SubAgentTracker {
       inputPreview: '',
       dispatchedAt: null,
       elapsedTimer: null,
+      editVersion: 0,
     };
 
     this.agents.set(block.id, info);
@@ -900,17 +902,20 @@ export class SubAgentTracker {
     const displayLabel = info.label || info.toolName;
 
     info.elapsedTimer = setInterval(() => {
-      if (info.status !== 'dispatched' || !info.tgMessageId || !info.dispatchedAt) {
+      // Strict check: don't touch completed agents
+      if (info.status !== 'dispatched') {
         this.clearElapsedTimer(info);
         return;
       }
+      if (!info.tgMessageId || !info.dispatchedAt) return;
 
       const elapsedSec = Math.round((Date.now() - info.dispatchedAt) / 1000);
-      const text = `🤖 ${escapeHtml(displayLabel)} — Working… (${elapsedSec}s)`;
+      const versionAtQueue = info.editVersion;
 
       this.sendQueue = this.sendQueue.then(async () => {
-        // Re-check status inside the queue — mailbox completion may have run first
-        if (info.status !== 'dispatched') return;
+        // If version changed, a completion edit was queued — don't overwrite it
+        if (info.status !== 'dispatched' || info.editVersion !== versionAtQueue) return;
+        const text = `🤖 ${escapeHtml(displayLabel)} — Working… (${elapsedSec}s)`;
         try {
           await this.sender.editMessage(
             this.chatId,
@@ -1021,9 +1026,11 @@ export class SubAgentTracker {
       const matched = this.findAgentByFrom(msg.from);
       if (!matched) continue;
 
-      // Clear elapsed timer
-      this.clearElapsedTimer(matched);
+      // CRITICAL ORDER: set status + bump version FIRST, then clear timer
+      // In-flight timer callbacks check editVersion and bail if it changed
       matched.status = 'completed';
+      matched.editVersion++;
+      this.clearElapsedTimer(matched);
 
       if (!matched.tgMessageId) continue;
 
