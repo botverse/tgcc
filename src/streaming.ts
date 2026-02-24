@@ -948,8 +948,12 @@ export class SubAgentTracker {
       mkdirSync(dir, { recursive: true });
     }
 
-    // Read current state to avoid processing pre-existing messages
-    this.lastMailboxCount = this.readMailboxMessages().length;
+    // Start from 0 — process all messages including pre-existing ones
+    // Background agents may finish before the watcher starts
+    this.lastMailboxCount = 0;
+
+    // Process immediately in case messages arrived before watching
+    this.processMailbox();
 
     watchFile(this.mailboxPath, { interval: 2000 }, () => {
       this.processMailbox();
