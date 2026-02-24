@@ -7,7 +7,7 @@ import type {
   AgentConfig,
   ConfigDiff,
 } from './config.js';
-import { resolveUserConfig } from './config.js';
+import { resolveUserConfig, resolveRepoPath } from './config.js';
 import { CCProcess, generateMcpConfig } from './cc-process.js';
 import {
   createTextMessage,
@@ -571,10 +571,21 @@ export class Bridge extends EventEmitter {
         if (!cmd.args) {
           const current = this.sessionStore.getUser(agentId, cmd.userId).repo
             || resolveUserConfig(agent.config, cmd.userId).repo;
-          await agent.tgBot.sendText(cmd.chatId, `Current repo: ${current}\n\nUsage: /repo <path>`);
+          // Show available repos from registry
+          const repoEntries = Object.entries(this.config.repos);
+          if (repoEntries.length > 0) {
+            const lines = repoEntries.map(([name, path]) => `• \`${name}\` → ${path}`);
+            await agent.tgBot.sendText(cmd.chatId,
+              `Current repo: ${current}\n\n*Available repos:*\n${lines.join('\n')}\n\nUsage: /repo <name or path>`,
+              'Markdown',
+            );
+          } else {
+            await agent.tgBot.sendText(cmd.chatId, `Current repo: ${current}\n\nUsage: /repo <path>`);
+          }
           break;
         }
-        const repoPath = cmd.args.trim();
+        // Resolve repo name from registry, or use as direct path
+        const repoPath = resolveRepoPath(this.config.repos, cmd.args.trim());
         if (!existsSync(repoPath)) {
           await agent.tgBot.sendText(cmd.chatId, `Path not found: ${repoPath}`);
           break;

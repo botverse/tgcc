@@ -37,6 +37,7 @@ export interface AgentConfig {
 
 export interface TgccConfig {
   global: GlobalConfig;
+  repos: Record<string, string>;       // name → absolute path
   agents: Record<string, AgentConfig>;
 }
 
@@ -78,6 +79,17 @@ export function validateConfig(raw: unknown): TgccConfig {
     stateFile: typeof globalRaw.stateFile === 'string' ? globalRaw.stateFile : DEFAULT_GLOBAL.stateFile,
   };
 
+  // Repos registry
+  const repos: Record<string, string> = {};
+  const reposRaw = obj.repos;
+  if (reposRaw && typeof reposRaw === 'object') {
+    for (const [name, path] of Object.entries(reposRaw as Record<string, unknown>)) {
+      if (typeof path === 'string') {
+        repos[name] = path;
+      }
+    }
+  }
+
   // Agents
   const agentsRaw = obj.agents;
   if (!agentsRaw || typeof agentsRaw !== 'object') {
@@ -86,6 +98,7 @@ export function validateConfig(raw: unknown): TgccConfig {
 
   const agents: Record<string, AgentConfig> = {};
   const seenTokens = new Set<string>();
+  const repoOwners = new Map<string, string>(); // repo key → agentId (exclusivity)
 
   for (const [agentId, agentRaw] of Object.entries(agentsRaw as Record<string, unknown>)) {
     if (!agentRaw || typeof agentRaw !== 'object') {
@@ -107,9 +120,29 @@ export function validateConfig(raw: unknown): TgccConfig {
     }
 
     const defaultsRaw = (a.defaults ?? {}) as Record<string, unknown>;
+
+    // Resolve defaults.repo: if it's a key in the repos map, resolve to the path
+    let resolvedRepo = DEFAULT_AGENT_DEFAULTS.repo;
+    if (typeof defaultsRaw.repo === 'string') {
+      const repoKey = defaultsRaw.repo;
+      if (repos[repoKey]) {
+        // It's a reference to the repos registry
+        resolvedRepo = repos[repoKey];
+
+        // Validate exclusivity: one agent per repo key
+        if (repoOwners.has(repoKey)) {
+          throw new Error(`Repo "${repoKey}" is already assigned to agent "${repoOwners.get(repoKey)}" — each repo can only be assigned to one agent`);
+        }
+        repoOwners.set(repoKey, agentId);
+      } else {
+        // Treat as a direct path (backwards compat)
+        resolvedRepo = repoKey;
+      }
+    }
+
     const defaults: AgentDefaults = {
       model: typeof defaultsRaw.model === 'string' ? defaultsRaw.model : DEFAULT_AGENT_DEFAULTS.model,
-      repo: typeof defaultsRaw.repo === 'string' ? defaultsRaw.repo : DEFAULT_AGENT_DEFAULTS.repo,
+      repo: resolvedRepo,
       maxTurns: typeof defaultsRaw.maxTurns === 'number' ? defaultsRaw.maxTurns : DEFAULT_AGENT_DEFAULTS.maxTurns,
       idleTimeoutMs: typeof defaultsRaw.idleTimeoutMs === 'number' ? defaultsRaw.idleTimeoutMs : DEFAULT_AGENT_DEFAULTS.idleTimeoutMs,
       hangTimeoutMs: typeof defaultsRaw.hangTimeoutMs === 'number' ? defaultsRaw.hangTimeoutMs : DEFAULT_AGENT_DEFAULTS.hangTimeoutMs,
@@ -143,7 +176,7 @@ export function validateConfig(raw: unknown): TgccConfig {
     throw new Error('Config must have at least one agent');
   }
 
-  return { global, agents };
+  return { global, repos, agents };
 }
 
 // ── Resolved per-user config ──
@@ -167,6 +200,28 @@ export function resolveUserConfig(agent: AgentConfig, userId: string): ResolvedU
     hangTimeoutMs: agent.defaults.hangTimeoutMs,
     permissionMode: agent.defaults.permissionMode,
   };
+}
+
+// ── Repo registry helpers ──
+
+/** Resolve a repo name or path: if it matches a key in the repos map, return the path; otherwise return as-is. */
+export function resolveRepoPath(repos: Record<string, string>, nameOrPath: string): string {
+  return repos[nameOrPath] ?? nameOrPath;
+}
+
+/** Find which agent owns a given repo path (by matching defaults.repo). Returns agentId or null. */
+export function agentForRepo(config: TgccConfig, repoPath: string): string | null {
+  for (const [agentId, agent] of Object.entries(config.agents)) {
+    if (agent.defaults.repo === repoPath) return agentId;
+  }
+  // Also check if repoPath is inside an agent's repo
+  for (const [agentId, agent] of Object.entries(config.agents)) {
+    const agentRepo = agent.defaults.repo;
+    if (agentRepo !== DEFAULT_AGENT_DEFAULTS.repo && repoPath.startsWith(agentRepo + '/')) {
+      return agentId;
+    }
+  }
+  return null;
 }
 
 // ── Config loading and watching ──
@@ -203,6 +258,8 @@ export interface ConfigDiff {
 }
 
 export function diffConfigs(oldConfig: TgccConfig, newConfig: TgccConfig): ConfigDiff {
+  // Note: repos changes are detected implicitly via agent config changes
+  // since repo keys are resolved to paths during validation
   const oldIds = new Set(Object.keys(oldConfig.agents));
   const newIds = new Set(Object.keys(newConfig.agents));
 
