@@ -57,7 +57,7 @@ describe('SubAgentTracker', () => {
     } as StreamInnerEvent);
 
     expect(sender.replies).toHaveLength(1);
-    expect(sender.replies[0].text).toContain('dispatch_agent');
+    expect(sender.replies[0].text).toContain('<code>dispatch_agent</code>');
     expect(sender.replies[0].text).toContain('🔄');
     expect(sender.replies[0].replyTo).toBe(42);
   });
@@ -99,7 +99,7 @@ describe('SubAgentTracker', () => {
     // Should have edited the reply with completion status
     expect(sender.edits).toHaveLength(1);
     expect(sender.edits[0].text).toContain('✅');
-    expect(sender.edits[0].text).toContain('dispatch_agent');
+    expect(sender.edits[0].text).toContain('<code>dispatch_agent</code>');
     expect(sender.edits[0].messageId).toBe(100); // the reply message ID
   });
 
@@ -117,8 +117,8 @@ describe('SubAgentTracker', () => {
     } as StreamInnerEvent);
 
     expect(sender.replies).toHaveLength(2);
-    expect(sender.replies[0].text).toContain('dispatch_agent');
-    expect(sender.replies[1].text).toContain('Task');
+    expect(sender.replies[0].text).toContain('<code>dispatch_agent</code>');
+    expect(sender.replies[1].text).toContain('<code>Task</code>');
 
     expect(tracker.activeAgents).toHaveLength(2);
   });
@@ -155,7 +155,7 @@ describe('SubAgentTracker', () => {
     // The edit should contain the input preview
     const editsForAgent = sender.edits.filter(e => e.messageId === 100);
     expect(editsForAgent.length).toBeGreaterThanOrEqual(1);
-    expect(editsForAgent[0].text).toContain('dispatch_agent');
+    expect(editsForAgent[0].text).toContain('<code>dispatch_agent</code>');
   });
 
   it('ignores text block events', async () => {
@@ -193,5 +193,6 @@ describe('SubAgentTracker', () => {
     const lastEdit = sender.edits[sender.edits.length - 1];
     expect(lastEdit.text).toContain('✅');
     expect(lastEdit.text).toContain('Fix the login bug');
+    expect(lastEdit.text).toContain('<i>');
   });
 });

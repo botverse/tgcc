@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { StreamAccumulator, makeMarkdownSafe, splitText, type TelegramSender } from '../src/streaming.js';
+import { StreamAccumulator, makeMarkdownSafe, makeHtmlSafe, escapeHtml, markdownToHtml, splitText, type TelegramSender } from '../src/streaming.js';
 import type { StreamInnerEvent } from '../src/cc-protocol.js';
 
 function createMockSender() {
@@ -18,26 +18,60 @@ function createMockSender() {
   };
 }
 
-describe('makeMarkdownSafe', () => {
-  it('closes unclosed triple backticks', () => {
-    const result = makeMarkdownSafe('```python\nprint("hi")');
-    expect(result).toContain('```');
-    const count = (result.match(/```/g) ?? []).length;
-    expect(count % 2).toBe(0);
-  });
-
-  it('leaves balanced backticks alone', () => {
-    const input = '```js\nconsole.log("hi")\n```';
-    expect(makeMarkdownSafe(input)).toBe(input);
-  });
-
-  it('closes unclosed single backtick', () => {
-    const result = makeMarkdownSafe('some `code here');
-    expect((result.match(/`/g) ?? []).length % 2).toBe(0);
+describe('escapeHtml', () => {
+  it('escapes angle brackets and ampersand', () => {
+    expect(escapeHtml('<b>test</b> & "quotes"')).toBe('&lt;b&gt;test&lt;/b&gt; &amp; "quotes"');
   });
 
   it('handles empty string', () => {
-    expect(makeMarkdownSafe('')).toBe('');
+    expect(escapeHtml('')).toBe('');
+  });
+});
+
+describe('markdownToHtml', () => {
+  it('converts code blocks with language', () => {
+    const result = markdownToHtml('```python\nprint("hi")\n```');
+    expect(result).toContain('<pre><code class="language-python">');
+    expect(result).toContain('print("hi")');
+  });
+
+  it('converts inline code', () => {
+    const result = markdownToHtml('use `npm install` here');
+    expect(result).toContain('<code>npm install</code>');
+  });
+
+  it('converts bold text', () => {
+    expect(markdownToHtml('**hello**')).toContain('<b>hello</b>');
+  });
+
+  it('converts italic text', () => {
+    expect(markdownToHtml('*hello*')).toContain('<i>hello</i>');
+  });
+
+  it('converts strikethrough text', () => {
+    expect(markdownToHtml('~~deleted~~')).toContain('<s>deleted</s>');
+  });
+
+  it('converts links', () => {
+    const result = markdownToHtml('[Google](https://google.com)');
+    expect(result).toContain('<a href="https://google.com">Google</a>');
+  });
+
+  it('escapes HTML in non-code text', () => {
+    const result = markdownToHtml('use <div> tag');
+    expect(result).toContain('&lt;div&gt;');
+  });
+
+  it('handles empty string', () => {
+    expect(markdownToHtml('')).toBe('');
+  });
+});
+
+describe('makeMarkdownSafe (deprecated, now HTML)', () => {
+  it('returns HTML-converted text', () => {
+    const result = makeMarkdownSafe('**bold** and `code`');
+    expect(result).toContain('<b>bold</b>');
+    expect(result).toContain('<code>code</code>');
   });
 });
 
@@ -83,7 +117,8 @@ describe('StreamAccumulator', () => {
     } as StreamInnerEvent);
 
     expect(sender.sentMessages).toHaveLength(1);
-    expect(sender.sentMessages[0].text).toContain('Thinking');
+    expect(sender.sentMessages[0].text).toContain('💭 Thinking...');
+    expect(sender.sentMessages[0].text).toContain('<i>');
   });
 
   it('accumulates text deltas and sends first message', async () => {

@@ -320,14 +320,14 @@ export function summarizeJsonlDelta(jsonlPath: string, fromByteOffset: number, m
 
 function formatStaleSummary(turns: JsonlTurn[], maxChars: number): string {
   const turnCount = turns.filter(t => t.role === 'assistant').length;
-  const header = `ℹ️ *Session was updated from another client* (${turnCount} CC turn${turnCount !== 1 ? 's' : ''} since your last message here):\n\n`;
+  const header = `ℹ️ <b>Session was updated from another client</b> (${turnCount} CC turn${turnCount !== 1 ? 's' : ''} since your last message here):\n\n`;
 
   const lines: string[] = [];
   // Build from newest to oldest so we can truncate old ones
   for (const turn of turns) {
     if (turn.role === 'user') {
       const preview = truncateText(turn.text ?? '', 80);
-      lines.push(`• *You:* "${preview}"`);
+      lines.push(`• <b>You:</b> "${preview}"`);
     } else {
       const parts: string[] = [];
       if (turn.tools && turn.tools.length > 0) {
@@ -337,7 +337,7 @@ function formatStaleSummary(turns: JsonlTurn[], maxChars: number): string {
         const preview = truncateText(turn.text, 120);
         parts.push(`"${preview}"`);
       }
-      lines.push(`• *CC:* ${parts.join(' — ') || '(no text)'}`);
+      lines.push(`• <b>CC:</b> ${parts.join(' — ') || '(no text)'}`);
     }
   }
 
@@ -486,12 +486,12 @@ export function formatCatchupMessage(repo: string, missed: MissedSession[]): str
   const slug = computeProjectSlug(repo);
   const sessionsDir = join(homedir(), '.claude', 'projects', slug, 'sessions');
 
-  const lines = [`*External CC activity* (${missed.length} session(s)):\n`];
+  const lines = [`<b>External CC activity</b> (${missed.length} session(s)):\n`];
 
   for (const session of missed.slice(0, 5)) {
     const age = formatAge(session.mtime);
     const summary = parseSessionSummary(join(sessionsDir, session.id));
-    lines.push(`\`${session.id.slice(0, 8)}\` (${age})`);
+    lines.push(`<code>${session.id.slice(0, 8)}</code> (${age})`);
     lines.push(`  ${summary}\n`);
   }
 

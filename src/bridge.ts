@@ -20,7 +20,7 @@ import {
   type ResultEvent,
   type StreamInnerEvent,
 } from './cc-protocol.js';
-import { StreamAccumulator, SubAgentTracker, splitText, type TelegramSender, type SubAgentSender } from './streaming.js';
+import { StreamAccumulator, SubAgentTracker, splitText, escapeHtml, type TelegramSender, type SubAgentSender } from './streaming.js';
 import { TelegramBot, type TelegramMessage, type SlashCommand, type CallbackQuery } from './telegram.js';
 import { InlineKeyboard } from 'grammy';
 import { McpBridgeServer, type McpToolRequest, type McpToolResponse } from './mcp-bridge.js';
@@ -110,29 +110,29 @@ class MessageBatcher {
 
 // ── Help text ──
 
-const HELP_TEXT = `*TGCC Commands*
+const HELP_TEXT = `<b>TGCC Commands</b>
 
-*Session*
+<b>Session</b>
 /new — Start a fresh session
 /sessions — List recent sessions
-/resume <id> — Resume a session by ID
+/resume &lt;id&gt; — Resume a session by ID
 /session — Current session info
 
-*Info*
+<b>Info</b>
 /status — Process state, model, uptime
 /cost — Show session cost
 /catchup — Summarize external CC activity
 /ping — Liveness check
 
-*Control*
+<b>Control</b>
 /cancel — Abort current CC turn
-/model <name> — Switch model
+/model &lt;name&gt; — Switch model
 /permissions — Set permission mode
 /repo — List repos (buttons)
 /repo help — Repo management commands
-/repo add <name> <path> — Register a repo
-/repo remove <name> — Unregister a repo
-/repo assign <name> — Set as agent default
+/repo add &lt;name&gt; &lt;path&gt; — Register a repo
+/repo remove &lt;name&gt; — Unregister a repo
+/repo assign &lt;name&gt; — Set as agent default
 /repo clear — Clear agent default
 
 /help — This message`;
@@ -341,7 +341,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
         proc.destroy();
         agent.processes.delete(userId);
         proc = undefined;
-        agent.tgBot.sendText(chatId, staleInfo.summary, 'Markdown');
+        agent.tgBot.sendText(chatId, staleInfo.summary, 'HTML');
       }
     }
 
@@ -386,7 +386,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
       // Session is stale — build a summary of what happened
       const summary = summarizeJsonlDelta(jsonlPath, tracking.size)
-        ?? '_ℹ️ Session was updated from another client. Reconnecting..._';
+        ?? '<i>ℹ️ Session was updated from another client. Reconnecting...</i>';
 
       return { summary };
     } catch {
@@ -480,7 +480,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
     });
 
     proc.on('hang', () => {
-      agent.tgBot.sendText(chatId, '_CC session paused. Send a message to continue._', 'Markdown');
+      agent.tgBot.sendText(chatId, '<i>CC session paused. Send a message to continue.</i>', 'HTML');
     });
 
     proc.on('takeover', () => {
@@ -489,8 +489,8 @@ export class Bridge extends EventEmitter implements CtlHandler {
       this.sessionStore.clearSession(agentId, userId);
       agent.tgBot.sendText(
         chatId,
-        '_Session was picked up by another client. Next message will start a fresh session._',
-        'Markdown',
+        '<i>Session was picked up by another client. Next message will start a fresh session.</i>',
+        'HTML',
       );
     });
 
@@ -507,7 +507,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
     });
 
     proc.on('error', (err: Error) => {
-      agent.tgBot.sendText(chatId, `_CC error: ${err.message}_`, 'Markdown');
+      agent.tgBot.sendText(chatId, `<i>CC error: ${escapeHtml(String(err.message))}</i>`, 'HTML');
     });
 
     return proc;
@@ -578,7 +578,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
     // Handle errors
     if (event.is_error && event.result) {
-      agent.tgBot.sendText(chatId, `_Error: ${event.result}_`, 'Markdown');
+      agent.tgBot.sendText(chatId, `<i>Error: ${escapeHtml(String(event.result))}</i>`, 'HTML');
     }
   }
 
@@ -605,7 +605,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
       }
 
       case 'help':
-        await agent.tgBot.sendText(cmd.chatId, HELP_TEXT, 'Markdown');
+        await agent.tgBot.sendText(cmd.chatId, HELP_TEXT, 'HTML');
         break;
 
       case 'ping': {
@@ -623,14 +623,14 @@ export class Bridge extends EventEmitter implements CtlHandler {
           : 'N/A';
 
         const status = [
-          `*Agent:* ${agentId}`,
-          `*Process:* ${(proc?.state ?? 'idle').toUpperCase()} (uptime: ${uptime})`,
-          `*Session:* \`${proc?.sessionId?.slice(0, 8) ?? 'none'}\``,
-          `*Model:* ${userState.model || resolveUserConfig(agent.config, cmd.userId).model}`,
-          `*Repo:* ${userState.repo || resolveUserConfig(agent.config, cmd.userId).repo}`,
-          `*Cost:* $${(proc?.totalCostUsd ?? 0).toFixed(4)}`,
+          `<b>Agent:</b> ${escapeHtml(agentId)}`,
+          `<b>Process:</b> ${(proc?.state ?? 'idle').toUpperCase()} (uptime: ${uptime})`,
+          `<b>Session:</b> <code>${escapeHtml(proc?.sessionId?.slice(0, 8) ?? 'none')}</code>`,
+          `<b>Model:</b> ${escapeHtml(userState.model || resolveUserConfig(agent.config, cmd.userId).model)}`,
+          `<b>Repo:</b> ${escapeHtml(userState.repo || resolveUserConfig(agent.config, cmd.userId).repo)}`,
+          `<b>Cost:</b> $${(proc?.totalCostUsd ?? 0).toFixed(4)}`,
         ].join('\n');
-        await agent.tgBot.sendText(cmd.chatId, status, 'Markdown');
+        await agent.tgBot.sendText(cmd.chatId, status, 'HTML');
         break;
       }
 
@@ -663,7 +663,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
         const keyboard = new InlineKeyboard();
 
         sessions.forEach((s, i) => {
-          const title = s.title ? `"${s.title}"` : `\`${s.id.slice(0, 8)}\``;
+          const title = s.title ? `"${escapeHtml(s.title)}"` : `<code>${escapeHtml(s.id.slice(0, 8))}</code>`;
           const age = formatAge(new Date(s.lastActivity));
           const isCurrent = s.id === currentSessionId;
           lines.push(`${i + 1}. ${title} — ${s.messageCount} msgs, $${s.totalCostUsd.toFixed(2)} (${age})${isCurrent ? ' ✓' : ''}`);
@@ -676,9 +676,9 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
         await agent.tgBot.sendTextWithKeyboard(
           cmd.chatId,
-          `📋 *Recent sessions:*\n\n${lines.join('\n')}`,
+          `📋 <b>Recent sessions:</b>\n\n${lines.join('\n')}`,
           keyboard,
-          'Markdown',
+          'HTML',
         );
         break;
       }
@@ -694,7 +694,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
           agent.processes.delete(cmd.userId);
         }
         this.sessionStore.setCurrentSession(agentId, cmd.userId, cmd.args.trim());
-        await agent.tgBot.sendText(cmd.chatId, `Will resume session \`${cmd.args.trim().slice(0, 8)}\` on next message.`, 'Markdown');
+        await agent.tgBot.sendText(cmd.chatId, `Will resume session <code>${escapeHtml(cmd.args.trim().slice(0, 8))}</code> on next message.`, 'HTML');
         break;
       }
 
@@ -706,8 +706,8 @@ export class Bridge extends EventEmitter implements CtlHandler {
           break;
         }
         await agent.tgBot.sendText(cmd.chatId,
-          `*Session:* \`${session.id.slice(0, 8)}\`\n*Messages:* ${session.messageCount}\n*Cost:* $${session.totalCostUsd.toFixed(4)}\n*Started:* ${session.startedAt}`,
-          'Markdown'
+          `<b>Session:</b> <code>${escapeHtml(session.id.slice(0, 8))}</code>\n<b>Messages:</b> ${session.messageCount}\n<b>Cost:</b> $${session.totalCostUsd.toFixed(4)}\n<b>Started:</b> ${session.startedAt}`,
+          'HTML'
         );
         break;
       }
@@ -720,7 +720,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
           break;
         }
         this.sessionStore.setModel(agentId, cmd.userId, cmd.args.trim());
-        await agent.tgBot.sendText(cmd.chatId, `Model set to \`${cmd.args.trim()}\`. Takes effect on next spawn.`, 'Markdown');
+        await agent.tgBot.sendText(cmd.chatId, `Model set to <code>${escapeHtml(cmd.args.trim())}</code>. Takes effect on next spawn.`, 'HTML');
         break;
       }
 
@@ -754,7 +754,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
             repos[repoName] = repoAddPath;
             cfg.repos = repos;
           });
-          await agent.tgBot.sendText(cmd.chatId, `Repo \`${repoName}\` added → ${repoAddPath}`, 'Markdown');
+          await agent.tgBot.sendText(cmd.chatId, `Repo <code>${escapeHtml(repoName)}</code> added → ${escapeHtml(repoAddPath)}`, 'HTML');
           break;
         }
 
@@ -781,7 +781,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
             delete repos[repoName];
             cfg.repos = repos;
           });
-          await agent.tgBot.sendText(cmd.chatId, `Repo \`${repoName}\` removed.`, 'Markdown');
+          await agent.tgBot.sendText(cmd.chatId, `Repo <code>${escapeHtml(repoName)}</code> removed.`, 'HTML');
           break;
         }
 
@@ -811,22 +811,22 @@ export class Bridge extends EventEmitter implements CtlHandler {
               agentCfg.defaults = defaults;
             }
           });
-          await agent.tgBot.sendText(cmd.chatId, `Repo \`${repoName}\` assigned to agent \`${agentId}\`.`, 'Markdown');
+          await agent.tgBot.sendText(cmd.chatId, `Repo <code>${escapeHtml(repoName)}</code> assigned to agent <code>${escapeHtml(agentId)}</code>.`, 'HTML');
           break;
         }
 
         if (repoSub === 'help') {
           const helpText = [
-            '*Repo Management*',
+            '<b>Repo Management</b>',
             '',
             '/repo — List repos (buttons)',
             '/repo help — This help text',
-            '/repo add <name> <path> — Register a repo',
-            '/repo remove <name> — Unregister a repo',
-            '/repo assign <name> — Set as this agent\'s default',
+            '/repo add &lt;name&gt; &lt;path&gt; — Register a repo',
+            '/repo remove &lt;name&gt; — Unregister a repo',
+            '/repo assign &lt;name&gt; — Set as this agent\'s default',
             '/repo clear — Clear this agent\'s default',
           ].join('\n');
-          await agent.tgBot.sendText(cmd.chatId, helpText, 'Markdown');
+          await agent.tgBot.sendText(cmd.chatId, helpText, 'HTML');
           break;
         }
 
@@ -841,7 +841,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
               agentCfg.defaults = defaults;
             }
           });
-          await agent.tgBot.sendText(cmd.chatId, `Default repo cleared for agent \`${agentId}\`.`, 'Markdown');
+          await agent.tgBot.sendText(cmd.chatId, `Default repo cleared for agent <code>${escapeHtml(agentId)}</code>.`, 'HTML');
           break;
         }
 
@@ -858,9 +858,9 @@ export class Bridge extends EventEmitter implements CtlHandler {
             keyboard.text('➕ Add', 'repo_add:prompt').text('❓ Help', 'repo_help:show').row();
             await agent.tgBot.sendTextWithKeyboard(
               cmd.chatId,
-              `Current repo: \`${current}\`\n\nSelect a repo:\n\n_Type /repo help for management commands_`,
+              `Current repo: <code>${escapeHtml(current)}</code>\n\nSelect a repo:\n\n<i>Type /repo help for management commands</i>`,
               keyboard,
-              'Markdown',
+              'HTML',
             );
           } else {
             await agent.tgBot.sendText(cmd.chatId, `Current repo: ${current}\n\nUsage: /repo <path>`);
@@ -882,7 +882,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
         }
         this.sessionStore.setRepo(agentId, cmd.userId, repoPath);
         this.sessionStore.clearSession(agentId, cmd.userId);
-        await agent.tgBot.sendText(cmd.chatId, `Repo set to \`${repoPath}\`. Session cleared.`, 'Markdown');
+        await agent.tgBot.sendText(cmd.chatId, `Repo set to <code>${escapeHtml(repoPath)}</code>. Session cleared.`, 'HTML');
         break;
       }
 
@@ -903,7 +903,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
         const lastActivity = new Date(userState.lastActivity || 0);
         const missed = findMissedSessions(repo, userState.knownSessionIds, lastActivity);
         const message = formatCatchupMessage(repo, missed);
-        await agent.tgBot.sendText(cmd.chatId, message, 'Markdown');
+        await agent.tgBot.sendText(cmd.chatId, message, 'HTML');
         break;
       }
 
@@ -926,7 +926,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
             proc.destroy();
             agent.processes.delete(cmd.userId);
           }
-          await agent.tgBot.sendText(cmd.chatId, `Permission mode set to \`${mode}\`. Takes effect on next message.`, 'Markdown');
+          await agent.tgBot.sendText(cmd.chatId, `Permission mode set to <code>${escapeHtml(mode)}</code>. Takes effect on next message.`, 'HTML');
           break;
         }
 
@@ -937,9 +937,9 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
         await agent.tgBot.sendTextWithKeyboard(
           cmd.chatId,
-          `Current: \`${currentMode}\`\nDefault: \`${agentDefault}\`\n\nSelect a mode for this session:`,
+          `Current: <code>${escapeHtml(currentMode)}</code>\nDefault: <code>${escapeHtml(agentDefault)}</code>\n\nSelect a mode for this session:`,
           keyboard,
-          'Markdown',
+          'HTML',
         );
         break;
       }
@@ -966,8 +966,8 @@ export class Bridge extends EventEmitter implements CtlHandler {
         await agent.tgBot.answerCallbackQuery(query.callbackQueryId, 'Session set');
         await agent.tgBot.sendText(
           query.chatId,
-          `Will resume session \`${sessionId.slice(0, 8)}\` on next message.`,
-          'Markdown',
+          `Will resume session <code>${escapeHtml(sessionId.slice(0, 8))}</code> on next message.`,
+          'HTML',
         );
         break;
       }
@@ -977,7 +977,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
         const deleted = this.sessionStore.deleteSession(agentId, query.userId, sessionId);
         if (deleted) {
           await agent.tgBot.answerCallbackQuery(query.callbackQueryId, 'Session deleted');
-          await agent.tgBot.sendText(query.chatId, `Session \`${sessionId.slice(0, 8)}\` deleted.`, 'Markdown');
+          await agent.tgBot.sendText(query.chatId, `Session <code>${escapeHtml(sessionId.slice(0, 8))}</code> deleted.`, 'HTML');
         } else {
           await agent.tgBot.answerCallbackQuery(query.callbackQueryId, 'Session not found');
         }
@@ -1000,13 +1000,13 @@ export class Bridge extends EventEmitter implements CtlHandler {
         this.sessionStore.setRepo(agentId, query.userId, repoPath);
         this.sessionStore.clearSession(agentId, query.userId);
         await agent.tgBot.answerCallbackQuery(query.callbackQueryId, `Repo: ${repoName}`);
-        await agent.tgBot.sendText(query.chatId, `Repo set to \`${repoPath}\`. Session cleared.`, 'Markdown');
+        await agent.tgBot.sendText(query.chatId, `Repo set to <code>${escapeHtml(repoPath)}</code>. Session cleared.`, 'HTML');
         break;
       }
 
       case 'repo_add': {
         await agent.tgBot.answerCallbackQuery(query.callbackQueryId, 'Usage below');
-        await agent.tgBot.sendText(query.chatId, 'Send: `/repo add <name> <path>`', 'Markdown');
+        await agent.tgBot.sendText(query.chatId, 'Send: <code>/repo add &lt;name&gt; &lt;path&gt;</code>', 'HTML');
         break;
       }
 
@@ -1027,8 +1027,8 @@ export class Bridge extends EventEmitter implements CtlHandler {
         await agent.tgBot.answerCallbackQuery(query.callbackQueryId, `Mode: ${mode}`);
         await agent.tgBot.sendText(
           query.chatId,
-          `Permission mode set to \`${mode}\`. Takes effect on next message.`,
-          'Markdown',
+          `Permission mode set to <code>${escapeHtml(mode)}</code>. Takes effect on next message.`,
+          'HTML',
         );
         break;
       }
@@ -1036,16 +1036,16 @@ export class Bridge extends EventEmitter implements CtlHandler {
       case 'repo_help': {
         await agent.tgBot.answerCallbackQuery(query.callbackQueryId);
         const helpText = [
-          '*Repo Management*',
+          '<b>Repo Management</b>',
           '',
           '/repo — List repos (buttons)',
           '/repo help — This help text',
-          '/repo add <name> <path> — Register a repo',
-          '/repo remove <name> — Unregister a repo',
-          '/repo assign <name> — Set as this agent\'s default',
+          '/repo add &lt;name&gt; &lt;path&gt; — Register a repo',
+          '/repo remove &lt;name&gt; — Unregister a repo',
+          '/repo assign &lt;name&gt; — Set as this agent\'s default',
           '/repo clear — Clear this agent\'s default',
         ].join('\n');
-        await agent.tgBot.sendText(query.chatId, helpText, 'Markdown');
+        await agent.tgBot.sendText(query.chatId, helpText, 'HTML');
         break;
       }
 

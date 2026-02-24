@@ -20,24 +20,75 @@ export interface StreamAccumulatorOptions {
   splitThreshold?: number;       // char count to trigger message split (default 4000)
 }
 
-// ── Markdown safety ──
+// ── HTML safety & conversion ──
 
+/** Escape characters that are special in Telegram HTML. */
+export function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+/**
+ * Convert markdown-ish text to Telegram-safe HTML.
+ * Handles code blocks, inline code, bold, italic, strikethrough, links.
+ * Falls back to HTML-escaped plain text for anything it can't convert.
+ */
+export function markdownToHtml(text: string): string {
+  // First, extract code blocks to protect them from other conversions
+  const codeBlocks: string[] = [];
+  let result = text.replace(/```(\w*)\n?([\s\S]*?)```/g, (_match, lang, code) => {
+    const idx = codeBlocks.length;
+    const langAttr = lang ? ` class="language-${escapeHtml(lang)}"` : '';
+    codeBlocks.push(`<pre><code${langAttr}>${escapeHtml(code.replace(/\n$/, ''))}</code></pre>`);
+    return `\x00CODEBLOCK${idx}\x00`;
+  });
+
+  // Extract inline code
+  const inlineCodes: string[] = [];
+  result = result.replace(/`([^`\n]+)`/g, (_match, code) => {
+    const idx = inlineCodes.length;
+    inlineCodes.push(`<code>${escapeHtml(code)}</code>`);
+    return `\x00INLINE${idx}\x00`;
+  });
+
+  // Escape HTML in remaining text
+  result = escapeHtml(result);
+
+  // Convert markdown formatting
+  // Bold: **text** or __text__
+  result = result.replace(/\*\*(.+?)\*\*/g, '<b>$1</b>');
+  result = result.replace(/__(.+?)__/g, '<b>$1</b>');
+
+  // Italic: *text* or _text_ (but not inside words for underscore)
+  result = result.replace(/(?<!\w)\*([^*\n]+?)\*(?!\w)/g, '<i>$1</i>');
+  result = result.replace(/(?<!\w)_([^_\n]+?)_(?!\w)/g, '<i>$1</i>');
+
+  // Strikethrough: ~~text~~
+  result = result.replace(/~~(.+?)~~/g, '<s>$1</s>');
+
+  // Links: [text](url)
+  result = result.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>');
+
+  // Restore code blocks and inline code
+  result = result.replace(/\x00CODEBLOCK(\d+)\x00/g, (_match, idx) => codeBlocks[Number(idx)]);
+  result = result.replace(/\x00INLINE(\d+)\x00/g, (_match, idx) => inlineCodes[Number(idx)]);
+
+  return result;
+}
+
+/**
+ * Make text safe for Telegram HTML parse mode during streaming.
+ * Closes unclosed HTML tags from partial markdown conversion.
+ */
+export function makeHtmlSafe(text: string): string {
+  return markdownToHtml(text);
+}
+
+/** @deprecated Use makeHtmlSafe instead */
 export function makeMarkdownSafe(text: string): string {
-  // Count unclosed triple backticks
-  const tripleBackticks = (text.match(/```/g) ?? []).length;
-  let safe = text;
-  if (tripleBackticks % 2 !== 0) {
-    safe += '\n```';
-  }
-
-  // Count unclosed single backticks (but not triple)
-  const withoutTriple = safe.replace(/```/g, '');
-  const singleBackticks = (withoutTriple.match(/`/g) ?? []).length;
-  if (singleBackticks % 2 !== 0) {
-    safe += '`';
-  }
-
-  return safe;
+  return makeHtmlSafe(text);
 }
 
 // ── Stream Accumulator ──
@@ -102,7 +153,7 @@ export class StreamAccumulator {
     if (blockType === 'thinking') {
       this.currentBlockType = 'thinking';
       if (!this.thinkingIndicatorShown && !this.buffer) {
-        await this.sendOrEdit('_Thinking..._');
+        await this.sendOrEdit('<i>💭 Thinking...</i>', true);
         this.thinkingIndicatorShown = true;
       }
     } else if (blockType === 'text') {
@@ -130,19 +181,20 @@ export class StreamAccumulator {
 
   // ── TG message management ──
 
-  private async sendOrEdit(text: string): Promise<void> {
-    this.sendQueue = this.sendQueue.then(() => this._doSendOrEdit(text));
+  /** Send or edit a message. If rawHtml is true, text is already HTML-safe. */
+  private async sendOrEdit(text: string, rawHtml = false): Promise<void> {
+    this.sendQueue = this.sendQueue.then(() => this._doSendOrEdit(text, rawHtml));
     return this.sendQueue;
   }
 
-  private async _doSendOrEdit(text: string): Promise<void> {
-    const safeText = makeMarkdownSafe(text) || '...';
+  private async _doSendOrEdit(text: string, rawHtml = false): Promise<void> {
+    const safeText = (rawHtml ? text : makeHtmlSafe(text)) || '...';
     try {
       if (!this.tgMessageId) {
-        this.tgMessageId = await this.sender.sendMessage(this.chatId, safeText, 'Markdown');
+        this.tgMessageId = await this.sender.sendMessage(this.chatId, safeText, 'HTML');
         this.messageIds.push(this.tgMessageId);
       } else {
-        await this.sender.editMessage(this.chatId, this.tgMessageId, safeText, 'Markdown');
+        await this.sender.editMessage(this.chatId, this.tgMessageId, safeText, 'HTML');
       }
       this.lastEditTime = Date.now();
     } catch (err: unknown) {
@@ -160,10 +212,11 @@ export class StreamAccumulator {
   }
 
   private async showToolIndicator(toolName: string): Promise<void> {
-    const indicator = this.buffer
-      ? `${this.buffer}\n\n_Using ${toolName}..._`
-      : `_Using ${toolName}..._`;
-    await this.sendOrEdit(indicator);
+    const bufferHtml = this.buffer ? makeHtmlSafe(this.buffer) : '';
+    const indicator = bufferHtml
+      ? `${bufferHtml}\n\n<i>Using ${escapeHtml(toolName)}...</i>`
+      : `<i>Using ${escapeHtml(toolName)}...</i>`;
+    await this.sendOrEdit(indicator, true);
   }
 
   private async throttledEdit(): Promise<void> {
@@ -378,9 +431,9 @@ export class SubAgentTracker {
         try {
           const msgId = await this.sender.replyToMessage(
             this.chatId,
-            `🔄 Sub-agent spawned: \`${block.name}\``,
+            `🔄 Sub-agent spawned: <code>${escapeHtml(block.name)}</code>`,
             mainMsgId,
-            'Markdown',
+            'HTML',
           );
           info.tgMessageId = msgId;
         } catch (err) {
@@ -412,8 +465,8 @@ export class SubAgentTracker {
         await this.sender.editMessage(
           this.chatId,
           info.tgMessageId!,
-          `🔄 Sub-agent: \`${info.toolName}\`\n\n\`\`\`\n${preview}\n\`\`\``,
-          'Markdown',
+          `🔄 Sub-agent: <code>${escapeHtml(info.toolName)}</code>\n\n<pre>${escapeHtml(preview)}</pre>`,
+          'HTML',
         );
       } catch {
         // Ignore edit failures (rate limits, not modified, etc.)
@@ -446,8 +499,8 @@ export class SubAgentTracker {
     }
 
     const text = summary
-      ? `✅ Sub-agent completed: \`${info.toolName}\`\n_${summary}_`
-      : `✅ Sub-agent completed: \`${info.toolName}\``;
+      ? `✅ Sub-agent completed: <code>${escapeHtml(info.toolName)}</code>\n<i>${escapeHtml(summary)}</i>`
+      : `✅ Sub-agent completed: <code>${escapeHtml(info.toolName)}</code>`;
 
     this.sendQueue = this.sendQueue.then(async () => {
       try {
@@ -455,7 +508,7 @@ export class SubAgentTracker {
           this.chatId,
           info.tgMessageId!,
           text,
-          'Markdown',
+          'HTML',
         );
       } catch {
         // Ignore edit failures
