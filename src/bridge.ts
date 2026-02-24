@@ -21,7 +21,7 @@ import {
   type ResultEvent,
   type StreamInnerEvent,
 } from './cc-protocol.js';
-import { StreamAccumulator, SubAgentTracker, splitText, escapeHtml, type TelegramSender, type SubAgentSender } from './streaming.js';
+import { StreamAccumulator, SubAgentTracker, splitText, escapeHtml, type TelegramSender, type SubAgentSender, type MailboxMessage } from './streaming.js';
 import { TelegramBot, type TelegramMessage, type SlashCommand, type CallbackQuery } from './telegram.js';
 import { InlineKeyboard } from 'grammy';
 import { McpBridgeServer, type McpToolRequest, type McpToolResponse } from './mcp-bridge.js';
@@ -483,8 +483,41 @@ export class Bridge extends EventEmitter implements CtlHandler {
     proc.on('tool_result', (event: ToolResultEvent) => {
       const accKey = `${userId}:${chatId}`;
       const tracker = agent.subAgentTrackers.get(accKey);
-      if (tracker && event.tool_use_id) {
-        const resultText = typeof event.content === 'string' ? event.content : JSON.stringify(event.content);
+      if (!tracker) return;
+
+      const resultText = typeof event.content === 'string' ? event.content : JSON.stringify(event.content);
+
+      // Try to extract team name from sub-agent spawn confirmation
+      if (!tracker.currentTeamName) {
+        const teamMatch = resultText.match(/agent_id:\s*\S+@(\S+)/);
+        if (teamMatch) {
+          const teamName = teamMatch[1];
+          this.logger.info({ agentId, teamName }, 'Extracted team name from tool_result');
+          tracker.setTeamName(teamName);
+
+          // Wire the "all agents reported" callback to send follow-up to CC
+          tracker.setOnAllReported(() => {
+            const ccProc = agent.processes.get(userId);
+            if (ccProc && ccProc.state === 'active') {
+              ccProc.sendMessage(createTextMessage(
+                'All background agents have reported back. Please read their results and provide a synthesis.',
+              ));
+            }
+          });
+
+          // Start watching if we have dispatched agents
+          if (tracker.hasDispatchedAgents) {
+            tracker.startMailboxWatch();
+          }
+        }
+      }
+
+      // Start mailbox watch once we have team name + dispatched agents
+      if (tracker.currentTeamName && tracker.hasDispatchedAgents && !tracker.isMailboxWatching) {
+        tracker.startMailboxWatch();
+      }
+
+      if (event.tool_use_id) {
         tracker.handleToolResult(event.tool_use_id, resultText);
       }
     });
@@ -566,7 +599,11 @@ export class Bridge extends EventEmitter implements CtlHandler {
         acc.finalize();
         agent.accumulators.delete(accKey);
       }
-      // Clean up sub-agent tracker
+      // Clean up sub-agent tracker (stops mailbox watch)
+      const exitTracker = agent.subAgentTrackers.get(accKey);
+      if (exitTracker) {
+        exitTracker.stopMailboxWatch();
+      }
       agent.subAgentTrackers.delete(accKey);
     });
 
@@ -662,20 +699,12 @@ export class Bridge extends EventEmitter implements CtlHandler {
       agent.tgBot.sendText(chatId, `<i>Error: ${escapeHtml(String(event.result))}</i>`, 'HTML');
     }
 
-    // Check if background sub-agents are still running (dispatched but no result)
+    // If background sub-agents are still running, mailbox watcher handles them.
+    // Ensure mailbox watch is started if we have a team name and dispatched agents.
     const tracker = agent.subAgentTrackers.get(accKey);
-    if (tracker?.hasDispatchedAgents) {
-      this.logger.info({ agentId }, 'Turn ended with background sub-agents still running');
-      // Mark dispatched agents as "results in main response" since background agents
-      // report through CC's text, not through tool_result events
-      tracker.markDispatchedAsReportedInMain();
-      // Send follow-up after 15s to collect remaining results
-      setTimeout(() => {
-        const proc = agent.processes.get(userId);
-        if (proc && proc.state === 'active') {
-          proc.sendMessage(createTextMessage('Please check on the remaining background agents and report their findings.'));
-        }
-      }, 15000);
+    if (tracker?.hasDispatchedAgents && tracker.currentTeamName) {
+      this.logger.info({ agentId }, 'Turn ended with background sub-agents still running — mailbox watcher active');
+      tracker.startMailboxWatch();
     }
   }
 

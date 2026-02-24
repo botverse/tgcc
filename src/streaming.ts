@@ -1,3 +1,6 @@
+import { readFileSync, watchFile, unwatchFile, existsSync, mkdirSync } from 'node:fs';
+import { join, dirname } from 'node:path';
+import { homedir } from 'node:os';
 import type {
   StreamInnerEvent,
   StreamContentBlockStart,
@@ -603,12 +606,30 @@ export interface SubAgentTrackerOptions {
   sender: SubAgentSender;
 }
 
+/** A single mailbox message from a CC background sub-agent. */
+export interface MailboxMessage {
+  from: string;
+  text: string;
+  summary: string;
+  timestamp: string;
+  color?: string;
+  read: boolean;
+}
+
+/** Callback invoked when all tracked sub-agents have reported via mailbox. */
+export type AllAgentsReportedCallback = () => void;
+
 export class SubAgentTracker {
   private chatId: number | string;
   private sender: SubAgentSender;
   private agents = new Map<string, SubAgentInfo>();        // toolUseId → info
   private blockToAgent = new Map<number, string>();         // blockIndex → toolUseId
   private sendQueue: Promise<void> = Promise.resolve();
+  private teamName: string | null = null;
+  private mailboxPath: string | null = null;
+  private mailboxWatching = false;
+  private lastMailboxCount = 0;
+  private onAllReported: AllAgentsReportedCallback | null = null;
 
   constructor(options: SubAgentTrackerOptions) {
     this.chatId = options.chatId;
@@ -853,7 +874,133 @@ export class SubAgentTracker {
     }
   }
 
+  /** Set callback invoked when ALL dispatched sub-agents have mailbox results. */
+  setOnAllReported(cb: AllAgentsReportedCallback | null): void {
+    this.onAllReported = cb;
+  }
+
+  /** Set the CC team name (extracted from spawn confirmation tool_result). */
+  setTeamName(name: string): void {
+    this.teamName = name;
+    this.mailboxPath = join(
+      homedir(),
+      '.claude', 'teams', name, 'inboxes', 'team-lead.json',
+    );
+  }
+
+  get currentTeamName(): string | null { return this.teamName; }
+  get isMailboxWatching(): boolean { return this.mailboxWatching; }
+
+  /** Start watching the mailbox file for sub-agent results. */
+  startMailboxWatch(): void {
+    if (this.mailboxWatching || !this.mailboxPath) return;
+    this.mailboxWatching = true;
+
+    // Ensure directory exists so watchFile doesn't error
+    const dir = dirname(this.mailboxPath);
+    if (!existsSync(dir)) {
+      mkdirSync(dir, { recursive: true });
+    }
+
+    // Read current state to avoid processing pre-existing messages
+    this.lastMailboxCount = this.readMailboxMessages().length;
+
+    watchFile(this.mailboxPath, { interval: 2000 }, () => {
+      this.processMailbox();
+    });
+  }
+
+  /** Stop watching the mailbox file. */
+  stopMailboxWatch(): void {
+    if (!this.mailboxWatching || !this.mailboxPath) return;
+    try {
+      unwatchFile(this.mailboxPath);
+    } catch { /* ignore */ }
+    this.mailboxWatching = false;
+  }
+
+  /** Read and parse the mailbox file. Returns [] on any error. */
+  private readMailboxMessages(): MailboxMessage[] {
+    if (!this.mailboxPath || !existsSync(this.mailboxPath)) return [];
+    try {
+      const raw = readFileSync(this.mailboxPath, 'utf-8');
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }
+
+  /** Process new mailbox messages and update sub-agent TG messages. */
+  private processMailbox(): void {
+    const messages = this.readMailboxMessages();
+    if (messages.length <= this.lastMailboxCount) return;
+
+    const newMessages = messages.slice(this.lastMailboxCount);
+    this.lastMailboxCount = messages.length;
+
+    for (const msg of newMessages) {
+      if (msg.read) continue; // Already read by CC
+
+      // Match msg.from to a tracked sub-agent by label
+      const matched = this.findAgentByFrom(msg.from);
+      if (!matched) continue;
+
+      // Clear elapsed timer
+      this.clearElapsedTimer(matched);
+      matched.status = 'completed';
+
+      if (!matched.tgMessageId) continue;
+
+      const label = matched.label || matched.toolName;
+      const summary = msg.summary || 'Done';
+      // Truncate text for blockquote (TG limit)
+      const maxTextLen = 1024;
+      const bodyText = msg.text.length > maxTextLen
+        ? msg.text.slice(0, maxTextLen) + '…'
+        : msg.text;
+
+      const colorEmoji = msg.color === 'green' ? '✅'
+        : msg.color === 'red' ? '❌'
+        : msg.color === 'yellow' ? '⚠️'
+        : '✅';
+
+      const text = `<blockquote expandable>${colorEmoji} ${escapeHtml(label)} — ${escapeHtml(summary)}\n${escapeHtml(bodyText)}</blockquote>`;
+
+      const msgId = matched.tgMessageId;
+      this.sendQueue = this.sendQueue.then(async () => {
+        try {
+          await this.sender.editMessage(this.chatId, msgId, text, 'HTML');
+        } catch { /* ignore */ }
+      });
+    }
+
+    // Check if ALL dispatched agents are now completed
+    if (this.onAllReported && !this.hasDispatchedAgents && this.agents.size > 0) {
+      // All done — invoke callback
+      const cb = this.onAllReported;
+      // Defer slightly to let edits flush
+      setTimeout(() => cb(), 500);
+    }
+  }
+
+  /** Find a tracked sub-agent whose label matches the mailbox message's `from` field. */
+  private findAgentByFrom(from: string): SubAgentInfo | null {
+    const fromLower = from.toLowerCase();
+    for (const info of this.agents.values()) {
+      if (info.status !== 'dispatched') continue;
+      const label = (info.label || info.toolName).toLowerCase();
+      // Match: exact, contains, or from contains label
+      if (label === fromLower || label.includes(fromLower) || fromLower.includes(label)) {
+        return info;
+      }
+    }
+    return null;
+  }
+
   reset(): void {
+    // Stop mailbox watching
+    this.stopMailboxWatch();
     // Clear all elapsed timers before resetting
     for (const info of this.agents.values()) {
       this.clearElapsedTimer(info);
@@ -861,6 +1008,10 @@ export class SubAgentTracker {
     this.agents.clear();
     this.blockToAgent.clear();
     this.sendQueue = Promise.resolve();
+    this.teamName = null;
+    this.mailboxPath = null;
+    this.lastMailboxCount = 0;
+    this.onAllReported = null;
   }
 }
 
