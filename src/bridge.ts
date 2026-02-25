@@ -273,6 +273,24 @@ export class Bridge extends EventEmitter implements CtlHandler {
       this.mcpServer.close(socketPath);
     }
 
+    // Clean up accumulators (clears edit timers)
+    for (const [, acc] of agent.accumulators) {
+      acc.finalize();
+    }
+    agent.accumulators.clear();
+
+    // Clean up sub-agent trackers (stops mailbox watchers)
+    for (const [, tracker] of agent.subAgentTrackers) {
+      tracker.reset();
+    }
+    agent.subAgentTrackers.clear();
+
+    // Clear remaining maps
+    agent.pendingTitles.clear();
+    agent.pendingPermissions.clear();
+    agent.processes.clear();
+    agent.batchers.clear();
+
     // Close control socket
     const ctlSocketPath = join('/tmp/tgcc/ctl', `${agentId}.sock`);
     this.ctlServer.close(ctlSocketPath);
@@ -1411,6 +1429,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
     this.mcpServer.closeAll();
     this.ctlServer.closeAll();
+    this.removeAllListeners();
     this.logger.info('Bridge stopped');
   }
 }

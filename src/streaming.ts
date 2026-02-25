@@ -730,7 +730,9 @@ export class SubAgentTracker {
     const info = this.agents.get(toolUseId);
     if (!info || !info.tgMessageId) return;
 
-    info.inputPreview += event.delta.partial_json;
+    if (info.inputPreview.length < 10_000) {
+      info.inputPreview += event.delta.partial_json;
+    }
 
     // Extract agent name from input JSON (used for mailbox matching)
     if (!info.agentName) {

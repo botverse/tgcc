@@ -396,6 +396,7 @@ export class TelegramBot {
     if (this.running) {
       this.running = false;
       this.bot.stop();
+      this.replyMaps.clear();
       this.logger.info('Bot stopped');
     }
   }

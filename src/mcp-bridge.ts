@@ -215,6 +215,10 @@ export class McpBridgeClient {
   }
 
   close(): void {
+    for (const [, pending] of this.pendingRequests) {
+      pending.reject(new Error('MCP connection closed'));
+    }
+    this.pendingRequests.clear();
     this.socket?.destroy();
     this.socket = null;
     this.connected = false;

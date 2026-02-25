@@ -513,6 +513,8 @@ export class CCProcess extends EventEmitter {
     if (this.process && this._state === 'active') {
       this.logger.info('Sending SIGINT to cancel current turn');
       this.process.kill('SIGINT');
+      // Restart idle timer so the process doesn't hang forever after cancel
+      this.startIdleTimer();
     }
   }
 
@@ -528,6 +530,11 @@ export class CCProcess extends EventEmitter {
 
   destroy(): void {
     this.kill();
+    if (this.process) {
+      this.process.removeAllListeners();
+      this.process.stdout?.removeAllListeners();
+      this.process.stderr?.removeAllListeners();
+    }
     this.removeAllListeners();
   }
 }
