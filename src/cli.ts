@@ -709,10 +709,91 @@ function cmdPermissions(args: string[]): void {
 
 // ── Main ──
 
+// ── Init command ──
+
+async function prompt(question: string): Promise<string> {
+  const { createInterface } = await import('node:readline');
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise((resolve) => {
+    rl.question(question, (answer) => {
+      rl.close();
+      resolve(answer.trim());
+    });
+  });
+}
+
+async function cmdInit(): Promise<void> {
+  const configDir = join(homedir(), '.tgcc');
+  const configPath = join(configDir, 'config.json');
+
+  if (existsSync(configPath)) {
+    const overwrite = await prompt('Config already exists. Overwrite? (y/N) ');
+    if (overwrite.toLowerCase() !== 'y') {
+      console.log('Aborted.');
+      return;
+    }
+  }
+
+  console.log('🤖 TGCC Setup\n');
+  console.log('You need a Telegram bot token from @BotFather.\n');
+
+  const agentName = await prompt('Agent name (e.g. my-agent): ') || 'default';
+  const botToken = await prompt('Bot token: ');
+
+  if (!botToken) {
+    console.error('Bot token is required.');
+    process.exit(1);
+  }
+
+  const repoPath = await prompt('Default repo path (optional, press Enter to skip): ');
+
+  const config: Record<string, unknown> = {
+    global: {
+      ccBinaryPath: 'claude',
+      mediaDir: '/tmp/tgcc/media',
+      socketDir: '/tmp/tgcc/sockets',
+      logLevel: 'info',
+    },
+    repos: {} as Record<string, string>,
+    agents: {
+      [agentName]: {
+        botToken,
+        allowedUsers: [],
+        defaults: {
+          permissionMode: 'bypassPermissions',
+        },
+      },
+    },
+  };
+
+  if (repoPath) {
+    const repoName = repoPath.split('/').pop() || 'default';
+    (config.repos as Record<string, string>)[repoName] = resolve(repoPath);
+    (config.agents as Record<string, Record<string, unknown>>)[agentName].defaults = {
+      permissionMode: 'bypassPermissions',
+      repo: repoName,
+    };
+  }
+
+  mkdirSync(configDir, { recursive: true });
+  writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n');
+
+  console.log(`\n✅ Config written to ${configPath}`);
+  console.log(`\nNext steps:`);
+  console.log(`  tgcc run         Run in foreground to test`);
+  console.log(`  tgcc install     Install as a service`);
+  console.log(`\nSend /start to your bot on Telegram to begin.`);
+}
+
 // ── Start / Service commands ──
 
 async function cmdStart(): Promise<void> {
-  // Run the service in the foreground
+  const configPath = join(homedir(), '.tgcc', 'config.json');
+  if (!existsSync(configPath)) {
+    console.error(`Config not found: ${configPath}`);
+    console.error('Run: tgcc init');
+    process.exit(1);
+  }
   const { main: serviceMain } = await import('./service.js');
   await serviceMain();
 }
@@ -920,6 +1001,10 @@ async function main(): Promise<void> {
       cmdPermissions(args.slice(1));
       break;
 
+    case 'init':
+      await cmdInit();
+      break;
+
     case 'run':
       await cmdStart();
       break;
@@ -967,6 +1052,9 @@ async function main(): Promise<void> {
 
 function printHelp(): void {
   console.log(`tgcc — Telegram ↔ Claude Code CLI
+
+Setup:
+  tgcc init                 Create config interactively
 
 Service:
   tgcc install              Install & start as a user service (systemd/launchd)
