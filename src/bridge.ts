@@ -668,8 +668,15 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
     // On message_start: always create new message on new CC turn for deterministic behavior
     if (event.type === 'message_start') {
-      // Always create new message on new CC turn
-      acc.reset();
+      // Soft reset: clear buffer but keep tgMessageId so tool indicators
+      // ("Using Bash...") get overwritten by the actual response text.
+      // Only do a full reset (new TG message) when sub-agents were active,
+      // since their results should appear in a separate message.
+      if (tracker.hadSubAgents) {
+        acc.reset();
+      } else {
+        acc.softReset();
+      }
       // Only reset tracker if no agents still dispatched
       if (!tracker.hasDispatchedAgents) {
         tracker.reset();
@@ -1046,8 +1053,15 @@ export class Bridge extends EventEmitter implements CtlHandler {
           agent.processes.delete(cmd.userId);
         }
         this.sessionStore.setRepo(agentId, cmd.userId, repoPath);
-        this.sessionStore.clearSession(agentId, cmd.userId);
-        await agent.tgBot.sendText(cmd.chatId, `Repo set to <code>${escapeHtml(repoPath)}</code>. Session cleared.`, 'HTML');
+        const userState = this.sessionStore.getUser(agentId, cmd.userId);
+        const lastActive = new Date(userState.lastActivity).getTime();
+        const staleMs = 24 * 60 * 60 * 1000;
+        if (Date.now() - lastActive > staleMs || !userState.currentSessionId) {
+          this.sessionStore.clearSession(agentId, cmd.userId);
+          await agent.tgBot.sendText(cmd.chatId, `Repo set to <code>${escapeHtml(repoPath)}</code>. Session cleared (stale).`, 'HTML');
+        } else {
+          await agent.tgBot.sendText(cmd.chatId, `Repo set to <code>${escapeHtml(repoPath)}</code>. Session kept (active &lt;24h).`, 'HTML');
+        }
         break;
       }
 
@@ -1163,9 +1177,16 @@ export class Bridge extends EventEmitter implements CtlHandler {
           agent.processes.delete(query.userId);
         }
         this.sessionStore.setRepo(agentId, query.userId, repoPath);
-        this.sessionStore.clearSession(agentId, query.userId);
+        const userState2 = this.sessionStore.getUser(agentId, query.userId);
+        const lastActive2 = new Date(userState2.lastActivity).getTime();
+        const staleMs2 = 24 * 60 * 60 * 1000;
         await agent.tgBot.answerCallbackQuery(query.callbackQueryId, `Repo: ${repoName}`);
-        await agent.tgBot.sendText(query.chatId, `Repo set to <code>${escapeHtml(repoPath)}</code>. Session cleared.`, 'HTML');
+        if (Date.now() - lastActive2 > staleMs2 || !userState2.currentSessionId) {
+          this.sessionStore.clearSession(agentId, query.userId);
+          await agent.tgBot.sendText(query.chatId, `Repo set to <code>${escapeHtml(repoPath)}</code>. Session cleared (stale).`, 'HTML');
+        } else {
+          await agent.tgBot.sendText(query.chatId, `Repo set to <code>${escapeHtml(repoPath)}</code>. Session kept (active &lt;24h).`, 'HTML');
+        }
         break;
       }
 
