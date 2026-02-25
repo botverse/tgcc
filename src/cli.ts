@@ -727,6 +727,7 @@ ExecStart=TGCC_BIN
 Restart=on-failure
 RestartSec=5
 Environment=NODE_ENV=production
+Environment=PATH=PATH_VAL
 
 [Install]
 WantedBy=default.target
@@ -741,7 +742,7 @@ const LAUNCHD_PLIST = `<?xml version="1.0" encoding="UTF-8"?>
   <key>ProgramArguments</key>
   <array>
     <string>TGCC_BIN</string>
-    <string>start</string>
+    <string>run</string>
   </array>
   <key>RunAtLoad</key>
   <true/>
@@ -804,7 +805,9 @@ function cmdInstall(): void {
 
     mkdirSync(unitDir, { recursive: true });
 
-    const content = SYSTEMD_UNIT.replace(/TGCC_BIN/g, `${tgccBin} start`);
+    const content = SYSTEMD_UNIT
+      .replace(/TGCC_BIN/g, `${tgccBin} run`)
+      .replace(/PATH_VAL/g, process.env.PATH || '/usr/local/bin:/usr/bin:/bin');
     writeFileSync(unitPath, content);
     execSync('systemctl --user daemon-reload', { stdio: 'ignore' });
     execSync('systemctl --user enable --now tgcc', { stdio: 'ignore' });
