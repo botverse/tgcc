@@ -601,7 +601,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
             const ccProc = agent.processes.get(userId);
             if (ccProc && ccProc.state === 'active') {
               ccProc.sendMessage(createTextMessage(
-                'All background agents have reported back. Please read their results and provide a synthesis.',
+                '[System] All background agents have reported back. Please read their results from the mailbox/files and provide a synthesis to the user.',
               ));
             }
           });
@@ -852,7 +852,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
               tracker.markCompleted(info.toolUseId, '(results delivered in CC response)');
             }
           }
-          proc.sendMessage(createTextMessage('The background agents should be done by now. Please report their results.'));
+          proc.sendMessage(createTextMessage('[System] The background agents should be done by now. Please read their results from the mailbox/files and report to the user.'));
         }, 60_000);
       }
     }
