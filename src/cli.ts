@@ -832,8 +832,35 @@ async function ensureConfig(): Promise<void> {
   }
 }
 
+function checkClaudeCode(): void {
+  // Check if claude binary exists
+  try {
+    execSync('which claude', { stdio: 'ignore' });
+  } catch {
+    console.error('❌ Claude Code CLI not found.\n');
+    console.error('Install it:');
+    console.error('  npm install -g @anthropic-ai/claude-code\n');
+    console.error('Then authenticate:');
+    console.error('  claude login');
+    process.exit(1);
+  }
+
+  // Check if logged in
+  try {
+    const output = execSync('claude --version', { encoding: 'utf-8', timeout: 5000 }).trim();
+    if (!output) throw new Error('no output');
+  } catch {
+    console.error('❌ Claude Code CLI found but not responding.\n');
+    console.error('Try:');
+    console.error('  claude --version');
+    console.error('  claude login');
+    process.exit(1);
+  }
+}
+
 async function cmdStart(): Promise<void> {
   await ensureConfig();
+  checkClaudeCode();
   const { main: serviceMain } = await import('./service.js');
   await serviceMain();
 }
