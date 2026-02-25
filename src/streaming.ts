@@ -385,12 +385,16 @@ export class StreamAccumulator {
     this.clearEditTimer(); // Ensure cleanup
   }
 
-  /** Full reset: also clears tgMessageId (next send creates a new message) */
+  /** Full reset: also clears tgMessageId (next send creates a new message).
+   *  Chains on the existing sendQueue so any pending finalize() edits complete first. */
   reset(): void {
+    // Chain on the existing queue so pending sends (e.g. finalize) complete
+    // before the new turn starts sending.
+    const prevQueue = this.sendQueue;
     this.softReset();
     this.tgMessageId = null;
     this.messageIds = [];
-    this.sendQueue = Promise.resolve();
+    this.sendQueue = prevQueue.catch(() => {});  // swallow errors from prev turn
   }
 }
 
