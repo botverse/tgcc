@@ -109,6 +109,7 @@ export class CCProcess extends EventEmitter {
   private _ccActivity: CCActivityState = 'idle';
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
   private hangTimer: ReturnType<typeof setTimeout> | null = null;
+  private forceKillTimer: ReturnType<typeof setTimeout> | null = null;
   private messageQueue: UserMessage[] = [];
   private logger: pino.Logger;
   private options: CCProcessOptions;
@@ -476,6 +477,13 @@ export class CCProcess extends EventEmitter {
     }
   }
 
+  private clearForceKillTimer(): void {
+    if (this.forceKillTimer) {
+      clearTimeout(this.forceKillTimer);
+      this.forceKillTimer = null;
+    }
+  }
+
   // ── Lifecycle ──
 
   kill(): void {
@@ -485,15 +493,19 @@ export class CCProcess extends EventEmitter {
     this.logger.info('Sending SIGTERM to CC process');
     this.process.kill('SIGTERM');
 
+    // Clear any existing force kill timer
+    this.clearForceKillTimer();
+
     // Force kill after 5s
-    const forceTimer = setTimeout(() => {
+    this.forceKillTimer = setTimeout(() => {
       if (this.process && !this.process.killed) {
         this.logger.warn('Force killing CC process with SIGKILL');
         this.process.kill('SIGKILL');
       }
+      this.forceKillTimer = null;
     }, 5000);
 
-    this.process.once('exit', () => clearTimeout(forceTimer));
+    this.process.once('exit', () => this.clearForceKillTimer());
   }
 
   /** Respond to a permission request from CC */
@@ -521,6 +533,7 @@ export class CCProcess extends EventEmitter {
   private cleanup(): void {
     this.clearIdleTimer();
     this.clearHangTimer();
+    this.clearForceKillTimer();
     this._state = 'idle';
     this._ccActivity = 'idle';
     this._killedByUs = false;

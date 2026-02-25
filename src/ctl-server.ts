@@ -63,6 +63,7 @@ export interface CtlHandler {
 
 export class CtlServer {
   private servers = new Map<string, Server>();
+  private activeSockets = new Map<string, Set<Socket>>(); // socketPath → Set<Socket>
   private handler: CtlHandler;
   private logger: pino.Logger;
 
@@ -79,6 +80,9 @@ export class CtlServer {
     const dir = dirname(socketPath);
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 
+    // Initialize socket set for this path
+    this.activeSockets.set(socketPath, new Set());
+
     const server = createServer((socket) => this.handleConnection(socket, socketPath));
 
     server.on('error', (err) => {
@@ -94,6 +98,13 @@ export class CtlServer {
 
   private handleConnection(socket: Socket, socketPath: string): void {
     this.logger.debug({ socketPath }, 'Ctl client connected');
+    
+    // Track this socket
+    const sockets = this.activeSockets.get(socketPath);
+    if (sockets) {
+      sockets.add(socket);
+    }
+
     let buffer = '';
 
     socket.on('data', (data) => {
@@ -108,6 +119,14 @@ export class CtlServer {
 
     socket.on('error', (err) => {
       this.logger.debug({ err, socketPath }, 'Ctl connection error');
+    });
+
+    socket.on('close', () => {
+      // Remove socket from tracking when it closes
+      const sockets = this.activeSockets.get(socketPath);
+      if (sockets) {
+        sockets.delete(socket);
+      }
     });
   }
 
@@ -145,6 +164,16 @@ export class CtlServer {
   close(socketPath: string): void {
     const server = this.servers.get(socketPath);
     if (server) {
+      // Destroy all active sockets for this server
+      const sockets = this.activeSockets.get(socketPath);
+      if (sockets) {
+        for (const socket of sockets) {
+          socket.destroy();
+        }
+        sockets.clear();
+        this.activeSockets.delete(socketPath);
+      }
+
       server.close();
       this.servers.delete(socketPath);
       if (existsSync(socketPath)) {
@@ -156,11 +185,21 @@ export class CtlServer {
   /** Stop all control sockets. */
   closeAll(): void {
     for (const [socketPath, server] of this.servers) {
+      // Destroy all active sockets for this server
+      const sockets = this.activeSockets.get(socketPath);
+      if (sockets) {
+        for (const socket of sockets) {
+          socket.destroy();
+        }
+        sockets.clear();
+      }
+
       server.close();
       if (existsSync(socketPath)) {
         try { unlinkSync(socketPath); } catch {}
       }
     }
     this.servers.clear();
+    this.activeSockets.clear();
   }
 }

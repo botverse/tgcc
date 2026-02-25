@@ -386,6 +386,7 @@ export class TelegramBot {
     this.running = true;
     this.bot.start({
       drop_pending_updates: true,
+      timeout: 30, // 30 second timeout for getUpdates
       onStart: (info) => {
         this.logger.info({ username: info.username }, 'Bot started');
       },

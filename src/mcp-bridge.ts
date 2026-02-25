@@ -135,9 +135,20 @@ export class McpBridgeClient {
 
   async connect(): Promise<void> {
     return new Promise((resolve, reject) => {
+      // Add 5 second connection timeout
+      const timeout = setTimeout(() => {
+        if (this.socket) {
+          this.socket.destroy();
+          this.socket = null;
+        }
+        this.connected = false;
+        reject(new Error('MCP connection timeout after 5 seconds'));
+      }, 5000);
+
       this.socket = createConnection(this.socketPath);
 
       this.socket.on('connect', () => {
+        clearTimeout(timeout);
         this.connected = true;
         resolve();
       });
@@ -153,6 +164,7 @@ export class McpBridgeClient {
       });
 
       this.socket.on('error', (err) => {
+        clearTimeout(timeout);
         this.connected = false;
         reject(err);
         // Reject all pending requests

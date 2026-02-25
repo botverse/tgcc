@@ -115,6 +115,13 @@ class MessageBatcher {
     }
     this.pending = [];
   }
+
+  destroy(): void {
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+  }
 }
 
 // ── Help text ──
@@ -257,14 +264,38 @@ export class Bridge extends EventEmitter implements CtlHandler {
     // Stop bot
     await agent.tgBot.stop();
 
-    // Kill all CC processes
+    // Kill all CC processes and wait for them to exit
+    const processExitPromises: Promise<void>[] = [];
     for (const [, proc] of agent.processes) {
+      // Create a promise that resolves when the process exits or times out
+      const exitPromise = new Promise<void>((resolve) => {
+        const onExit = () => {
+          proc.off('exit', onExit);
+          resolve();
+        };
+        proc.on('exit', onExit);
+        
+        // Timeout after 3 seconds if process doesn't exit
+        const timeoutId = setTimeout(() => {
+          proc.off('exit', onExit);
+          resolve();
+        }, 3000);
+        
+        // Clear timeout if process exits before timeout
+        proc.on('exit', () => clearTimeout(timeoutId));
+      });
+      
+      processExitPromises.push(exitPromise);
       proc.destroy();
     }
+
+    // Wait for all processes to exit (or timeout)
+    await Promise.all(processExitPromises);
 
     // Cancel batchers
     for (const [, batcher] of agent.batchers) {
       batcher.cancel();
+      batcher.destroy();
     }
 
     // Close MCP sockets

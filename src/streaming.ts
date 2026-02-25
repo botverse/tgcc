@@ -162,6 +162,13 @@ export class StreamAccumulator {
       const delta = (event as StreamTextDelta).delta;
       if (delta?.type === 'text_delta') {
         this.buffer += delta.text;
+        
+        // Force split/truncation if buffer exceeds 50KB
+        if (this.buffer.length > 50_000) {
+          await this.forceSplitOrTruncate();
+          return; // Skip throttledEdit - already handled in forceSplitOrTruncate
+        }
+        
         await this.throttledEdit();
       }
     } else if (this.currentBlockType === 'thinking' && 'delta' in event) {
@@ -303,6 +310,32 @@ export class StreamAccumulator {
 
     if (this.buffer) {
       await this.sendOrEdit(makeHtmlSafe(this.buffer), true);
+    }
+  }
+
+  /** Emergency split/truncation when buffer exceeds 50KB absolute limit */
+  private async forceSplitOrTruncate(): Promise<void> {
+    const maxChars = 50_000;
+    
+    if (this.buffer.length > maxChars) {
+      // Split at a reasonable point within the 50KB limit
+      const splitAt = findSplitPoint(this.buffer, maxChars - 200); // Leave some margin
+      const firstPart = this.buffer.slice(0, splitAt);
+      const remainder = this.buffer.slice(splitAt);
+      
+      // Finalize current message with first part + truncation notice
+      const truncationNotice = '\n\n<i>[Output truncated - buffer limit exceeded]</i>';
+      await this.sendOrEdit(makeHtmlSafe(firstPart) + truncationNotice, true);
+      
+      // Start a new message for remainder (up to another 50KB)
+      this.tgMessageId = null;
+      this.buffer = remainder.length > maxChars 
+        ? remainder.slice(0, maxChars - 100) + '...' 
+        : remainder;
+      
+      if (this.buffer) {
+        await this.sendOrEdit(makeHtmlSafe(this.buffer), true);
+      }
     }
   }
 
