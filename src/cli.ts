@@ -845,7 +845,7 @@ function cmdUninstall(): void {
   }
 }
 
-function cmdServiceCtl(action: 'stop' | 'restart'): void {
+function cmdServiceCtl(action: 'start' | 'stop' | 'restart'): void {
   const platform = detectPlatform();
 
   if (platform === 'mac') {
@@ -856,11 +856,11 @@ function cmdServiceCtl(action: 'stop' | 'restart'): void {
     }
     if (action === 'stop') {
       execSync(`launchctl bootout gui/$(id -u) ${plistPath}`, { stdio: 'inherit' });
-      console.log('✅ Service stopped.');
-    } else {
-      execSync(`launchctl bootout gui/$(id -u) ${plistPath}`, { stdio: 'ignore' });
+    } else if (action === 'start') {
       execSync(`launchctl bootstrap gui/$(id -u) ${plistPath}`, { stdio: 'inherit' });
-      console.log('✅ Service restarted.');
+    } else {
+      try { execSync(`launchctl bootout gui/$(id -u) ${plistPath}`, { stdio: 'ignore' }); } catch { /* ok */ }
+      execSync(`launchctl bootstrap gui/$(id -u) ${plistPath}`, { stdio: 'inherit' });
     }
   } else {
     const unitPath = join(homedir(), '.config', 'systemd', 'user', 'tgcc.service');
@@ -869,8 +869,10 @@ function cmdServiceCtl(action: 'stop' | 'restart'): void {
       process.exit(1);
     }
     execSync(`systemctl --user ${action} tgcc`, { stdio: 'inherit' });
-    console.log(`✅ Service ${action === 'stop' ? 'stopped' : 'restarted'}.`);
   }
+
+  const labels = { start: 'started', stop: 'stopped', restart: 'restarted' };
+  console.log(`✅ Service ${labels[action]}.`);
 }
 
 function cmdLogs(): void {
@@ -915,9 +917,12 @@ async function main(): Promise<void> {
       cmdPermissions(args.slice(1));
       break;
 
-    case 'start':
     case 'run':
       await cmdStart();
+      break;
+
+    case 'start':
+      cmdServiceCtl('start');
       break;
 
     case 'install':
@@ -961,12 +966,13 @@ function printHelp(): void {
   console.log(`tgcc — Telegram ↔ Claude Code CLI
 
 Service:
-  tgcc start                Run in the foreground
   tgcc install              Install & start as a user service (systemd/launchd)
+  tgcc start                Start the service
   tgcc stop                 Stop the service
   tgcc restart              Restart the service
   tgcc uninstall            Remove the service
   tgcc logs                 Tail service logs
+  tgcc run                  Run in the foreground (no service)
 
 Commands:
   tgcc status [--agent]     Show running agents and active sessions
