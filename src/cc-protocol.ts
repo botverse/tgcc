@@ -329,6 +329,17 @@ export interface ApiErrorEvent {
 // ── Union of all CC output events ──
 
 /** User output message — wraps tool_result content blocks (sub-agent results). */
+/** Content block within a tool_result (text, image, etc.) */
+export interface ToolResultContentBlock {
+  type: string;
+  text?: string;
+  source?: {
+    type: string;
+    media_type?: string;
+    data?: string;
+  };
+}
+
 export interface UserOutputMessage {
   type: 'user';
   message: {
@@ -336,7 +347,7 @@ export interface UserOutputMessage {
     content: Array<{
       type: string;
       tool_use_id?: string;
-      content?: string | Array<{ type: string; text?: string }>;
+      content?: string | ToolResultContentBlock[];
       is_error?: boolean;
     }>;
   };

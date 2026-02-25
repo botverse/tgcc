@@ -58,6 +58,7 @@ interface AgentInstance {
   batchers: Map<string, MessageBatcher>;   // userId → batcher
   pendingTitles: Map<string, string>;      // userId → first message text for session title
   pendingPermissions: Map<string, PendingPermission>; // requestId → pending permission
+  typingIntervals: Map<string, ReturnType<typeof setInterval>>; // `${userId}:${chatId}` → interval
 }
 
 // ── Message Batcher ──
@@ -210,6 +211,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
       batchers: new Map(),
       pendingTitles: new Map(),
       pendingPermissions: new Map(),
+      typingIntervals: new Map(),
     };
 
     this.agents.set(agentId, instance);
@@ -317,6 +319,12 @@ export class Bridge extends EventEmitter implements CtlHandler {
     agent.subAgentTrackers.clear();
 
     // Clear remaining maps
+    // Clear typing indicators
+    for (const [, interval] of agent.typingIntervals) {
+      clearInterval(interval);
+    }
+    agent.typingIntervals.clear();
+
     agent.pendingTitles.clear();
     agent.pendingPermissions.clear();
     agent.processes.clear();
@@ -418,8 +426,8 @@ export class Bridge extends EventEmitter implements CtlHandler {
       agent.processes.set(userId, proc);
     }
 
-    // Show typing indicator
-    agent.tgBot.sendTyping(chatId);
+    // Show typing indicator (repeated every 4s — TG typing expires after ~5s)
+    this.startTypingIndicator(agent, userId, chatId);
 
     proc.sendMessage(ccMsg);
     this.sessionStore.updateSessionActivity(agentId, userId);
@@ -477,6 +485,29 @@ export class Bridge extends EventEmitter implements CtlHandler {
     } catch {
       // File doesn't exist yet — clear tracking
       this.sessionStore.clearJsonlTracking(agentId, userId);
+    }
+  }
+
+  // ── Typing indicator management ──
+
+  private startTypingIndicator(agent: AgentInstance, userId: string, chatId: number): void {
+    const key = `${userId}:${chatId}`;
+    // Don't create duplicate intervals
+    if (agent.typingIntervals.has(key)) return;
+    // Send immediately, then repeat every 4s (TG typing badge lasts ~5s)
+    agent.tgBot.sendTyping(chatId);
+    const interval = setInterval(() => {
+      agent.tgBot.sendTyping(chatId);
+    }, 4_000);
+    agent.typingIntervals.set(key, interval);
+  }
+
+  private stopTypingIndicator(agent: AgentInstance, userId: string, chatId: number): void {
+    const key = `${userId}:${chatId}`;
+    const interval = agent.typingIntervals.get(key);
+    if (interval) {
+      clearInterval(interval);
+      agent.typingIntervals.delete(key);
     }
   }
 
@@ -586,12 +617,28 @@ export class Bridge extends EventEmitter implements CtlHandler {
       }
     });
 
+    // Media from tool results (images, PDFs, etc.)
+    proc.on('media', (media: { kind: string; media_type: string; data: string }) => {
+      const buf = Buffer.from(media.data, 'base64');
+      if (media.kind === 'image') {
+        agent.tgBot.sendPhotoBuffer(chatId, buf).catch(err => {
+          this.logger.error({ err, agentId, userId }, 'Failed to send tool_result image');
+        });
+      } else if (media.kind === 'document') {
+        const ext = media.media_type === 'application/pdf' ? '.pdf' : '';
+        agent.tgBot.sendDocumentBuffer(chatId, buf, `document${ext}`).catch(err => {
+          this.logger.error({ err, agentId, userId }, 'Failed to send tool_result document');
+        });
+      }
+    });
+
     proc.on('assistant', (event: AssistantMessage) => {
       // Non-streaming fallback — only used if stream_events don't fire
       // In practice, stream_events handle the display
     });
 
     proc.on('result', (event: ResultEvent) => {
+      this.stopTypingIndicator(agent, userId, chatId);
       this.handleResult(agentId, userId, chatId, event);
     });
 
@@ -641,10 +688,12 @@ export class Bridge extends EventEmitter implements CtlHandler {
     });
 
     proc.on('hang', () => {
+      this.stopTypingIndicator(agent, userId, chatId);
       agent.tgBot.sendText(chatId, '<i>CC session paused. Send a message to continue.</i>', 'HTML');
     });
 
     proc.on('takeover', () => {
+      this.stopTypingIndicator(agent, userId, chatId);
       this.logger.warn({ agentId, userId }, 'Session takeover detected — keeping session for roaming');
       // Don't clear session — allow roaming between clients.
       // Just kill the current process; next message will --resume the same session.
@@ -653,6 +702,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
     });
 
     proc.on('exit', () => {
+      this.stopTypingIndicator(agent, userId, chatId);
       // Finalize any active accumulator
       const accKey = `${userId}:${chatId}`;
       const acc = agent.accumulators.get(accKey);
@@ -669,6 +719,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
     });
 
     proc.on('error', (err: Error) => {
+      this.stopTypingIndicator(agent, userId, chatId);
       agent.tgBot.sendText(chatId, `<i>CC error: ${escapeHtml(String(err.message))}</i>`, 'HTML');
     });
 
@@ -714,15 +765,11 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
     // On message_start: always create new message on new CC turn for deterministic behavior
     if (event.type === 'message_start') {
-      // Soft reset: clear buffer but keep tgMessageId so tool indicators
-      // ("Using Bash...") get overwritten by the actual response text.
-      // Only do a full reset (new TG message) when sub-agents were active,
-      // since their results should appear in a separate message.
-      if (tracker.hadSubAgents) {
-        acc.reset();
-      } else {
-        acc.softReset();
-      }
+      // Full reset: each assistant turn gets its own TG message.
+      // This prevents the "rewriting the wrong bubble" problem where a multi-turn
+      // session (tool calls → responses → more tool calls) kept overwriting a single
+      // message positioned between user messages, losing all context.
+      acc.reset();
       // Only reset tracker if no agents still dispatched
       if (!tracker.hasDispatchedAgents) {
         tracker.reset();
@@ -752,7 +799,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
         });
       }
       acc.finalize();
-      // Don't delete — next turn will softReset via message_start and edit the same message
+      // Don't delete — next turn will reset via message_start and create a new message
     }
 
     // Update session store with cost

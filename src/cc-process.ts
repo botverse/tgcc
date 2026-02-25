@@ -286,11 +286,37 @@ export class CCProcess extends EventEmitter {
         if (event.message?.content) {
           for (const block of event.message.content) {
             if (block.type === 'tool_result' && block.tool_use_id) {
-              const resultText = typeof block.content === 'string'
-                ? block.content
-                : Array.isArray(block.content)
-                  ? block.content.map((c: { text?: string }) => c.text ?? '').join('\n')
-                  : JSON.stringify(block.content);
+              // Extract text and images from rich tool_result content
+              const contentBlocks = Array.isArray(block.content) ? block.content : [];
+              const imageBlocks: Array<{ media_type: string; data: string }> = [];
+              let resultText: string;
+
+              if (typeof block.content === 'string') {
+                resultText = block.content;
+              } else if (Array.isArray(block.content)) {
+                const textParts: string[] = [];
+                for (const c of block.content) {
+                  if (c.type === 'text' && c.text) {
+                    textParts.push(c.text);
+                  } else if (c.type === 'image' && c.source?.type === 'base64' && c.source.data) {
+                    this.emit('media', {
+                      kind: 'image' as const,
+                      media_type: c.source.media_type ?? 'image/png',
+                      data: c.source.data,
+                    });
+                  } else if (c.type === 'document' && c.source?.type === 'base64' && c.source.data) {
+                    this.emit('media', {
+                      kind: 'document' as const,
+                      media_type: c.source.media_type ?? 'application/pdf',
+                      data: c.source.data,
+                    });
+                  }
+                }
+                resultText = textParts.join('\n');
+              } else {
+                resultText = JSON.stringify(block.content);
+              }
+
               this.emit('tool_result', {
                 type: 'tool_result' as const,
                 tool_use_id: block.tool_use_id,

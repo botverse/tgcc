@@ -445,6 +445,13 @@ export class TelegramBot {
     });
   }
 
+  async sendDocumentBuffer(chatId: number | string, buffer: Buffer, filename: string, caption?: string): Promise<number> {
+    const msg = await this.bot.api.sendDocument(Number(chatId), new InputFile(buffer, filename), {
+      caption,
+    });
+    return msg.message_id;
+  }
+
   async sendImage(chatId: number | string, filePath: string, caption?: string): Promise<void> {
     await this.bot.api.sendPhoto(Number(chatId), new InputFile(filePath), {
       caption,
