@@ -20,7 +20,7 @@ TGCC bridges the [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-cod
 
 - **Streaming** — responses stream into a single message that updates in place
 - **Sessions** — resume, switch, and list sessions. Roam between Telegram and the CC CLI on the same session
-- **Multi-project** — switch repos on the fly with `/repo`, one bot handles all your projects
+- **Multi-project** — switch repos on the fly with `/repo`, or run dedicated bots per project
 - **Permission relay** — CC permission prompts appear as inline buttons
 - **MCP tools** — CC can send files, images, and voice back via built-in MCP server
 - **Markdown → Telegram HTML** — code blocks, bold, italic, links, tables, all rendered properly
@@ -83,6 +83,39 @@ tgcc permissions set mybot dangerously-skip
 | `/status` | Process state, model, repo, cost |
 | `/cancel` | Abort current CC turn |
 | `/catchup` | Summarize external CC activity |
+
+## Project Setup
+
+TGCC supports two approaches — use one or both:
+
+### Single bot, multiple repos (recommended)
+
+One bot switches between projects on the fly:
+
+```bash
+tgcc repo add ~/code/frontend --name=frontend
+tgcc repo add ~/code/backend --name=backend
+tgcc repo assign --agent=mybot --name=frontend   # set default
+```
+
+In Telegram, use `/repo` to switch. If no repo is selected, TGCC warns that CC will run in `~`.
+
+### Dedicated bot per project
+
+Create a separate Telegram bot (via [@BotFather](https://t.me/BotFather)) for each project:
+
+```bash
+tgcc agent add frontend-bot --bot-token <token1>
+tgcc agent add backend-bot --bot-token <token2>
+
+tgcc repo add ~/code/frontend --name=frontend
+tgcc repo add ~/code/backend --name=backend
+
+tgcc repo assign --agent=frontend-bot --name=frontend
+tgcc repo assign --agent=backend-bot --name=backend
+```
+
+Each bot starts CC in its assigned repo by default. Users can still `/repo` switch if needed.
 
 ## Configuration
 
