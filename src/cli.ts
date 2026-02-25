@@ -460,24 +460,7 @@ function cmdRepoList(): void {
 }
 
 function cmdRepoAdd(args: string[]): void {
-  // Parse --name=... flag
-  let explicitName: string | undefined;
-  const positional: string[] = [];
-  for (const arg of args) {
-    if (arg.startsWith('--name=')) {
-      explicitName = arg.slice(7);
-    } else if (arg === '--name') {
-      // handled as next arg below
-    } else {
-      positional.push(arg);
-    }
-  }
-  // Handle --name <value> (two separate args)
-  for (let i = 0; i < args.length; i++) {
-    if (args[i] === '--name' && args[i + 1] && !args[i + 1].startsWith('-')) {
-      explicitName = args[i + 1];
-    }
-  }
+  const { flags, positional } = parseFlags(args);
 
   let name: string;
   let repoPath: string;
@@ -485,7 +468,7 @@ function cmdRepoAdd(args: string[]): void {
   if (positional.length === 1) {
     // tgcc repo add <path-or-.> [--name=...]
     repoPath = resolve(positional[0]);
-    name = explicitName || repoPath.split('/').pop() || 'default';
+    name = flags.name || repoPath.split('/').pop() || 'default';
   } else if (positional.length >= 2) {
     // tgcc repo add <name> <path> (original syntax)
     name = positional[0];
@@ -523,10 +506,31 @@ function cmdRepoAdd(args: string[]): void {
   console.log(`Repo "${name}" added → ${absPath}`);
 }
 
+/** Parse --key=value and --key value flags from args, returning { flags, positional } */
+function parseFlags(args: string[]): { flags: Record<string, string>; positional: string[] } {
+  const flags: Record<string, string> = {};
+  const positional: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i].startsWith('--') && args[i].includes('=')) {
+      const [key, ...rest] = args[i].slice(2).split('=');
+      flags[key] = rest.join('=');
+    } else if (args[i].startsWith('--') && i + 1 < args.length && !args[i + 1].startsWith('-')) {
+      flags[args[i].slice(2)] = args[i + 1];
+      i++;
+    } else {
+      positional.push(args[i]);
+    }
+  }
+  return { flags, positional };
+}
+
 function cmdRepoRemove(args: string[]): void {
-  const name = args[0];
+  const { flags, positional } = parseFlags(args);
+  const name = flags.name || positional[0];
+
   if (!name) {
     console.error('Usage: tgcc repo remove <name>');
+    console.error('       tgcc repo remove --name=<name>');
     process.exit(1);
   }
 
@@ -539,7 +543,7 @@ function cmdRepoRemove(args: string[]): void {
 
   const owner = findRepoOwner(raw, name);
   if (owner) {
-    console.error(`Can't remove: repo "${name}" is assigned to agent "${owner}". Use "tgcc repo clear ${owner}" first.`);
+    console.error(`Can't remove: repo "${name}" is assigned to agent "${owner}". Use "tgcc repo clear --agent=${owner}" first.`);
     process.exit(1);
   }
 
@@ -553,11 +557,13 @@ function cmdRepoRemove(args: string[]): void {
 }
 
 function cmdRepoAssign(args: string[]): void {
-  const agentName = args[0];
-  const repoName = args[1];
+  const { flags, positional } = parseFlags(args);
+  const agentName = flags.agent || positional[0];
+  const repoName = flags.name || positional[1];
 
   if (!agentName || !repoName) {
-    console.error('Usage: tgcc repo assign <agent> <name>');
+    console.error('Usage: tgcc repo assign --agent=<agent> --name=<repo>');
+    console.error('       tgcc repo assign <agent> <repo>');
     process.exit(1);
   }
 
@@ -595,9 +601,12 @@ function cmdRepoAssign(args: string[]): void {
 }
 
 function cmdRepoClear(args: string[]): void {
-  const agentName = args[0];
+  const { flags, positional } = parseFlags(args);
+  const agentName = flags.agent || positional[0];
+
   if (!agentName) {
-    console.error('Usage: tgcc repo clear <agent>');
+    console.error('Usage: tgcc repo clear --agent=<agent>');
+    console.error('       tgcc repo clear <agent>');
     process.exit(1);
   }
 
