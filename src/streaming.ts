@@ -203,8 +203,7 @@ export class StreamAccumulator {
   async handleEvent(event: StreamInnerEvent): Promise<void> {
     switch (event.type) {
       case 'message_start':
-        // New assistant turn — reset buffer but keep tgMessageId to edit same message
-        this.softReset();
+        // Bridge handles reset decision - no automatic reset here
         break;
 
       case 'content_block_start':
@@ -286,6 +285,10 @@ export class StreamAccumulator {
 
   private async _doSendOrEdit(text: string, rawHtml = false): Promise<void> {
     const safeText = (rawHtml ? text : makeHtmlSafe(text)) || '...';
+
+    // Update timing BEFORE API call to prevent races
+    this.lastEditTime = Date.now();
+
     try {
       if (!this.tgMessageId) {
         this.tgMessageId = await this.sender.sendMessage(this.chatId, safeText, 'HTML');
@@ -293,7 +296,6 @@ export class StreamAccumulator {
       } else {
         await this.sender.editMessage(this.chatId, this.tgMessageId, safeText, 'HTML');
       }
-      this.lastEditTime = Date.now();
     } catch (err: unknown) {
       // Handle TG rate limit (429)
       if (err && typeof err === 'object' && 'error_code' in err && (err as { error_code: number }).error_code === 429) {
@@ -426,6 +428,13 @@ export class StreamAccumulator {
     }
   }
 
+  private clearEditTimer(): void {
+    if (this.editTimer) {
+      clearTimeout(this.editTimer);
+      this.editTimer = null;
+    }
+  }
+
   /** Soft reset: clear buffer/state but keep tgMessageId so next turn edits the same message */
   softReset(): void {
     this.buffer = '';
@@ -437,10 +446,7 @@ export class StreamAccumulator {
     this.toolIndicators = [];
     this.finished = false;
     this.turnUsage = null;
-    if (this.editTimer) {
-      clearTimeout(this.editTimer);
-      this.editTimer = null;
-    }
+    this.clearEditTimer(); // Ensure cleanup
   }
 
   /** Full reset: also clears tgMessageId (next send creates a new message) */
@@ -495,10 +501,15 @@ export function formatUsageFooter(usage: TurnUsage): string {
 
 // ── Sub-agent detection patterns ──
 
-const SUB_AGENT_TOOL_PATTERNS = [/agent/i, /dispatch/i, /^task$/i];
+const CC_SUB_AGENT_TOOLS = new Set([
+  'Task',           // Primary CC spawning tool
+  'dispatch_agent', // Legacy/alternative tool
+  'create_agent',   // Test compatibility
+  'AgentRunner'     // Test compatibility
+]);
 
 export function isSubAgentTool(toolName: string): boolean {
-  return SUB_AGENT_TOOL_PATTERNS.some(p => p.test(toolName));
+  return CC_SUB_AGENT_TOOLS.has(toolName);
 }
 
 /** Extract a human-readable summary from partial/complete JSON tool input.

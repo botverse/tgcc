@@ -444,7 +444,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
     }
 
     // Generate MCP config
-    const mcpServerPath = join(import.meta.dirname ?? '.', 'mcp-server.ts');
+    const mcpServerPath = resolveMcpServerPath();
     const mcpConfigPath = generateMcpConfig(
       agentId,
       userId,
@@ -493,17 +493,12 @@ export class Bridge extends EventEmitter implements CtlHandler {
       const resultText = typeof event.content === 'string' ? event.content : JSON.stringify(event.content);
       const meta = event.tool_use_result;
 
-      // Also detect spawn from text (fallback when tool_use_result is missing)
-      const isSpawnText = !meta && /agent_id:\s*\S+@\S+/.test(resultText);
-      const textMeta = isSpawnText ? {
-        status: 'teammate_spawned' as const,
-        team_name: resultText.match(/team_name:\s*(\S+)/)?.[1],
-        name: resultText.match(/^name:\s*(\S+)/m)?.[1],
-        agent_type: undefined as string | undefined,
-        color: undefined as string | undefined,
-      } : undefined;
+      // Log warning if structured metadata is missing
+      if (!meta && /agent_id:\s*\S+@\S+/.test(resultText)) {
+        this.logger.warn({ agentId, toolUseId: event.tool_use_id }, 'Spawn detected in text but no structured tool_use_result metadata - skipping');
+      }
 
-      const spawnMeta = meta?.status === 'teammate_spawned' ? meta : textMeta;
+      const spawnMeta = meta?.status === 'teammate_spawned' ? meta : undefined;
 
       if (spawnMeta?.status === 'teammate_spawned' && spawnMeta.team_name) {
         if (!tracker.currentTeamName) {
@@ -671,13 +666,11 @@ export class Bridge extends EventEmitter implements CtlHandler {
       agent.subAgentTrackers.set(accKey, tracker);
     }
 
-    // On message_start: if sub-agents were active, reset accumulator so conclusions
-    // stream to a NEW message instead of editing the original pre-sub-agent message.
+    // On message_start: always create new message on new CC turn for deterministic behavior
     if (event.type === 'message_start') {
-      if (tracker.hadSubAgents) {
-        acc.reset(); // Full reset — next text creates a fresh TG message
-      }
-      // Only reset tracker if no agents are still waiting for mailbox results
+      // Always create new message on new CC turn
+      acc.reset();
+      // Only reset tracker if no agents still dispatched
       if (!tracker.hasDispatchedAgents) {
         tracker.reset();
       }
@@ -1421,3 +1414,18 @@ function formatAge(date: Date): string {
   const days = Math.floor(hours / 24);
   return `${days}d ago`;
 }
+
+/** Environment-aware MCP server path resolution */
+function resolveMcpServerPath(): string {
+  const baseDir = import.meta.dirname ?? '.';
+
+  // Check for compiled JS first (production/tsx runtime)
+  const jsPath = join(baseDir, 'mcp-server.js');
+  if (existsSync(jsPath)) {
+    return jsPath;
+  }
+
+  // Fallback to TS source (development)
+  return join(baseDir, 'mcp-server.ts');
+}
+
