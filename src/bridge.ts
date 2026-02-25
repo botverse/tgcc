@@ -418,6 +418,17 @@ export class Bridge extends EventEmitter implements CtlHandler {
     }
 
     if (!proc || proc.state === 'idle') {
+      // Warn if no repo is configured — CC would run in ~ which is likely not intended
+      const userState2 = this.sessionStore.getUser(agentId, userId);
+      const resolvedRepo = userState2.repo || resolveUserConfig(agent.config, userId).repo;
+      if (resolvedRepo === homedir()) {
+        agent.tgBot.sendText(
+          chatId,
+          '<blockquote>⚠️ No project selected. Use /repo to pick one, or CC will run in your home directory.</blockquote>',
+          'HTML',
+        );
+      }
+
       // Save first message text as pending session title
       if (data.text) {
         agent.pendingTitles.set(userId, data.text);
