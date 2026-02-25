@@ -344,7 +344,12 @@ export class Bridge extends EventEmitter implements CtlHandler {
     }
 
     // Staleness check: detect if session was modified by another client
-    if (proc && proc.state !== 'idle') {
+    // Skip if background sub-agents are running — their results grow the JSONL
+    // and would cause false-positive staleness detection
+    const accKey2 = `${userId}:${chatId}`;
+    const activeTracker = agent.subAgentTrackers.get(accKey2);
+    const hasBackgroundAgents = activeTracker?.hasDispatchedAgents ?? false;
+    if (proc && proc.state !== 'idle' && !hasBackgroundAgents) {
       const staleInfo = this.checkSessionStaleness(agentId, userId);
       if (staleInfo) {
         this.logger.info({ agentId, userId }, 'Session stale — killing process for reconnect');
@@ -439,7 +444,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
     }
 
     // Generate MCP config
-    const mcpServerPath = join(import.meta.dirname ?? '.', 'mcp-server.js');
+    const mcpServerPath = join(import.meta.dirname ?? '.', 'mcp-server.ts');
     const mcpConfigPath = generateMcpConfig(
       agentId,
       userId,

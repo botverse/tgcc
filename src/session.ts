@@ -318,6 +318,10 @@ export function summarizeJsonlDelta(jsonlPath: string, fromByteOffset: number, m
   return formatStaleSummary(meaningful, maxChars);
 }
 
+function escapeHtmlBasic(text: string): string {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
 function formatStaleSummary(turns: JsonlTurn[], maxChars: number): string {
   const turnCount = turns.filter(t => t.role === 'assistant').length;
   const header = `ℹ️ <b>Session was updated from another client</b> (${turnCount} CC turn${turnCount !== 1 ? 's' : ''} since your last message here):\n\n`;
@@ -326,15 +330,15 @@ function formatStaleSummary(turns: JsonlTurn[], maxChars: number): string {
   // Build from newest to oldest so we can truncate old ones
   for (const turn of turns) {
     if (turn.role === 'user') {
-      const preview = truncateText(turn.text ?? '', 80);
+      const preview = escapeHtmlBasic(truncateText(turn.text ?? '', 80));
       lines.push(`• <b>You:</b> "${preview}"`);
     } else {
       const parts: string[] = [];
       if (turn.tools && turn.tools.length > 0) {
-        parts.push(`Used ${turn.tools.join(', ')}`);
+        parts.push(`Used ${turn.tools.map(t => escapeHtmlBasic(t)).join(', ')}`);
       }
       if (turn.text) {
-        const preview = truncateText(turn.text, 120);
+        const preview = escapeHtmlBasic(truncateText(turn.text, 120));
         parts.push(`"${preview}"`);
       }
       lines.push(`• <b>CC:</b> ${parts.join(' — ') || '(no text)'}`);

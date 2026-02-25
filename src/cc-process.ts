@@ -79,7 +79,7 @@ export function generateMcpConfig(
     mcpServers: {
       tgcc: {
         command: 'node',
-        args: [mcpServerPath],
+        args: ['--import', 'tsx/esm', mcpServerPath],
         env: {
           TGCC_AGENT_ID: agentId,
           TGCC_USER_ID: userId,
