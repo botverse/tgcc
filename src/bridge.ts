@@ -833,21 +833,22 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
         sessions.forEach((s, i) => {
           const rawTitle = s.title || s.id.slice(0, 8);
-          const displayTitle = s.title ? `"${escapeHtml(s.title)}"` : `<code>${escapeHtml(s.id.slice(0, 8))}</code>`;
+          const displayTitle = s.title ? escapeHtml(s.title) : `<code>${escapeHtml(s.id.slice(0, 8))}</code>`;
           const age = formatAge(new Date(s.lastActivity));
           const isCurrent = s.id === currentSessionId;
-          lines.push(`${i + 1}. ${displayTitle} — ${s.messageCount} msgs, $${s.totalCostUsd.toFixed(2)} (${age})${isCurrent ? ' ✓' : ''}`);
+          const current = isCurrent ? ' ✓' : '';
+          lines.push(`<b>${i + 1}.</b> ${displayTitle}${current}\n    ${s.messageCount} msgs · $${s.totalCostUsd.toFixed(2)} · ${age}`);
 
-          // Button label: truncated title so user knows which session
-          const btnLabel = rawTitle.length > 20 ? rawTitle.slice(0, 18) + '…' : rawTitle;
+          // Button: full title (TG allows up to ~40 chars visible), no ellipsis
           if (!isCurrent) {
-            keyboard.text(`▶️ ${i + 1}. ${btnLabel}`, `resume:${s.id}`).row();
+            const btnLabel = rawTitle.length > 35 ? rawTitle.slice(0, 35) : rawTitle;
+            keyboard.text(`${i + 1}. ${btnLabel}`, `resume:${s.id}`).row();
           }
         });
 
         await agent.tgBot.sendTextWithKeyboard(
           cmd.chatId,
-          `📋 <b>Recent sessions:</b>\n\n${lines.join('\n')}`,
+          `📋 <b>Sessions</b>\n\n${lines.join('\n\n')}`,
           keyboard,
           'HTML',
         );
