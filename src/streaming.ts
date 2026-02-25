@@ -8,6 +8,7 @@ import type {
   StreamInputJsonDelta,
   StreamTextDelta,
 } from './cc-protocol.js';
+import { markdownToTelegramHtml } from './telegram-html.js';
 
 // ── Types ──
 
@@ -43,109 +44,11 @@ export function escapeHtml(text: string): string {
 }
 
 /**
- * Convert markdown-ish text to Telegram-safe HTML.
- * Handles code blocks, inline code, bold, italic, strikethrough, links.
- * Falls back to HTML-escaped plain text for anything it can't convert.
+ * Convert markdown text to Telegram-safe HTML using the marked library.
+ * Replaces the old hand-rolled implementation with a proper markdown parser.
  */
-/**
- * Convert a markdown table into Telegram-friendly list format.
- * Tables use `<b>col1</b> — col2 — col3` per data row.
- */
-function convertMarkdownTable(tableBlock: string): string {
-  const lines = tableBlock.split('\n').filter(l => l.trim().length > 0);
-  if (lines.length < 2) return tableBlock;
-
-  const parseRow = (line: string): string[] =>
-    line.replace(/^\|/, '').replace(/\|$/, '').split('|').map(c => c.trim());
-
-  // Detect separator row (e.g. |---|---|)
-  const isSeparator = (line: string) => /^\|?\s*[-:]+\s*(\|\s*[-:]+\s*)+\|?\s*$/.test(line);
-
-  let headerRow: string[] | null = null;
-  const dataRows: string[][] = [];
-
-  let i = 0;
-  // First non-separator row is header if followed by separator
-  if (i < lines.length && !isSeparator(lines[i])) {
-    if (i + 1 < lines.length && isSeparator(lines[i + 1])) {
-      headerRow = parseRow(lines[i]);
-      i += 2; // skip header + separator
-    }
-  }
-
-  for (; i < lines.length; i++) {
-    if (!isSeparator(lines[i])) {
-      dataRows.push(parseRow(lines[i]));
-    }
-  }
-
-  if (dataRows.length === 0) return tableBlock;
-
-  return dataRows.map(cols => {
-    if (cols.length === 0) return '';
-    const first = `<b>${escapeHtml(cols[0])}</b>`;
-    const rest = cols.slice(1).map(c => escapeHtml(c));
-    return rest.length > 0 ? `${first} — ${rest.join(' — ')}` : first;
-  }).join('\n');
-}
-
 export function markdownToHtml(text: string): string {
-  // First, extract code blocks to protect them from other conversions
-  const codeBlocks: string[] = [];
-  let result = text.replace(/```(\w*)\n?([\s\S]*?)```/g, (_match, lang, code) => {
-    const idx = codeBlocks.length;
-    const langAttr = lang ? ` class="language-${escapeHtml(lang)}"` : '';
-    codeBlocks.push(`<pre><code${langAttr}>${escapeHtml(code.replace(/\n$/, ''))}</code></pre>`);
-    return `\x00CODEBLOCK${idx}\x00`;
-  });
-
-  // Convert markdown tables before HTML escaping (tables contain | which is safe)
-  const tableBlocks: string[] = [];
-  result = result.replace(
-    /(?:^|\n)((?:\|[^\n]+\|\s*\n?){2,})/g,
-    (_match, table, offset) => {
-      // Only treat as table if it has a separator row
-      if (/^\|?\s*[-:]+\s*(\|\s*[-:]+\s*)+\|?\s*$/m.test(table)) {
-        const idx = tableBlocks.length;
-        tableBlocks.push(convertMarkdownTable(table.trim()));
-        return `\n\x00TABLE${idx}\x00`;
-      }
-      return _match;
-    },
-  );
-
-  // Extract inline code
-  const inlineCodes: string[] = [];
-  result = result.replace(/`([^`\n]+)`/g, (_match, code) => {
-    const idx = inlineCodes.length;
-    inlineCodes.push(`<code>${escapeHtml(code)}</code>`);
-    return `\x00INLINE${idx}\x00`;
-  });
-
-  // Escape HTML in remaining text
-  result = escapeHtml(result);
-
-  // Convert markdown formatting
-  // Bold: **text** or __text__
-  result = result.replace(/\*\*(.+?)\*\*/g, '<b>$1</b>');
-  result = result.replace(/__(.+?)__/g, '<b>$1</b>');
-
-  // Italic: *text* or _text_ (but not inside words for underscore)
-  result = result.replace(/(?<!\w)\*([^*\n]+?)\*(?!\w)/g, '<i>$1</i>');
-  result = result.replace(/(?<!\w)_([^_\n]+?)_(?!\w)/g, '<i>$1</i>');
-
-  // Strikethrough: ~~text~~
-  result = result.replace(/~~(.+?)~~/g, '<s>$1</s>');
-
-  // Links: [text](url)
-  result = result.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>');
-
-  // Restore code blocks, inline code, and tables
-  result = result.replace(/\x00CODEBLOCK(\d+)\x00/g, (_match, idx) => codeBlocks[Number(idx)]);
-  result = result.replace(/\x00INLINE(\d+)\x00/g, (_match, idx) => inlineCodes[Number(idx)]);
-  result = result.replace(/\x00TABLE(\d+)\x00/g, (_match, idx) => tableBlocks[Number(idx)]);
-
-  return result;
+  return markdownToTelegramHtml(text);
 }
 
 /**

@@ -76,6 +76,7 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.26.0",
     "grammy": "^1.40.0",
+    "marked": "^17.0.3",
     "pino": "^10.3.1",
     "uuid": "^13.0.0",
     "zod": "^4.3.6"
