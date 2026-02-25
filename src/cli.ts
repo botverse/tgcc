@@ -815,13 +815,16 @@ async function cmdInit(): Promise<void> {
 
 // ── Start / Service commands ──
 
-async function cmdStart(): Promise<void> {
+async function ensureConfig(): Promise<void> {
   const configPath = join(homedir(), '.tgcc', 'config.json');
   if (!existsSync(configPath)) {
-    console.error(`Config not found: ${configPath}`);
-    console.error('Run: tgcc init');
-    process.exit(1);
+    console.log('No config found. Let\'s set one up.\n');
+    await cmdInit();
   }
+}
+
+async function cmdStart(): Promise<void> {
+  await ensureConfig();
   const { main: serviceMain } = await import('./service.js');
   await serviceMain();
 }
@@ -884,7 +887,8 @@ function findTgccBin(): string {
   }
 }
 
-function cmdInstall(): void {
+async function cmdInstall(): Promise<void> {
+  await ensureConfig();
   const platform = detectPlatform();
   const tgccBin = findTgccBin();
 
@@ -1042,7 +1046,7 @@ async function main(): Promise<void> {
       break;
 
     case 'install':
-      cmdInstall();
+      await cmdInstall();
       break;
 
     case 'uninstall':
