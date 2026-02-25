@@ -460,11 +460,39 @@ function cmdRepoList(): void {
 }
 
 function cmdRepoAdd(args: string[]): void {
-  const name = args[0];
-  const repoPath = args[1];
+  // Parse --name=... flag
+  let explicitName: string | undefined;
+  const positional: string[] = [];
+  for (const arg of args) {
+    if (arg.startsWith('--name=')) {
+      explicitName = arg.slice(7);
+    } else if (arg === '--name') {
+      // handled as next arg below
+    } else {
+      positional.push(arg);
+    }
+  }
+  // Handle --name <value> (two separate args)
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--name' && args[i + 1] && !args[i + 1].startsWith('-')) {
+      explicitName = args[i + 1];
+    }
+  }
 
-  if (!name || !repoPath) {
-    console.error('Usage: tgcc repo add <name> <path>');
+  let name: string;
+  let repoPath: string;
+
+  if (positional.length === 1) {
+    // tgcc repo add <path-or-.> [--name=...]
+    repoPath = resolve(positional[0]);
+    name = explicitName || repoPath.split('/').pop() || 'default';
+  } else if (positional.length >= 2) {
+    // tgcc repo add <name> <path> (original syntax)
+    name = positional[0];
+    repoPath = positional[1];
+  } else {
+    console.error('Usage: tgcc repo add <path> [--name=<name>]');
+    console.error('       tgcc repo add <name> <path>');
     process.exit(1);
   }
 
