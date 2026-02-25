@@ -271,7 +271,7 @@ export class StreamAccumulator {
       const thinkingPreview = this.thinkingBuffer.length > 1024
         ? this.thinkingBuffer.slice(0, 1024) + '…'
         : this.thinkingBuffer;
-      text += `<blockquote expandable>💭 Thinking\n${escapeHtml(thinkingPreview)}</blockquote>\n`;
+      text += `<blockquote expandable>💭 Thinking\n${markdownToTelegramHtml(thinkingPreview)}</blockquote>\n`;
     }
     // Convert markdown buffer to HTML-safe text
     text += makeHtmlSafe(this.buffer);
@@ -358,7 +358,7 @@ export class StreamAccumulator {
         ? this.thinkingBuffer.slice(0, 1024) + '…'
         : this.thinkingBuffer;
       await this.sendOrEdit(
-        `<blockquote expandable>💭 Thinking\n${escapeHtml(thinkingPreview)}</blockquote>`,
+        `<blockquote expandable>💭 Thinking\n${markdownToTelegramHtml(thinkingPreview)}</blockquote>`,
         true,
       );
     }
