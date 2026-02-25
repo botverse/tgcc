@@ -104,9 +104,14 @@ class TelegramRenderer extends Renderer {
     return token.text || '[image]';
   }
 
-  text(token: { text: string } | string): string {
-    const t = typeof token === 'string' ? token : token.text;
-    return esc(t);
+  text(token: { text: string; tokens?: any[] } | string): string {
+    if (typeof token === 'string') return esc(token);
+    // If the token has inline sub-tokens (e.g. bold/italic inside list items),
+    // let the parser process them instead of returning the raw text.
+    if (token.tokens?.length) {
+      return this.parser!.parseInline(token.tokens);
+    }
+    return esc(token.text);
   }
 
   br(): string {
