@@ -689,7 +689,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
     proc.on('hang', () => {
       this.stopTypingIndicator(agent, userId, chatId);
-      agent.tgBot.sendText(chatId, '<i>CC session paused. Send a message to continue.</i>', 'HTML');
+      agent.tgBot.sendText(chatId, '<blockquote>⏸ Session paused. Send a message to continue.</blockquote>', 'HTML');
     });
 
     proc.on('takeover', () => {
@@ -720,7 +720,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
     proc.on('error', (err: Error) => {
       this.stopTypingIndicator(agent, userId, chatId);
-      agent.tgBot.sendText(chatId, `<i>CC error: ${escapeHtml(String(err.message))}</i>`, 'HTML');
+      agent.tgBot.sendText(chatId, `<blockquote>⚠️ ${escapeHtml(String(err.message))}</blockquote>`, 'HTML');
     });
 
     return proc;
@@ -813,7 +813,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
     // Handle errors
     if (event.is_error && event.result) {
-      agent.tgBot.sendText(chatId, `<i>Error: ${escapeHtml(String(event.result))}</i>`, 'HTML');
+      agent.tgBot.sendText(chatId, `<blockquote>⚠️ ${escapeHtml(String(event.result))}</blockquote>`, 'HTML');
     }
 
     // If background sub-agents are still running, mailbox watcher handles them.
