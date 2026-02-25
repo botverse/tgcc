@@ -20,7 +20,7 @@ TGCC bridges the [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-cod
 
 - **Streaming** — responses stream into a single message that updates in place
 - **Sessions** — resume, switch, and list sessions. Roam between Telegram and the CC CLI on the same session
-- **Multi-agent** — one bot per project, each with its own config and permissions
+- **Multi-project** — switch repos on the fly with `/repo`, one bot handles all your projects
 - **Permission relay** — CC permission prompts appear as inline buttons
 - **MCP tools** — CC can send files, images, and voice back via built-in MCP server
 - **Markdown → Telegram HTML** — code blocks, bold, italic, links, tables, all rendered properly
