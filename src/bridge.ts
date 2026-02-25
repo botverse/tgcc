@@ -835,15 +835,17 @@ export class Bridge extends EventEmitter implements CtlHandler {
         const keyboard = new InlineKeyboard();
 
         sessions.forEach((s, i) => {
-          const title = s.title ? `"${escapeHtml(s.title)}"` : `<code>${escapeHtml(s.id.slice(0, 8))}</code>`;
+          const rawTitle = s.title || s.id.slice(0, 8);
+          const displayTitle = s.title ? `"${escapeHtml(s.title)}"` : `<code>${escapeHtml(s.id.slice(0, 8))}</code>`;
           const age = formatAge(new Date(s.lastActivity));
           const isCurrent = s.id === currentSessionId;
-          lines.push(`${i + 1}. ${title} — ${s.messageCount} msgs, $${s.totalCostUsd.toFixed(2)} (${age})${isCurrent ? ' ✓' : ''}`);
+          lines.push(`${i + 1}. ${displayTitle} — ${s.messageCount} msgs, $${s.totalCostUsd.toFixed(2)} (${age})${isCurrent ? ' ✓' : ''}`);
 
+          // Button label: truncated title so user knows which session
+          const btnLabel = rawTitle.length > 20 ? rawTitle.slice(0, 18) + '…' : rawTitle;
           if (!isCurrent) {
-            keyboard.text('Resume', `resume:${s.id}`);
+            keyboard.text(`▶️ ${i + 1}. ${btnLabel}`, `resume:${s.id}`).row();
           }
-          keyboard.text('Delete', `delete:${s.id}`).row();
         });
 
         await agent.tgBot.sendTextWithKeyboard(
