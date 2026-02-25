@@ -8,7 +8,7 @@ import type {
   StreamInputJsonDelta,
   StreamTextDelta,
 } from './cc-protocol.js';
-import { markdownToTelegramHtml } from './telegram-html.js';
+import { markdownToTelegramHtml } from './telegram-html-remark.js';
 
 // ── Types ──
 
