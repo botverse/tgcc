@@ -352,11 +352,11 @@ export class Bridge extends EventEmitter implements CtlHandler {
     if (proc && proc.state !== 'idle' && !hasBackgroundAgents) {
       const staleInfo = this.checkSessionStaleness(agentId, userId);
       if (staleInfo) {
-        this.logger.info({ agentId, userId }, 'Session stale — killing process for reconnect');
+        // Session was modified externally — silently reconnect for roaming support
+        this.logger.info({ agentId, userId }, 'Session modified externally — reconnecting for roaming');
         proc.destroy();
         agent.processes.delete(userId);
         proc = undefined;
-        agent.tgBot.sendText(chatId, staleInfo.summary, 'HTML');
       }
     }
 
@@ -596,14 +596,11 @@ export class Bridge extends EventEmitter implements CtlHandler {
     });
 
     proc.on('takeover', () => {
-      this.logger.warn({ agentId, userId }, 'Session takeover detected');
-      // Clear session so next message starts fresh instead of --resume
-      this.sessionStore.clearSession(agentId, userId);
-      agent.tgBot.sendText(
-        chatId,
-        '<i>Session was picked up by another client. Next message will start a fresh session.</i>',
-        'HTML',
-      );
+      this.logger.warn({ agentId, userId }, 'Session takeover detected — keeping session for roaming');
+      // Don't clear session — allow roaming between clients.
+      // Just kill the current process; next message will --resume the same session.
+      proc.destroy();
+      agent.processes.delete(userId);
     });
 
     proc.on('exit', () => {
