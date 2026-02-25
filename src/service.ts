@@ -2,7 +2,7 @@ import pino from 'pino';
 import { loadConfig, ensureDirectories, ConfigWatcher, CONFIG_PATH } from './config.js';
 import { Bridge } from './bridge.js';
 
-async function main(): Promise<void> {
+export async function main(): Promise<void> {
   // ── Load config ──
   const configPath = process.env.TGCC_CONFIG ?? CONFIG_PATH;
   let config;

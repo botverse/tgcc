@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 
 import { createConnection, type Socket } from 'node:net';
-import { existsSync, readdirSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, writeFileSync, mkdirSync, unlinkSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { homedir } from 'node:os';
+import { execSync } from 'node:child_process';
 import type { CtlRequest, CtlResponse } from './ctl-server.js';
 import { loadConfig, agentForRepo, CONFIG_PATH, updateConfig, isValidRepoName, findRepoOwner, type TgccConfig } from './config.js';
 
@@ -708,6 +709,158 @@ function cmdPermissions(args: string[]): void {
 
 // ── Main ──
 
+// ── Start / Service commands ──
+
+async function cmdStart(): Promise<void> {
+  // Run the service in the foreground
+  const { main: serviceMain } = await import('./service.js');
+  await serviceMain();
+}
+
+const SYSTEMD_UNIT = `[Unit]
+Description=TGCC — Telegram ↔ Claude Code bridge
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=TGCC_BIN
+Restart=on-failure
+RestartSec=5
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=default.target
+`;
+
+const LAUNCHD_PLIST = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>io.tgcc.service</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>TGCC_BIN</string>
+    <string>start</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>LOG_DIR/tgcc.log</string>
+  <key>StandardErrorPath</key>
+  <string>LOG_DIR/tgcc.err</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>NODE_ENV</key>
+    <string>production</string>
+    <key>PATH</key>
+    <string>PATH_VAL</string>
+  </dict>
+</dict>
+</plist>
+`;
+
+function detectPlatform(): 'linux' | 'mac' {
+  return process.platform === 'darwin' ? 'mac' : 'linux';
+}
+
+function findTgccBin(): string {
+  try {
+    return execSync('which tgcc', { encoding: 'utf-8' }).trim();
+  } catch {
+    return join(dirname(process.argv[1]), 'tgcc');
+  }
+}
+
+function cmdInstall(): void {
+  const platform = detectPlatform();
+  const tgccBin = findTgccBin();
+
+  if (platform === 'mac') {
+    const plistDir = join(homedir(), 'Library', 'LaunchAgents');
+    const plistPath = join(plistDir, 'io.tgcc.service.plist');
+    const logDir = join(homedir(), '.tgcc', 'logs');
+
+    mkdirSync(plistDir, { recursive: true });
+    mkdirSync(logDir, { recursive: true });
+
+    const content = LAUNCHD_PLIST
+      .replace(/TGCC_BIN/g, tgccBin)
+      .replace(/LOG_DIR/g, logDir)
+      .replace(/PATH_VAL/g, process.env.PATH || '/usr/local/bin:/usr/bin:/bin');
+
+    writeFileSync(plistPath, content);
+    console.log(`✅ LaunchAgent installed: ${plistPath}`);
+    console.log(`\nTo start now:  launchctl load ${plistPath}`);
+    console.log(`To stop:       launchctl unload ${plistPath}`);
+    console.log(`Logs:          ${logDir}/tgcc.log`);
+  } else {
+    const unitDir = join(homedir(), '.config', 'systemd', 'user');
+    const unitPath = join(unitDir, 'tgcc.service');
+
+    mkdirSync(unitDir, { recursive: true });
+
+    const content = SYSTEMD_UNIT.replace(/TGCC_BIN/g, `${tgccBin} start`);
+    writeFileSync(unitPath, content);
+
+    console.log(`✅ Systemd user service installed: ${unitPath}`);
+    console.log('\nTo enable & start:');
+    console.log('  systemctl --user daemon-reload');
+    console.log('  systemctl --user enable --now tgcc');
+    console.log('\nTo check status:');
+    console.log('  systemctl --user status tgcc');
+    console.log('\nLogs:');
+    console.log('  journalctl --user -u tgcc -f');
+  }
+}
+
+function cmdUninstall(): void {
+  const platform = detectPlatform();
+
+  if (platform === 'mac') {
+    const plistPath = join(homedir(), 'Library', 'LaunchAgents', 'io.tgcc.service.plist');
+    if (existsSync(plistPath)) {
+      try {
+        execSync(`launchctl unload ${plistPath}`, { stdio: 'ignore' });
+      } catch { /* might not be loaded */ }
+      unlinkSync(plistPath);
+      console.log(`✅ LaunchAgent removed: ${plistPath}`);
+    } else {
+      console.log('No LaunchAgent found. Nothing to uninstall.');
+    }
+  } else {
+    const unitPath = join(homedir(), '.config', 'systemd', 'user', 'tgcc.service');
+    if (existsSync(unitPath)) {
+      try {
+        execSync('systemctl --user disable --now tgcc', { stdio: 'ignore' });
+      } catch { /* might not be active */ }
+      unlinkSync(unitPath);
+      execSync('systemctl --user daemon-reload', { stdio: 'ignore' });
+      console.log(`✅ Systemd user service removed: ${unitPath}`);
+    } else {
+      console.log('No systemd user service found. Nothing to uninstall.');
+    }
+  }
+}
+
+function cmdLogs(): void {
+  const platform = detectPlatform();
+
+  if (platform === 'mac') {
+    const logPath = join(homedir(), '.tgcc', 'logs', 'tgcc.log');
+    if (existsSync(logPath)) {
+      execSync(`tail -f ${logPath}`, { stdio: 'inherit' });
+    } else {
+      console.error(`No log file found at ${logPath}`);
+      process.exit(1);
+    }
+  } else {
+    execSync('journalctl --user -u tgcc -f --no-pager', { stdio: 'inherit' });
+  }
+}
+
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const command = args[0];
@@ -734,6 +887,23 @@ async function main(): Promise<void> {
       cmdPermissions(args.slice(1));
       break;
 
+    case 'start':
+    case 'run':
+      await cmdStart();
+      break;
+
+    case 'install':
+      cmdInstall();
+      break;
+
+    case 'uninstall':
+      cmdUninstall();
+      break;
+
+    case 'logs':
+      cmdLogs();
+      break;
+
     case 'help':
     case '--help':
     case '-h':
@@ -755,24 +925,16 @@ function printHelp(): void {
   console.log(`tgcc — Telegram ↔ Claude Code CLI
 
 Usage:
-  tgcc message [--agent <name>] [--session <id>] "your message"
-  tgcc status [--agent <name>]
-  tgcc agent add|remove|rename|list|repo
-  tgcc repo [add|remove|assign|clear|list]
-  tgcc permissions [set <agent> <mode>]
-  tgcc help
-
-Commands:
-  message       Send a message to a running agent
-  status        Show running agents and active sessions
-  agent         Manage agent registrations
-  repo          Manage repo registry
-  permissions   View/set agent permission modes
-  help          Show this help message
-
-Options:
-  --agent    Specify agent by name (auto-detected from cwd if omitted)
-  --session  Resume a specific session by ID`);
+  tgcc start                Run the service in the foreground
+  tgcc install              Install as a user service (systemd/launchd)
+  tgcc uninstall            Remove the user service
+  tgcc logs                 Tail the service logs
+  tgcc status [--agent]     Show running agents and active sessions
+  tgcc message [--agent] "text"  Send a message to a running agent
+  tgcc agent <subcommand>   Manage agent registrations
+  tgcc repo <subcommand>    Manage repo registry
+  tgcc permissions          View/set agent permission modes
+  tgcc help                 Show this help message`);
 }
 
 main().catch((err) => {
