@@ -1,6 +1,6 @@
 {
   "name": "@fonz/tgcc",
-  "version": "0.6.6",
+  "version": "0.6.7",
   "description": "Telegram ↔ Claude Code CLI bridge",
   "type": "module",
   "main": "dist/index.js",
