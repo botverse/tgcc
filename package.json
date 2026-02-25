@@ -1,6 +1,6 @@
 {
   "name": "@fonz/tgcc",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Telegram ↔ Claude Code CLI bridge",
   "type": "module",
   "main": "dist/index.js",
@@ -87,5 +87,12 @@
     "tsx": "^4.21.0",
     "typescript": "^5.9.3",
     "vitest": "^4.0.18"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
   }
 }

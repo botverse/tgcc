@@ -38,7 +38,7 @@ class TelegramRenderer extends Renderer {
     return `<blockquote>${body.trim()}</blockquote>\n`;
   }
 
-  list(token: { ordered: boolean; start: number; items: any[] }): string {
+  list(token: { ordered: boolean; start: number | ''; items: any[] }): string {
     let counter = token.start || 1;
     const lines = token.items.map((item) => {
       const text = this.parser!.parse(item.tokens).trim();
@@ -100,7 +100,7 @@ class TelegramRenderer extends Renderer {
     return `<a href="${esc(token.href)}">${text}</a>`;
   }
 
-  image(token: { href: string; text: string; title: string }): string {
+  image(token: { href: string; text: string; title: string | null }): string {
     return token.text || '[image]';
   }
 
