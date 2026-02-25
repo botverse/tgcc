@@ -576,6 +576,7 @@ export class SubAgentTracker {
   private sender: SubAgentSender;
   private agents = new Map<string, SubAgentInfo>();        // toolUseId → info
   private blockToAgent = new Map<number, string>();         // blockIndex → toolUseId
+  private consolidatedAgentMsgId: number | null = null;     // shared TG message for all sub-agents
   private sendQueue: Promise<void> = Promise.resolve();
   private teamName: string | null = null;
   private mailboxPath: string | null = null;
@@ -684,14 +685,7 @@ export class SubAgentTracker {
       info.status = 'dispatched';
       info.dispatchedAt = Date.now();
 
-      const label = info.label || info.toolName;
-      const text = `🤖 ${escapeHtml(label)} — Spawned, waiting for results…`;
-      this.sendQueue = this.sendQueue.then(async () => {
-        try {
-          await this.sender.editMessage(this.chatId, info.tgMessageId!, text, 'HTML');
-        } catch { /* ignore */ }
-      });
-      await this.sendQueue;
+      this.updateConsolidatedAgentMessage();
       return;
     }
 
@@ -744,20 +738,47 @@ export class SubAgentTracker {
     this.agents.set(block.id, info);
     this.blockToAgent.set(event.index, block.id);
 
-    // Send standalone message (no reply_to — cleaner in private chat)
+    // Consolidate all sub-agent indicators into one shared message.
+    // If a consolidated message already exists, reuse it; otherwise create one.
+    if (this.consolidatedAgentMsgId) {
+      info.tgMessageId = this.consolidatedAgentMsgId;
+      this.updateConsolidatedAgentMessage();
+    } else {
+      this.sendQueue = this.sendQueue.then(async () => {
+        try {
+          const msgId = await this.sender.sendMessage(
+            this.chatId,
+            '🤖 Starting sub-agent…',
+            'HTML',
+          );
+          info.tgMessageId = msgId;
+          this.consolidatedAgentMsgId = msgId;
+        } catch {
+          // Silently ignore
+        }
+      });
+      await this.sendQueue;
+    }
+  }
+
+  /** Build and edit the shared sub-agent status message. */
+  private updateConsolidatedAgentMessage(): void {
+    if (!this.consolidatedAgentMsgId) return;
+    const msgId = this.consolidatedAgentMsgId;
+    const lines: string[] = [];
+    for (const info of this.agents.values()) {
+      const label = info.label || info.agentName || info.toolName;
+      const status = info.status === 'completed' ? '✅ Done'
+        : info.status === 'dispatched' ? 'Waiting for results…'
+        : 'Working…';
+      lines.push(`🤖 ${escapeHtml(label)} — ${status}`);
+    }
+    const text = lines.join('\n');
     this.sendQueue = this.sendQueue.then(async () => {
       try {
-        const msgId = await this.sender.sendMessage(
-          this.chatId,
-          '🤖 Starting sub-agent…',
-          'HTML',
-        );
-        info.tgMessageId = msgId;
-      } catch (err) {
-        // Silently ignore — main stream continues regardless
-      }
+        await this.sender.editMessage(this.chatId, msgId, text, 'HTML');
+      } catch { /* ignore */ }
     });
-    await this.sendQueue;
   }
 
   private async onInputDelta(event: StreamInputJsonDelta): Promise<void> {
@@ -790,21 +811,7 @@ export class SubAgentTracker {
       const label = extractAgentLabel(info.inputPreview);
       if (label) {
         info.label = label;
-        // Once we have a label, update the message to show it
-        const displayLabel = info.label;
-        this.sendQueue = this.sendQueue.then(async () => {
-          try {
-            await this.sender.editMessage(
-              this.chatId,
-              info.tgMessageId!,
-              `🤖 ${escapeHtml(displayLabel)} — Working…`,
-              'HTML',
-            );
-          } catch {
-            // Ignore edit failures
-          }
-        });
-        await this.sendQueue;
+        this.updateConsolidatedAgentMessage();
       }
     }
   }
@@ -826,22 +833,7 @@ export class SubAgentTracker {
       if (label) info.label = label;
     }
 
-    const displayLabel = info.label || info.toolName;
-    const text = `🤖 ${escapeHtml(displayLabel)} — Working…`;
-
-    this.sendQueue = this.sendQueue.then(async () => {
-      try {
-        await this.sender.editMessage(
-          this.chatId,
-          info.tgMessageId!,
-          text,
-          'HTML',
-        );
-      } catch {
-        // Ignore edit failures
-      }
-    });
-    await this.sendQueue;
+    this.updateConsolidatedAgentMessage();
 
     // Start elapsed timer — update every 15s to show progress
 
@@ -989,6 +981,7 @@ export class SubAgentTracker {
     }
     this.agents.clear();
     this.blockToAgent.clear();
+    this.consolidatedAgentMsgId = null;
     this.sendQueue = Promise.resolve();
     this.teamName = null;
     this.mailboxPath = null;
