@@ -357,9 +357,11 @@ export class ConfigWatcher extends EventEmitter {
     try {
       const newConfig = loadConfig(this.configPath);
       const diff = diffConfigs(this.currentConfig, newConfig);
+      const reposChanged = JSON.stringify(this.currentConfig.repos) !== JSON.stringify(newConfig.repos);
+      const globalChanged = JSON.stringify(this.currentConfig.global) !== JSON.stringify(newConfig.global);
 
-      if (diff.added.length || diff.removed.length || diff.changed.length) {
-        this.logger.info({ diff }, 'Config changed');
+      if (diff.added.length || diff.removed.length || diff.changed.length || reposChanged || globalChanged) {
+        this.logger.info({ diff, reposChanged, globalChanged }, 'Config changed');
         this.currentConfig = newConfig;
         this.emit('change', newConfig, diff);
       }
