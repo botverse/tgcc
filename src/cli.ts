@@ -792,10 +792,12 @@ function cmdInstall(): void {
       .replace(/PATH_VAL/g, process.env.PATH || '/usr/local/bin:/usr/bin:/bin');
 
     writeFileSync(plistPath, content);
-    console.log(`✅ LaunchAgent installed: ${plistPath}`);
-    console.log(`\nTo start now:  launchctl load ${plistPath}`);
-    console.log(`To stop:       launchctl unload ${plistPath}`);
-    console.log(`Logs:          ${logDir}/tgcc.log`);
+    execSync(`launchctl bootstrap gui/$(id -u) ${plistPath}`, { stdio: 'ignore' });
+    console.log(`✅ Service installed and started.`);
+    console.log(`\n  tgcc stop        Stop the service`);
+    console.log(`  tgcc restart     Restart the service`);
+    console.log(`  tgcc logs        Tail logs`);
+    console.log(`  tgcc uninstall   Remove the service`);
   } else {
     const unitDir = join(homedir(), '.config', 'systemd', 'user');
     const unitPath = join(unitDir, 'tgcc.service');
@@ -804,15 +806,13 @@ function cmdInstall(): void {
 
     const content = SYSTEMD_UNIT.replace(/TGCC_BIN/g, `${tgccBin} start`);
     writeFileSync(unitPath, content);
-
-    console.log(`✅ Systemd user service installed: ${unitPath}`);
-    console.log('\nTo enable & start:');
-    console.log('  systemctl --user daemon-reload');
-    console.log('  systemctl --user enable --now tgcc');
-    console.log('\nTo check status:');
-    console.log('  systemctl --user status tgcc');
-    console.log('\nLogs:');
-    console.log('  journalctl --user -u tgcc -f');
+    execSync('systemctl --user daemon-reload', { stdio: 'ignore' });
+    execSync('systemctl --user enable --now tgcc', { stdio: 'ignore' });
+    console.log(`✅ Service installed and started.`);
+    console.log(`\n  tgcc stop        Stop the service`);
+    console.log(`  tgcc restart     Restart the service`);
+    console.log(`  tgcc logs        Tail logs`);
+    console.log(`  tgcc uninstall   Remove the service`);
   }
 }
 
@@ -842,6 +842,34 @@ function cmdUninstall(): void {
     } else {
       console.log('No systemd user service found. Nothing to uninstall.');
     }
+  }
+}
+
+function cmdServiceCtl(action: 'stop' | 'restart'): void {
+  const platform = detectPlatform();
+
+  if (platform === 'mac') {
+    const plistPath = join(homedir(), 'Library', 'LaunchAgents', 'io.tgcc.service.plist');
+    if (!existsSync(plistPath)) {
+      console.error('Service not installed. Run: tgcc install');
+      process.exit(1);
+    }
+    if (action === 'stop') {
+      execSync(`launchctl bootout gui/$(id -u) ${plistPath}`, { stdio: 'inherit' });
+      console.log('✅ Service stopped.');
+    } else {
+      execSync(`launchctl bootout gui/$(id -u) ${plistPath}`, { stdio: 'ignore' });
+      execSync(`launchctl bootstrap gui/$(id -u) ${plistPath}`, { stdio: 'inherit' });
+      console.log('✅ Service restarted.');
+    }
+  } else {
+    const unitPath = join(homedir(), '.config', 'systemd', 'user', 'tgcc.service');
+    if (!existsSync(unitPath)) {
+      console.error('Service not installed. Run: tgcc install');
+      process.exit(1);
+    }
+    execSync(`systemctl --user ${action} tgcc`, { stdio: 'inherit' });
+    console.log(`✅ Service ${action === 'stop' ? 'stopped' : 'restarted'}.`);
   }
 }
 
@@ -900,6 +928,14 @@ async function main(): Promise<void> {
       cmdUninstall();
       break;
 
+    case 'stop':
+      cmdServiceCtl('stop');
+      break;
+
+    case 'restart':
+      cmdServiceCtl('restart');
+      break;
+
     case 'logs':
       cmdLogs();
       break;
@@ -924,11 +960,15 @@ async function main(): Promise<void> {
 function printHelp(): void {
   console.log(`tgcc — Telegram ↔ Claude Code CLI
 
-Usage:
-  tgcc start                Run the service in the foreground
-  tgcc install              Install as a user service (systemd/launchd)
-  tgcc uninstall            Remove the user service
-  tgcc logs                 Tail the service logs
+Service:
+  tgcc start                Run in the foreground
+  tgcc install              Install & start as a user service (systemd/launchd)
+  tgcc stop                 Stop the service
+  tgcc restart              Restart the service
+  tgcc uninstall            Remove the service
+  tgcc logs                 Tail service logs
+
+Commands:
   tgcc status [--agent]     Show running agents and active sessions
   tgcc message [--agent] "text"  Send a message to a running agent
   tgcc agent <subcommand>   Manage agent registrations
