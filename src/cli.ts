@@ -782,6 +782,9 @@ async function cmdInit(): Promise<void> {
     process.exit(1);
   }
 
+  const userIdInput = await prompt('Your Telegram user ID (empty = open access): ');
+  const allowedUsers = userIdInput ? [userIdInput] : [];
+
   const repoPath = await prompt('Default repo path (optional, press Enter to skip): ');
 
   const config: Record<string, unknown> = {
@@ -795,7 +798,7 @@ async function cmdInit(): Promise<void> {
     agents: {
       [agentName]: {
         botToken,
-        allowedUsers: [],
+        allowedUsers,
         defaults: {
           permissionMode: 'bypassPermissions',
         },

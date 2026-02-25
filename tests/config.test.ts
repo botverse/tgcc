@@ -96,10 +96,10 @@ describe('validateConfig', () => {
     })).toThrow('allowedUsers');
   });
 
-  it('rejects agent with empty allowedUsers', () => {
+  it('accepts agent with empty allowedUsers (open access)', () => {
     expect(() => validateConfig({
       agents: { test: { botToken: 'tok', allowedUsers: [] } },
-    })).toThrow('non-empty');
+    })).not.toThrow();
   });
 
   it('rejects duplicate bot tokens', () => {

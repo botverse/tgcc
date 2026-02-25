@@ -123,6 +123,8 @@ export class TelegramBot {
   }
 
   private isAllowed(userId: number): boolean {
+    // Empty allowedUsers = open access (anyone can use the bot)
+    if (this.config.allowedUsers.length === 0) return true;
     return this.config.allowedUsers.includes(String(userId));
   }
 

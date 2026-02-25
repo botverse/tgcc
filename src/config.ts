@@ -115,8 +115,8 @@ export function validateConfig(raw: unknown): TgccConfig {
     }
     seenTokens.add(a.botToken);
 
-    if (!Array.isArray(a.allowedUsers) || a.allowedUsers.length === 0) {
-      throw new Error(`Agent "${agentId}" must have a non-empty "allowedUsers" array`);
+    if (!Array.isArray(a.allowedUsers)) {
+      throw new Error(`Agent "${agentId}" must have an "allowedUsers" array (empty = open access)`);
     }
 
     const defaultsRaw = (a.defaults ?? {}) as Record<string, unknown>;
