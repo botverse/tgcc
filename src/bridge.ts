@@ -1474,15 +1474,9 @@ export class Bridge extends EventEmitter implements CtlHandler {
         // Kill current process (different CWD needs new process)
         this.disconnectClient(agentId, cmd.userId, cmd.chatId);
         this.sessionStore.setRepo(agentId, cmd.userId, repoPath);
-        const userState = this.sessionStore.getUser(agentId, cmd.userId);
-        const lastActive = new Date(userState.lastActivity).getTime();
-        const staleMs = 24 * 60 * 60 * 1000;
-        if (Date.now() - lastActive > staleMs || !userState.currentSessionId) {
-          this.sessionStore.clearSession(agentId, cmd.userId);
-          await agent.tgBot.sendText(cmd.chatId, `Repo set to <code>${escapeHtml(repoPath)}</code>. Session cleared (stale).`, 'HTML');
-        } else {
-          await agent.tgBot.sendText(cmd.chatId, `Repo set to <code>${escapeHtml(repoPath)}</code>. Session kept (active &lt;24h).`, 'HTML');
-        }
+        // Always clear session when repo changes — sessions are project-specific
+        this.sessionStore.clearSession(agentId, cmd.userId);
+        await agent.tgBot.sendText(cmd.chatId, `<blockquote>Repo set to <code>${escapeHtml(shortenRepoPath(repoPath))}</code>. Session cleared.</blockquote>`, 'HTML');
         break;
       }
 
@@ -1582,16 +1576,10 @@ export class Bridge extends EventEmitter implements CtlHandler {
         // Kill current process (different CWD needs new process)
         this.disconnectClient(agentId, query.userId, query.chatId);
         this.sessionStore.setRepo(agentId, query.userId, repoPath);
-        const userState2 = this.sessionStore.getUser(agentId, query.userId);
-        const lastActive2 = new Date(userState2.lastActivity).getTime();
-        const staleMs2 = 24 * 60 * 60 * 1000;
+        // Always clear session when repo changes — sessions are project-specific
+        this.sessionStore.clearSession(agentId, query.userId);
         await agent.tgBot.answerCallbackQuery(query.callbackQueryId, `Repo: ${repoName}`);
-        if (Date.now() - lastActive2 > staleMs2 || !userState2.currentSessionId) {
-          this.sessionStore.clearSession(agentId, query.userId);
-          await agent.tgBot.sendText(query.chatId, `Repo set to <code>${escapeHtml(repoPath)}</code>. Session cleared (stale).`, 'HTML');
-        } else {
-          await agent.tgBot.sendText(query.chatId, `Repo set to <code>${escapeHtml(repoPath)}</code>. Session kept (active &lt;24h).`, 'HTML');
-        }
+        await agent.tgBot.sendText(query.chatId, `<blockquote>Repo set to <code>${escapeHtml(shortenRepoPath(repoPath))}</code>. Session cleared.</blockquote>`, 'HTML');
         break;
       }
 

@@ -521,7 +521,14 @@ export class CCProcess extends EventEmitter {
       return;
     }
 
-    // responding or idle with no output for hangTimeoutMs — truly hung
+    // responding or idle — check for active children before killing
+    // (bash tool may still be running even if CC stream shows 'responding')
+    if (hasActiveChildren(pid)) {
+      this.logger.info({ activity }, 'Hang timer: active child processes detected — extending 5 min');
+      this.startHangTimer();
+      return;
+    }
+
     this.logger.warn({ activity }, 'Hang timeout — truly hung, killing');
     this.emit('hang');
     this.kill();

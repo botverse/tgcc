@@ -588,7 +588,8 @@ function extractToolInputSummary(toolName: string, inputJson: string, maxLen = 1
     Search:     ['pattern', 'query'],
     Grep:       ['pattern', 'query'],
     Glob:       ['pattern'],
-    TodoWrite:  ['content', 'task', 'text'],
+    TodoWrite:  [],  // handled specially below
+    TaskOutput: [],  // handled specially below
   };
 
   const skipTools = new Set(['TodoRead']);
@@ -601,6 +602,25 @@ function extractToolInputSummary(toolName: string, inputJson: string, maxLen = 1
   // Try parsing complete JSON first
   try {
     const parsed = JSON.parse(inputJson);
+
+    // TaskOutput: show task ID compactly
+    if (toolName === 'TaskOutput' && parsed.task_id) {
+      return `collecting result · ${String(parsed.task_id).slice(0, 7)}`;
+    }
+
+    // TodoWrite: show in-progress item or summary
+    if (toolName === 'TodoWrite' && Array.isArray(parsed.todos)) {
+      const todos = parsed.todos as Array<{ content?: string; status?: string }>;
+      const inProgress = todos.find(t => t.status === 'in_progress');
+      const item = inProgress ?? todos[todos.length - 1];
+      const total = todos.length;
+      const done = todos.filter(t => t.status === 'completed').length;
+      const label = item?.content?.trim() ?? '';
+      const prefix = `[${done}/${total}] `;
+      const combined = prefix + label;
+      return combined.length > maxLen ? combined.slice(0, maxLen) + '…' : combined;
+    }
+
     if (fields) {
       for (const f of fields) {
         if (typeof parsed[f] === 'string' && parsed[f].trim()) {
