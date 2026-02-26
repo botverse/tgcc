@@ -12,6 +12,7 @@ import {
   type TaskStartedEvent,
   type TaskProgressEvent,
   type TaskCompletedEvent,
+  type CompactBoundaryEvent,
   type PermissionRequest,
   type ControlResponse,
   parseCCOutputLine,
@@ -282,6 +283,9 @@ export class CCProcess extends EventEmitter {
         } else if (event.subtype === 'task_progress') {
           this.logger.debug({ taskId: (event as TaskProgressEvent).task_id, lastTool: (event as TaskProgressEvent).last_tool_name }, 'Background task progress');
           this.emit('task_progress', event as TaskProgressEvent);
+        } else if (event.subtype === 'compact_boundary') {
+          this.logger.info({ trigger: (event as CompactBoundaryEvent).compact_metadata?.trigger, preTokens: (event as CompactBoundaryEvent).compact_metadata?.pre_tokens }, 'Compact boundary received');
+          this.emit('compact', event as CompactBoundaryEvent);
         } else if (event.subtype === 'task_completed') {
           const taskId = (event as TaskCompletedEvent).task_id;
           this._activeBackgroundTasks.delete(taskId);

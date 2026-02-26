@@ -360,6 +360,17 @@ export interface TaskCompletedEvent {
   description?: string;
 }
 
+export interface CompactBoundaryEvent {
+  type: 'system';
+  subtype: 'compact_boundary';
+  compact_metadata: {
+    trigger: 'manual' | 'auto';
+    pre_tokens: number;
+  };
+  uuid: string;
+  session_id: string;
+}
+
 // ── Union of all CC output events ──
 
 /** User output message — wraps tool_result content blocks (sub-agent results). */
@@ -399,6 +410,7 @@ export type CCOutputEvent =
   | TaskStartedEvent
   | TaskProgressEvent
   | TaskCompletedEvent
+  | CompactBoundaryEvent
   | PermissionRequest;
 
 // ── Parser ──

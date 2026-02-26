@@ -50,6 +50,7 @@ export const COMMANDS = [
   { command: 'cost', description: 'Show session cost' },
   { command: 'catchup', description: 'Summarize external CC activity' },
   { command: 'cancel', description: 'Abort current CC turn' },
+  { command: 'compact', description: 'Compact conversation context' },
   { command: 'model', description: 'Switch model' },
   { command: 'permissions', description: 'Set permission mode' },
   { command: 'repo', description: 'Manage repos & switch working directory' },

@@ -308,6 +308,7 @@ function truncTitle(text: string): string {
   return first.length > 60 ? first.slice(0, 57) + '…' : first;
 }
 
+
 function extractContextPct(jsonlPath: string, fileSize: number): number | null {
   try {
     // Read last ~4KB to find the last usage entry
@@ -322,14 +323,14 @@ function extractContextPct(jsonlPath: string, fileSize: number): number | null {
 
     for (const line of lines) {
       try {
-        // Find the start of the JSON object (buffer may have partial first line)
         const start = line.indexOf('{');
         if (start < 0) continue;
         const parsed = JSON.parse(line.slice(start));
         const usage = parsed?.message?.usage;
+        const model: string = parsed?.message?.model ?? '';
         if (!usage) continue;
         const input = (usage.input_tokens || 0) + (usage.cache_creation_input_tokens || 0) + (usage.cache_read_input_tokens || 0);
-        if (input > 0) return Math.round(input / 200000 * 100);
+        if (input > 0) return Math.round(input / 200_000 * 100);
       } catch {
         continue;
       }

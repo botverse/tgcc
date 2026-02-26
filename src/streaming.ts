@@ -7,6 +7,7 @@ import type {
   StreamContentBlockStop,
   StreamInputJsonDelta,
   StreamTextDelta,
+  StreamMessageStart,
 } from './cc-protocol.js';
 import { markdownToTelegramHtml } from './telegram-html-remark.js';
 
@@ -25,6 +26,13 @@ export interface TurnUsage {
   cacheReadTokens: number;
   cacheCreationTokens: number;
   costUsd: number | null;
+  model?: string;
+  /** Tokens from the LAST API call's message_start — represents actual context window state.
+   *  Unlike inputTokens/cacheReadTokens/cacheCreationTokens (cumulative across tool-use loops),
+   *  these are per-call and bounded by the model's context window. Use for context % display. */
+  ctxInputTokens?: number;
+  ctxCacheReadTokens?: number;
+  ctxCacheCreationTokens?: number;
 }
 
 export interface StreamAccumulatorOptions {
@@ -91,6 +99,8 @@ export class StreamAccumulator {
   private finished = false;
   private sendQueue: Promise<void> = Promise.resolve();
   private turnUsage: TurnUsage | null = null;
+  /** Usage from the most recent message_start event — represents a single API call's context (not cumulative). */
+  private _lastMsgStartCtx: { input: number; cacheRead: number; cacheCreation: number } | null = null;
 
   // Per-tool-use independent indicator messages (persists across resets)
   private toolMessages: Map<string, { msgId: number; toolName: string; startTime: number }> = new Map();
@@ -110,16 +120,37 @@ export class StreamAccumulator {
 
   /** Set usage stats for the current turn (called from bridge on result event) */
   setTurnUsage(usage: TurnUsage): void {
-    this.turnUsage = usage;
+    // Merge in per-API-call ctx tokens if we captured them from message_start events.
+    // These are bounded by the context window (unlike result event usage which accumulates across tool loops).
+    if (this._lastMsgStartCtx) {
+      this.turnUsage = {
+        ...usage,
+        ctxInputTokens: this._lastMsgStartCtx.input,
+        ctxCacheReadTokens: this._lastMsgStartCtx.cacheRead,
+        ctxCacheCreationTokens: this._lastMsgStartCtx.cacheCreation,
+      };
+    } else {
+      this.turnUsage = usage;
+    }
   }
 
   // ── Process stream events ──
 
   async handleEvent(event: StreamInnerEvent): Promise<void> {
     switch (event.type) {
-      case 'message_start':
+      case 'message_start': {
         // Bridge handles reset decision - no automatic reset here
+        // Capture per-API-call token counts for accurate context % (not cumulative like result event)
+        const msUsage = (event as StreamMessageStart).message?.usage;
+        if (msUsage) {
+          this._lastMsgStartCtx = {
+            input: (msUsage.input_tokens as number) ?? 0,
+            cacheRead: (msUsage.cache_read_input_tokens as number) ?? 0,
+            cacheCreation: (msUsage.cache_creation_input_tokens as number) ?? 0,
+          };
+        }
         break;
+      }
 
       case 'content_block_start':
         await this.onContentBlockStart(event as StreamContentBlockStart);
@@ -441,7 +472,7 @@ export class StreamAccumulator {
     // Convert markdown buffer to HTML-safe text
     text += makeHtmlSafe(this.buffer);
     if (includeSuffix && this.turnUsage) {
-      text += '\n' + formatUsageFooter(this.turnUsage);
+      text += '\n' + formatUsageFooter(this.turnUsage, this.turnUsage.model);
     }
     return { text, hasHtmlSuffix: includeSuffix && !!this.turnUsage };
   }
@@ -548,6 +579,7 @@ export class StreamAccumulator {
     this.thinkingIndicatorShown = false;
     this.finished = false;
     this.turnUsage = null;
+    this._lastMsgStartCtx = null;
     this.clearEditTimer();
   }
 
@@ -760,15 +792,23 @@ function sleep(ms: number): Promise<void> {
 }
 
 /** Format token count as human-readable: 1234 → "1.2k", 500 → "500" */
+
 function formatTokens(n: number): string {
   if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
   return String(n);
 }
 
 /** Format usage stats as an HTML italic footer line */
-export function formatUsageFooter(usage: TurnUsage): string {
-  const totalCtx = usage.inputTokens + usage.cacheReadTokens + usage.cacheCreationTokens;
-  const ctxPct = Math.round(totalCtx / 200000 * 100);
+export function formatUsageFooter(usage: TurnUsage, _model?: string): string {
+  // Use per-API-call ctx tokens (from message_start) for context % — these are bounded by the
+  // context window. Fall back to cumulative result event tokens only if ctx tokens unavailable.
+  const ctxInput = usage.ctxInputTokens ?? usage.inputTokens;
+  const ctxRead = usage.ctxCacheReadTokens ?? usage.cacheReadTokens;
+  const ctxCreation = usage.ctxCacheCreationTokens ?? usage.cacheCreationTokens;
+  const totalCtx = ctxInput + ctxRead + ctxCreation;
+  const CONTEXT_WINDOW = 200_000;
+  const ctxPct = Math.round(totalCtx / CONTEXT_WINDOW * 100);
+  const overLimit = ctxPct > 90;
   const parts = [
     `↩️ ${formatTokens(usage.inputTokens)} in`,
     `${formatTokens(usage.outputTokens)} out`,
@@ -776,7 +816,7 @@ export function formatUsageFooter(usage: TurnUsage): string {
   if (usage.costUsd != null) {
     parts.push(`$${usage.costUsd.toFixed(4)}`);
   }
-  parts.push(`${ctxPct}%`);
+  parts.push(overLimit ? `⚠️ ${ctxPct}%` : `${ctxPct}%`);
   return `<i>${parts.join(' · ')}</i>`;
 }
 

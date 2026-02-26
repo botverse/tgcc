@@ -8,7 +8,7 @@ import type {
   AgentConfig,
   ConfigDiff,
 } from './config.js';
-import type { ApiErrorEvent, PermissionRequest, ToolResultEvent, TaskStartedEvent, TaskProgressEvent, TaskCompletedEvent } from './cc-protocol.js';
+import type { ApiErrorEvent, PermissionRequest, ToolResultEvent, TaskStartedEvent, TaskProgressEvent, TaskCompletedEvent, CompactBoundaryEvent } from './cc-protocol.js';
 import { resolveUserConfig, resolveRepoPath, updateConfig, isValidRepoName, findRepoOwner } from './config.js';
 import { CCProcess, generateMcpConfig } from './cc-process.js';
 import {
@@ -142,6 +142,7 @@ const HELP_TEXT = `<b>TGCC Commands</b>
 
 <b>Control</b>
 /cancel — Abort current CC turn
+/compact [instructions] — Compact conversation context
 /model &lt;name&gt; — Switch model
 /permissions — Set permission mode
 /repo — List repos (buttons)
@@ -801,6 +802,25 @@ export class Bridge extends EventEmitter implements CtlHandler {
       }
     });
 
+    proc.on('compact', (event: CompactBoundaryEvent) => {
+      // Notify all subscribers that compaction happened
+      const trigger = event.compact_metadata?.trigger ?? 'manual';
+      const preTokens = event.compact_metadata?.pre_tokens;
+      const tokenInfo = preTokens ? ` (was ${Math.round(preTokens / 1000)}k tokens)` : '';
+      const entry = getEntry();
+      const subscriberList = entry ? [...this.processRegistry.subscribers(entry)] : [{ client: ownerRef }];
+      for (const sub of subscriberList) {
+        const subAgent = this.agents.get(sub.client.agentId);
+        if (!subAgent) continue;
+        const label = trigger === 'auto' ? '🗜️ Auto-compacted' : '🗜️ Compacted';
+        subAgent.tgBot.sendText(
+          sub.client.chatId,
+          `<blockquote>${escapeHtml(label + tokenInfo)}</blockquote>`,
+          'HTML'
+        ).catch((err: Error) => this.logger.error({ err }, 'Failed to send compact notification'));
+      }
+    });
+
     proc.on('permission_request', (event: PermissionRequest) => {
       // Send permission request only to the owner (first subscriber)
       const req = event.request;
@@ -1015,6 +1035,8 @@ export class Bridge extends EventEmitter implements CtlHandler {
           cacheReadTokens: event.usage.cache_read_input_tokens ?? 0,
           cacheCreationTokens: event.usage.cache_creation_input_tokens ?? 0,
           costUsd: event.total_cost_usd ?? null,
+          model: (event as { model?: string }).model
+            ?? this.processRegistry.findByClient({ agentId, userId, chatId })?.model,
         });
       }
       acc.finalize();
@@ -1488,6 +1510,22 @@ export class Bridge extends EventEmitter implements CtlHandler {
         } else {
           await agent.tgBot.sendText(cmd.chatId, '<blockquote>No active turn to cancel.</blockquote>', 'HTML');
         }
+        break;
+      }
+
+      case 'compact': {
+        // Trigger CC's built-in /compact slash command — like the Claude Code extension does
+        const proc = agent.processes.get(cmd.userId);
+        if (!proc || proc.state !== 'active') {
+          await agent.tgBot.sendText(cmd.chatId, '<blockquote>No active session to compact. Start one first.</blockquote>', 'HTML');
+          break;
+        }
+        // Build the compact message: "/compact [optional-instructions]"
+        const compactMsg = cmd.args?.trim()
+          ? `/compact ${cmd.args.trim()}`
+          : '/compact';
+        await agent.tgBot.sendText(cmd.chatId, '<blockquote>🗜️ Compacting…</blockquote>', 'HTML');
+        proc.sendMessage(createTextMessage(compactMsg));
         break;
       }
 
