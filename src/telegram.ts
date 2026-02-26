@@ -440,6 +440,10 @@ export class TelegramBot {
     await this.bot.api.setMessageReaction(Number(chatId), messageId, [{ type: 'emoji', emoji: emoji as '👍' }]);
   }
 
+  async deleteMessage(chatId: number | string, messageId: number): Promise<void> {
+    await this.bot.api.deleteMessage(Number(chatId), messageId);
+  }
+
   async sendFile(chatId: number | string, filePath: string, caption?: string): Promise<void> {
     await this.bot.api.sendDocument(Number(chatId), new InputFile(filePath), {
       caption,

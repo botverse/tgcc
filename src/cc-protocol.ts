@@ -196,6 +196,7 @@ export interface ToolResultEvent {
   type: 'tool_result';
   tool_use_id: string;
   content: string;
+  is_error?: boolean;
   /** Rich structured metadata from CC's tool_use_result field (teammate_spawned, etc.) */
   tool_use_result?: {
     status?: string;

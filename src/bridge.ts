@@ -427,7 +427,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
           chatId,
           '<blockquote>⚠️ No project selected. Use /repo to pick one, or CC will run in your home directory.</blockquote>',
           'HTML',
-        );
+        ).catch(err => this.logger.error({ err }, 'Failed to send no-repo warning'));
       }
 
       // Save first message text as pending session title
@@ -579,6 +579,16 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
     proc.on('tool_result', (event: ToolResultEvent) => {
       const accKey = `${userId}:${chatId}`;
+
+      // Resolve tool indicator message with success/failure status
+      const acc2 = agent.accumulators.get(accKey);
+      if (acc2 && event.tool_use_id) {
+        const isError = event.is_error === true;
+        const contentStr = typeof event.content === 'string' ? event.content : JSON.stringify(event.content);
+        const errorMsg = isError ? contentStr : undefined;
+        acc2.resolveToolMessage(event.tool_use_id, isError, errorMsg, contentStr);
+      }
+
       const tracker = agent.subAgentTrackers.get(accKey);
       if (!tracker) return;
 
@@ -706,7 +716,8 @@ export class Bridge extends EventEmitter implements CtlHandler {
         .text('❌ Deny', `perm_deny:${requestId}`)
         .text('✅ Allow All', `perm_allow_all:${userId}`);
 
-      agent.tgBot.sendTextWithKeyboard(chatId, text, keyboard, 'HTML');
+      agent.tgBot.sendTextWithKeyboard(chatId, text, keyboard, 'HTML')
+        .catch(err => this.logger.error({ err }, 'Failed to send permission request'));
     });
 
     proc.on('api_error', (event: ApiErrorEvent) => {
@@ -721,12 +732,14 @@ export class Bridge extends EventEmitter implements CtlHandler {
         ? `<blockquote>⚠️ API overloaded, retrying...${retryInfo}</blockquote>`
         : `<blockquote>⚠️ ${escapeHtml(errMsg)}${retryInfo}</blockquote>`;
 
-      agent.tgBot.sendText(chatId, text, 'HTML');
+      agent.tgBot.sendText(chatId, text, 'HTML')
+        .catch(err => this.logger.error({ err }, 'Failed to send API error notification'));
     });
 
     proc.on('hang', () => {
       this.stopTypingIndicator(agent, userId, chatId);
-      agent.tgBot.sendText(chatId, '<blockquote>⏸ Session paused. Send a message to continue.</blockquote>', 'HTML');
+      agent.tgBot.sendText(chatId, '<blockquote>⏸ Session paused. Send a message to continue.</blockquote>', 'HTML')
+        .catch(err => this.logger.error({ err }, 'Failed to send hang notification'));
     });
 
     proc.on('takeover', () => {
@@ -757,7 +770,8 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
     proc.on('error', (err: Error) => {
       this.stopTypingIndicator(agent, userId, chatId);
-      agent.tgBot.sendText(chatId, `<blockquote>⚠️ ${escapeHtml(String(err.message))}</blockquote>`, 'HTML');
+      agent.tgBot.sendText(chatId, `<blockquote>⚠️ ${escapeHtml(String(err.message))}</blockquote>`, 'HTML')
+        .catch(err2 => this.logger.error({ err: err2 }, 'Failed to send process error notification'));
     });
 
     return proc;
@@ -776,9 +790,14 @@ export class Bridge extends EventEmitter implements CtlHandler {
       const sender: TelegramSender = {
         sendMessage: (cid, text, parseMode) => agent.tgBot.sendText(cid, text, parseMode),
         editMessage: (cid, msgId, text, parseMode) => agent.tgBot.editText(cid, msgId, text, parseMode),
+        deleteMessage: (cid, msgId) => agent.tgBot.deleteMessage(cid, msgId),
         sendPhoto: (cid, buffer, caption) => agent.tgBot.sendPhotoBuffer(cid, buffer, caption),
       };
-      acc = new StreamAccumulator({ chatId, sender });
+      const onError = (err: unknown, context: string) => {
+        this.logger.error({ err, context, agentId, userId }, 'Stream accumulator error');
+        agent.tgBot.sendText(chatId, `<blockquote>⚠️ ${escapeHtml(context)}</blockquote>`, 'HTML').catch(() => {});
+      };
+      acc = new StreamAccumulator({ chatId, sender, logger: this.logger, onError });
       agent.accumulators.set(accKey, acc);
     }
 
@@ -800,12 +819,9 @@ export class Bridge extends EventEmitter implements CtlHandler {
       agent.subAgentTrackers.set(accKey, tracker);
     }
 
-    // On message_start: always create new message on new CC turn for deterministic behavior
+    // On message_start: new CC turn — full reset for text accumulator.
+    // Tool indicator messages are independent and persist across turns.
     if (event.type === 'message_start') {
-      // Full reset: each assistant turn gets its own TG message.
-      // This prevents the "rewriting the wrong bubble" problem where a multi-turn
-      // session (tool calls → responses → more tool calls) kept overwriting a single
-      // message positioned between user messages, losing all context.
       acc.reset();
       // Only reset tracker if no agents still dispatched
       if (!tracker.hasDispatchedAgents) {
@@ -850,7 +866,8 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
     // Handle errors
     if (event.is_error && event.result) {
-      agent.tgBot.sendText(chatId, `<blockquote>⚠️ ${escapeHtml(String(event.result))}</blockquote>`, 'HTML');
+      agent.tgBot.sendText(chatId, `<blockquote>⚠️ ${escapeHtml(String(event.result))}</blockquote>`, 'HTML')
+        .catch(err => this.logger.error({ err }, 'Failed to send result error notification'));
     }
 
     // If background sub-agents are still running, mailbox watcher handles them.
@@ -949,7 +966,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
           agent.processes.delete(cmd.userId);
         }
         this.sessionStore.clearSession(agentId, cmd.userId);
-        await agent.tgBot.sendText(cmd.chatId, 'Session cleared. Next message starts fresh.');
+        await agent.tgBot.sendText(cmd.chatId, '<blockquote>Session cleared. Next message starts fresh.</blockquote>', 'HTML');
         break;
       }
 
@@ -959,14 +976,14 @@ export class Bridge extends EventEmitter implements CtlHandler {
           proc.destroy();
           agent.processes.delete(cmd.userId);
         }
-        await agent.tgBot.sendText(cmd.chatId, 'Process respawned. Session kept — next message continues where you left off.');
+        await agent.tgBot.sendText(cmd.chatId, '<blockquote>Process respawned. Session kept — next message continues where you left off.</blockquote>', 'HTML');
         break;
       }
 
       case 'sessions': {
         const sessions = this.sessionStore.getRecentSessions(agentId, cmd.userId);
         if (sessions.length === 0) {
-          await agent.tgBot.sendText(cmd.chatId, 'No recent sessions.');
+          await agent.tgBot.sendText(cmd.chatId, '<blockquote>No recent sessions.</blockquote>', 'HTML');
           break;
         }
         const currentSessionId = this.sessionStore.getUser(agentId, cmd.userId).currentSessionId;
@@ -1000,7 +1017,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
       case 'resume': {
         if (!cmd.args) {
-          await agent.tgBot.sendText(cmd.chatId, 'Usage: /resume <session-id>');
+          await agent.tgBot.sendText(cmd.chatId, '<blockquote>Usage: /resume &lt;session-id&gt;</blockquote>', 'HTML');
           break;
         }
         const proc = agent.processes.get(cmd.userId);
@@ -1017,7 +1034,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
         const userState = this.sessionStore.getUser(agentId, cmd.userId);
         const session = userState.sessions.find(s => s.id === userState.currentSessionId);
         if (!session) {
-          await agent.tgBot.sendText(cmd.chatId, 'No active session.');
+          await agent.tgBot.sendText(cmd.chatId, '<blockquote>No active session.</blockquote>', 'HTML');
           break;
         }
         await agent.tgBot.sendText(cmd.chatId,
@@ -1066,11 +1083,11 @@ export class Bridge extends EventEmitter implements CtlHandler {
           const repoName = repoArgs[1];
           const repoAddPath = repoArgs[2];
           if (!repoName || !repoAddPath) {
-            await agent.tgBot.sendText(cmd.chatId, 'Usage: /repo add <name> <path>');
+            await agent.tgBot.sendText(cmd.chatId, '<blockquote>Usage: /repo add &lt;name&gt; &lt;path&gt;</blockquote>', 'HTML');
             break;
           }
           if (!isValidRepoName(repoName)) {
-            await agent.tgBot.sendText(cmd.chatId, 'Invalid repo name. Use alphanumeric + hyphens only.');
+            await agent.tgBot.sendText(cmd.chatId, '<blockquote>Invalid repo name. Use alphanumeric + hyphens only.</blockquote>', 'HTML');
             break;
           }
           if (!existsSync(repoAddPath)) {
@@ -1094,7 +1111,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
           // /repo remove <name>
           const repoName = repoArgs[1];
           if (!repoName) {
-            await agent.tgBot.sendText(cmd.chatId, 'Usage: /repo remove <name>');
+            await agent.tgBot.sendText(cmd.chatId, '<blockquote>Usage: /repo remove &lt;name&gt;</blockquote>', 'HTML');
             break;
           }
           if (!this.config.repos[repoName]) {
@@ -1121,7 +1138,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
           // /repo assign <name> — assign to THIS agent
           const repoName = repoArgs[1];
           if (!repoName) {
-            await agent.tgBot.sendText(cmd.chatId, 'Usage: /repo assign <name>');
+            await agent.tgBot.sendText(cmd.chatId, '<blockquote>Usage: /repo assign &lt;name&gt;</blockquote>', 'HTML');
             break;
           }
           if (!this.config.repos[repoName]) {
@@ -1229,9 +1246,9 @@ export class Bridge extends EventEmitter implements CtlHandler {
         const proc = agent.processes.get(cmd.userId);
         if (proc && proc.state === 'active') {
           proc.cancel();
-          await agent.tgBot.sendText(cmd.chatId, 'Cancelled.');
+          await agent.tgBot.sendText(cmd.chatId, '<blockquote>Cancelled.</blockquote>', 'HTML');
         } else {
-          await agent.tgBot.sendText(cmd.chatId, 'No active turn to cancel.');
+          await agent.tgBot.sendText(cmd.chatId, '<blockquote>No active turn to cancel.</blockquote>', 'HTML');
         }
         break;
       }
@@ -1255,7 +1272,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
         if (cmd.args) {
           const mode = cmd.args.trim();
           if (!validModes.includes(mode)) {
-            await agent.tgBot.sendText(cmd.chatId, `Invalid mode. Valid: ${validModes.join(', ')}`);
+            await agent.tgBot.sendText(cmd.chatId, `<blockquote>Invalid mode. Valid: ${validModes.join(', ')}</blockquote>`, 'HTML');
             break;
           }
           this.sessionStore.setPermissionMode(agentId, cmd.userId, mode);

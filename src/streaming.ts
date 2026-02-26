@@ -15,6 +15,7 @@ import { markdownToTelegramHtml } from './telegram-html-remark.js';
 export interface TelegramSender {
   sendMessage(chatId: number | string, text: string, parseMode?: string): Promise<number>;
   editMessage(chatId: number | string, messageId: number, text: string, parseMode?: string): Promise<void>;
+  deleteMessage?(chatId: number | string, messageId: number): Promise<void>;
   sendPhoto?(chatId: number | string, imageBuffer: Buffer, caption?: string): Promise<number>;
 }
 
@@ -31,6 +32,9 @@ export interface StreamAccumulatorOptions {
   sender: TelegramSender;
   editIntervalMs?: number;      // min ms between TG edits (default 1000)
   splitThreshold?: number;       // char count to trigger message split (default 4000)
+  logger?: { error?: (...args: unknown[]) => void; warn?: (...args: unknown[]) => void; debug?: (...args: unknown[]) => void };
+  /** Callback for critical errors that should be surfaced to the user */
+  onError?: (err: unknown, context: string) => void;
 }
 
 // ── HTML safety & conversion ──
@@ -71,6 +75,8 @@ export class StreamAccumulator {
   private sender: TelegramSender;
   private editIntervalMs: number;
   private splitThreshold: number;
+  private logger?: { error?: (...args: unknown[]) => void; warn?: (...args: unknown[]) => void; debug?: (...args: unknown[]) => void };
+  private onError?: (err: unknown, context: string) => void;
 
   // State
   private tgMessageId: number | null = null;
@@ -81,17 +87,23 @@ export class StreamAccumulator {
   private lastEditTime = 0;
   private editTimer: ReturnType<typeof setTimeout> | null = null;
   private thinkingIndicatorShown = false;
-  private toolIndicators: string[] = [];
   private messageIds: number[] = []; // all message IDs sent during this turn
   private finished = false;
   private sendQueue: Promise<void> = Promise.resolve();
   private turnUsage: TurnUsage | null = null;
+
+  // Per-tool-use independent indicator messages (persists across resets)
+  private toolMessages: Map<string, { msgId: number; toolName: string; startTime: number }> = new Map();
+  private toolInputBuffers: Map<string, string> = new Map(); // tool block ID → accumulated input JSON
+  private currentToolBlockId: string | null = null;
 
   constructor(options: StreamAccumulatorOptions) {
     this.chatId = options.chatId;
     this.sender = options.sender;
     this.editIntervalMs = options.editIntervalMs ?? 1000;
     this.splitThreshold = options.splitThreshold ?? 4000;
+    this.logger = options.logger;
+    this.onError = options.onError;
   }
 
   get allMessageIds(): number[] { return [...this.messageIds]; }
@@ -139,18 +151,21 @@ export class StreamAccumulator {
     if (blockType === 'thinking') {
       this.currentBlockType = 'thinking';
       if (!this.thinkingIndicatorShown && !this.buffer) {
-        await this.sendOrEdit('<i>💭 Thinking...</i>', true);
+        await this.sendOrEdit('<blockquote>💭 Thinking...</blockquote>', true);
         this.thinkingIndicatorShown = true;
       }
     } else if (blockType === 'text') {
       this.currentBlockType = 'text';
-      // Clear tool indicators when real text starts
-      this.toolIndicators = [];
+      // Text always gets its own message — don't touch tool indicator messages
+      if (!this.tgMessageId) {
+        // Will create a new message on next sendOrEdit
+      }
     } else if (blockType === 'tool_use') {
       this.currentBlockType = 'tool_use';
-      const name = (event.content_block as { type: 'tool_use'; name: string }).name;
-      this.toolIndicators.push(name);
-      await this.showToolIndicator(name);
+      const block = event.content_block as { type: 'tool_use'; id: string; name: string };
+      this.currentToolBlockId = block.id;
+      // Send an independent indicator message for this tool_use block
+      await this.sendToolIndicator(block.id, block.name);
     } else if (blockType === 'image') {
       this.currentBlockType = 'image';
       this.imageBase64Buffer = '';
@@ -176,25 +191,38 @@ export class StreamAccumulator {
       if (delta?.type === 'thinking_delta' && delta.thinking) {
         this.thinkingBuffer += delta.thinking;
       }
+    } else if (this.currentBlockType === 'tool_use' && 'delta' in event) {
+      const delta = (event as any).delta;
+      if (delta?.type === 'input_json_delta' && delta.partial_json && this.currentToolBlockId) {
+        const blockId = this.currentToolBlockId;
+        const prev = this.toolInputBuffers.get(blockId) ?? '';
+        this.toolInputBuffers.set(blockId, prev + delta.partial_json);
+        // Update indicator with input preview once we have enough
+        await this.updateToolIndicatorWithInput(blockId);
+      }
     } else if (this.currentBlockType === 'image' && 'delta' in event) {
       const delta = (event as any).delta;
       if (delta?.type === 'image_delta' && delta.data) {
         this.imageBase64Buffer += delta.data;
       }
     }
-    // Ignore input_json_delta content
   }
 
   // ── TG message management ──
 
   /** Send or edit a message. If rawHtml is true, text is already HTML-safe. */
   private async sendOrEdit(text: string, rawHtml = false): Promise<void> {
-    this.sendQueue = this.sendQueue.then(() => this._doSendOrEdit(text, rawHtml));
+    this.sendQueue = this.sendQueue.then(() => this._doSendOrEdit(text, rawHtml)).catch(err => {
+      this.logger?.error?.({ err }, 'sendOrEdit failed');
+      this.onError?.(err, 'Failed to send/edit message');
+    });
     return this.sendQueue;
   }
 
   private async _doSendOrEdit(text: string, rawHtml = false): Promise<void> {
-    const safeText = (rawHtml ? text : makeHtmlSafe(text)) || '...';
+    let safeText = (rawHtml ? text : makeHtmlSafe(text)) || '...';
+    // Guard against HTML that has tags but no visible text content (e.g. "<b></b>")
+    if (!safeText.replace(/<[^>]*>/g, '').trim()) safeText = '...';
 
     // Update timing BEFORE API call to prevent races
     this.lastEditTime = Date.now();
@@ -207,16 +235,20 @@ export class StreamAccumulator {
         await this.sender.editMessage(this.chatId, this.tgMessageId, safeText, 'HTML');
       }
     } catch (err: unknown) {
-      // Handle TG rate limit (429)
-      if (err && typeof err === 'object' && 'error_code' in err && (err as { error_code: number }).error_code === 429) {
+      const errorCode = err && typeof err === 'object' && 'error_code' in err
+        ? (err as { error_code: number }).error_code : 0;
+
+      // Handle TG rate limit (429) — retry
+      if (errorCode === 429) {
         const retryAfter = (err as { parameters?: { retry_after?: number } }).parameters?.retry_after ?? 5;
         this.editIntervalMs = Math.min(this.editIntervalMs * 2, 5000);
         await sleep(retryAfter * 1000);
         return this._doSendOrEdit(text);
       }
-      // Ignore "message is not modified" errors
+      // Ignore "message is not modified" errors (harmless)
       if (err instanceof Error && err.message.includes('message is not modified')) return;
-      throw err;
+      // 400 (bad request), 403 (forbidden), and all other errors — log and skip, never throw
+      this.logger?.error?.({ err, errorCode }, 'Telegram API error in _doSendOrEdit — skipping');
     }
   }
 
@@ -229,17 +261,150 @@ export class StreamAccumulator {
       this.messageIds.push(msgId);
     } catch (err) {
       // Fall back to text indicator on failure
+      this.logger?.error?.({ err }, 'Failed to send image');
       this.buffer += '\n[Image could not be sent]';
     }
     this.imageBase64Buffer = '';
   }
 
-  private async showToolIndicator(toolName: string): Promise<void> {
-    const bufferHtml = this.buffer ? makeHtmlSafe(this.buffer) : '';
-    const indicator = bufferHtml
-      ? `${bufferHtml}\n\n<i>Using ${escapeHtml(toolName)}...</i>`
-      : `<i>Using ${escapeHtml(toolName)}...</i>`;
-    await this.sendOrEdit(indicator, true);
+  /** Send an independent tool indicator message (not through the accumulator's sendOrEdit). */
+  private async sendToolIndicator(blockId: string, toolName: string): Promise<void> {
+    const startTime = Date.now();
+    this.sendQueue = this.sendQueue.then(async () => {
+      try {
+        const html = `<blockquote expandable>⚡ ${escapeHtml(toolName)}…</blockquote>`;
+        const msgId = await this.sender.sendMessage(this.chatId, html, 'HTML');
+        this.toolMessages.set(blockId, { msgId, toolName, startTime });
+      } catch (err) {
+        // Tool indicator is non-critical — log and continue
+        this.logger?.debug?.({ err, toolName }, 'Failed to send tool indicator');
+      }
+    }).catch(err => {
+      this.logger?.error?.({ err }, 'sendToolIndicator queue error');
+    });
+    return this.sendQueue;
+  }
+
+  /** Update a tool indicator message with input preview once the JSON value is complete. */
+  private toolIndicatorLastSummary = new Map<string, string>(); // blockId → last rendered summary
+  private async updateToolIndicatorWithInput(blockId: string): Promise<void> {
+    const entry = this.toolMessages.get(blockId);
+    if (!entry) return;
+    const inputJson = this.toolInputBuffers.get(blockId) ?? '';
+
+    // Only extract from complete JSON (try parse succeeds) or complete regex match
+    // (the value must have a closing quote to avoid truncated paths)
+    const summary = extractToolInputSummary(entry.toolName, inputJson, 120, true);
+    if (!summary) return; // not enough input yet or value still streaming
+
+    // Skip if summary hasn't changed since last edit
+    if (this.toolIndicatorLastSummary.get(blockId) === summary) return;
+    this.toolIndicatorLastSummary.set(blockId, summary);
+
+    const codeLine = `\n<code>${escapeHtml(summary)}</code>`;
+    const html = `<blockquote expandable>⚡ ${escapeHtml(entry.toolName)}…${codeLine}</blockquote>`;
+
+    this.sendQueue = this.sendQueue.then(async () => {
+      try {
+        await this.sender.editMessage(this.chatId, entry.msgId, html, 'HTML');
+      } catch (err) {
+        // "message is not modified" or other edit failure — non-critical
+        this.logger?.debug?.({ err }, 'Failed to update tool indicator with input');
+      }
+    }).catch(err => {
+      this.logger?.error?.({ err }, 'updateToolIndicatorWithInput queue error');
+    });
+    return this.sendQueue;
+  }
+
+  /** Resolve a tool indicator with success/failure status. Edits to a compact summary with input detail. */
+  async resolveToolMessage(blockId: string, isError: boolean, errorMessage?: string, resultContent?: string): Promise<void> {
+    const entry = this.toolMessages.get(blockId);
+    if (!entry) return;
+    const { msgId, toolName, startTime } = entry;
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+
+    const inputJson = this.toolInputBuffers.get(blockId) ?? '';
+    const summary = extractToolInputSummary(toolName, inputJson);
+    const resultStat = resultContent ? extractToolResultStat(toolName, resultContent) : '';
+    const codeLine = summary ? `\n<code>${escapeHtml(summary)}</code>` : '';
+    const statLine = resultStat ? `\n${escapeHtml(resultStat)}` : '';
+
+    const icon = isError ? '❌' : '✅';
+    const html = `<blockquote expandable>${icon} ${escapeHtml(toolName)} (${elapsed}s)${codeLine}${statLine}</blockquote>`;
+
+    // Clean up input buffer
+    this.toolInputBuffers.delete(blockId);
+    this.toolIndicatorLastSummary.delete(blockId);
+
+    this.sendQueue = this.sendQueue.then(async () => {
+      try {
+        await this.sender.editMessage(this.chatId, msgId, html, 'HTML');
+      } catch (err) {
+        // Edit failure on resolve — non-critical
+        this.logger?.debug?.({ err, toolName }, 'Failed to resolve tool indicator');
+      }
+    }).catch(err => {
+      this.logger?.error?.({ err }, 'resolveToolMessage queue error');
+    });
+    return this.sendQueue;
+  }
+
+  /** Edit a specific tool indicator message by block ID. */
+  async editToolMessage(blockId: string, html: string): Promise<void> {
+    const entry = this.toolMessages.get(blockId);
+    if (!entry) return;
+    this.sendQueue = this.sendQueue.then(async () => {
+      try {
+        await this.sender.editMessage(this.chatId, entry.msgId, html, 'HTML');
+      } catch (err) {
+        // Edit failure — non-critical
+        this.logger?.debug?.({ err }, 'Failed to edit tool message');
+      }
+    }).catch(err => {
+      this.logger?.error?.({ err }, 'editToolMessage queue error');
+    });
+    return this.sendQueue;
+  }
+
+  /** Delete a specific tool indicator message by block ID. */
+  async deleteToolMessage(blockId: string): Promise<void> {
+    const entry = this.toolMessages.get(blockId);
+    if (!entry) return;
+    this.toolMessages.delete(blockId);
+    this.sendQueue = this.sendQueue.then(async () => {
+      try {
+        if (this.sender.deleteMessage) {
+          await this.sender.deleteMessage(this.chatId, entry.msgId);
+        }
+      } catch (err) {
+        // Delete failure — non-critical
+        this.logger?.debug?.({ err }, 'Failed to delete tool message');
+      }
+    }).catch(err => {
+      this.logger?.error?.({ err }, 'deleteToolMessage queue error');
+    });
+    return this.sendQueue;
+  }
+
+  /** Delete all tool indicator messages. */
+  async deleteAllToolMessages(): Promise<void> {
+    const ids = [...this.toolMessages.values()];
+    this.toolMessages.clear();
+    if (!this.sender.deleteMessage) return;
+    this.sendQueue = this.sendQueue.then(async () => {
+      for (const { msgId } of ids) {
+        try {
+          await this.sender.deleteMessage!(this.chatId, msgId);
+        } catch (err) {
+          // Delete failure — non-critical
+          this.logger?.debug?.({ err }, 'Failed to delete tool message in batch');
+        }
+      }
+    }).catch(err => {
+      this.logger?.error?.({ err }, 'deleteAllToolMessages queue error');
+    });
+    return this.sendQueue;
   }
 
   private async throttledEdit(): Promise<void> {
@@ -371,25 +536,25 @@ export class StreamAccumulator {
     }
   }
 
-  /** Soft reset: clear buffer/state but keep tgMessageId so next turn edits the same message */
+  /** Soft reset: clear buffer/state but keep tgMessageId so next turn edits the same message.
+   *  toolMessages persists across resets — they are independent of the text accumulator. */
   softReset(): void {
     this.buffer = '';
     this.thinkingBuffer = '';
     this.imageBase64Buffer = '';
     this.currentBlockType = null;
+    this.currentToolBlockId = null;
     this.lastEditTime = 0;
     this.thinkingIndicatorShown = false;
-    this.toolIndicators = [];
     this.finished = false;
     this.turnUsage = null;
-    this.clearEditTimer(); // Ensure cleanup
+    this.clearEditTimer();
   }
 
   /** Full reset: also clears tgMessageId (next send creates a new message).
-   *  Chains on the existing sendQueue so any pending finalize() edits complete first. */
+   *  Chains on the existing sendQueue so any pending finalize() edits complete first.
+   *  toolMessages persists — they are independent fire-and-forget messages. */
   reset(): void {
-    // Chain on the existing queue so pending sends (e.g. finalize) complete
-    // before the new turn starts sending.
     const prevQueue = this.sendQueue;
     this.softReset();
     this.tgMessageId = null;
@@ -399,6 +564,125 @@ export class StreamAccumulator {
 }
 
 // ── Helpers ──
+
+/** Extract a human-readable summary from a tool's input JSON (may be partial/incomplete). */
+/** Shorten absolute paths to relative-ish display: /home/fonz/Botverse/KYO/src/foo.ts → KYO/src/foo.ts */
+function shortenPath(p: string): string {
+  // Strip common prefixes
+  return p
+    .replace(/^\/home\/[^/]+\/Botverse\//, '')
+    .replace(/^\/home\/[^/]+\/Projects\//, '')
+    .replace(/^\/home\/[^/]+\//, '~/');
+}
+
+function extractToolInputSummary(toolName: string, inputJson: string, maxLen = 120, requireComplete = false): string | null {
+  if (!inputJson) return null;
+
+  // Determine which field(s) to look for based on tool name
+  const fieldsByTool: Record<string, string[]> = {
+    Bash:       ['command'],
+    Read:       ['file_path', 'path'],
+    Write:      ['file_path', 'path'],
+    Edit:       ['file_path', 'path'],
+    MultiEdit:  ['file_path', 'path'],
+    Search:     ['pattern', 'query'],
+    Grep:       ['pattern', 'query'],
+    Glob:       ['pattern'],
+    TodoWrite:  ['content', 'task', 'text'],
+  };
+
+  const skipTools = new Set(['TodoRead']);
+  if (skipTools.has(toolName)) return null;
+
+  const fields = fieldsByTool[toolName];
+
+  const isPathTool = ['Read', 'Write', 'Edit', 'MultiEdit'].includes(toolName);
+
+  // Try parsing complete JSON first
+  try {
+    const parsed = JSON.parse(inputJson);
+    if (fields) {
+      for (const f of fields) {
+        if (typeof parsed[f] === 'string' && parsed[f].trim()) {
+          let val = parsed[f].trim();
+          if (isPathTool) val = shortenPath(val);
+          return val.length > maxLen ? val.slice(0, maxLen) + '…' : val;
+        }
+      }
+    }
+    // Default: first string value
+    for (const val of Object.values(parsed)) {
+      if (typeof val === 'string' && val.trim()) {
+        const v = val.trim();
+        return v.length > maxLen ? v.slice(0, maxLen) + '…' : v;
+      }
+    }
+    return null;
+  } catch {
+    if (requireComplete) return null; // Only use fully-parsed JSON when requireComplete
+    // Partial JSON — regex extraction (only used for final resolve, not live preview)
+    const targetFields = fields ?? ['command', 'file_path', 'path', 'pattern', 'query'];
+    for (const key of targetFields) {
+      const re = new RegExp(`"${key}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"`, 'i'); // require closing quote
+      const m = inputJson.match(re);
+      if (m?.[1]) {
+        let val = m[1].replace(/\\n/g, ' ').replace(/\\t/g, '  ').replace(/\\"/g, '"');
+        if (isPathTool) val = shortenPath(val);
+        return val.length > maxLen ? val.slice(0, maxLen) + '…' : val;
+      }
+    }
+    return null;
+  }
+}
+
+/** Extract a compact stat from a tool result for display in the indicator. */
+function extractToolResultStat(toolName: string, content: string): string {
+  if (!content) return '';
+  const first = content.split('\n')[0].trim();
+
+  switch (toolName) {
+    case 'Write': {
+      // "Successfully wrote 42 lines to src/foo.ts" or byte count
+      const lines = content.match(/(\d+)\s*lines?/i);
+      const bytes = content.match(/(\d[\d,.]*)\s*(bytes?|KB|MB)/i);
+      if (lines) return `${lines[1]} lines`;
+      if (bytes) return `${bytes[1]} ${bytes[2]}`;
+      return first.length > 60 ? first.slice(0, 60) + '…' : first;
+    }
+    case 'Edit':
+    case 'MultiEdit': {
+      // "Edited src/foo.ts: replaced 3 lines" or snippet
+      const replaced = content.match(/replaced\s+(\d+)\s*lines?/i);
+      const chars = content.match(/(\d+)\s*characters?/i);
+      if (replaced) return `${replaced[1]} lines replaced`;
+      if (chars) return `${chars[1]} chars changed`;
+      return first.length > 60 ? first.slice(0, 60) + '…' : first;
+    }
+    case 'Bash': {
+      // Show exit code or first line of output (truncated)
+      const exit = content.match(/exit\s*code\s*[:=]?\s*(\d+)/i);
+      if (exit && exit[1] !== '0') return `exit ${exit[1]}`;
+      // Count output lines
+      const outputLines = content.split('\n').filter(l => l.trim()).length;
+      if (outputLines > 3) return `${outputLines} lines output`;
+      return first.length > 60 ? first.slice(0, 60) + '…' : first;
+    }
+    case 'Read': {
+      const lines = content.split('\n').length;
+      return `${lines} lines`;
+    }
+    case 'Search':
+    case 'Grep':
+    case 'Glob': {
+      const matches = content.match(/(\d+)\s*(match|result|file)/i);
+      if (matches) return `${matches[1]} ${matches[2]}s`;
+      const resultLines = content.split('\n').filter(l => l.trim()).length;
+      return `${resultLines} results`;
+    }
+    default:
+      return first.length > 60 ? first.slice(0, 60) + '…' : first;
+  }
+}
 
 function findSplitPoint(text: string, threshold: number): number {
   // Try to split at paragraph break
@@ -630,8 +914,10 @@ export class SubAgentTracker {
       this.sendQueue = this.sendQueue.then(async () => {
         try {
           await this.sender.editMessage(this.chatId, info.tgMessageId!, text, 'HTML');
-        } catch { /* ignore */ }
-      });
+        } catch (err) {
+          // Non-critical — edit failure on dispatched agent status
+        }
+      }).catch(() => {});
     }
   }
 
@@ -725,9 +1011,9 @@ export class SubAgentTracker {
           'HTML',
         );
       } catch {
-        // Ignore edit failures
+        // Edit failure on tool result — non-critical
       }
-    });
+    }).catch(() => {});
     await this.sendQueue;
   }
 
@@ -769,9 +1055,9 @@ export class SubAgentTracker {
           info.tgMessageId = msgId;
           this.consolidatedAgentMsgId = msgId;
         } catch {
-          // Silently ignore
+          // Sub-agent indicator is non-critical
         }
-      });
+      }).catch(() => {});
       await this.sendQueue;
     }
   }
@@ -792,8 +1078,10 @@ export class SubAgentTracker {
     this.sendQueue = this.sendQueue.then(async () => {
       try {
         await this.sender.editMessage(this.chatId, msgId, text, 'HTML');
-      } catch { /* ignore */ }
-    });
+      } catch {
+        // Consolidated message edit failure — non-critical
+      }
+    }).catch(() => {});
   }
 
   private async onInputDelta(event: StreamInputJsonDelta): Promise<void> {
@@ -957,8 +1245,10 @@ export class SubAgentTracker {
       this.sendQueue = this.sendQueue.then(async () => {
         try {
           await this.sender.setReaction?.(this.chatId, msgId, emoji);
-        } catch { /* ignore — reaction might not be supported */ }
-      });
+        } catch {
+          // Reaction failure — non-critical, might not be supported
+        }
+      }).catch(() => {});
     }
 
     // Check if ALL dispatched agents are now completed
@@ -1052,8 +1342,10 @@ export class SubAgentTracker {
     this.sendQueue = this.sendQueue.then(async () => {
       try {
         await this.sender.editMessage(this.chatId, msgId, text, 'HTML');
-      } catch { /* ignore */ }
-    });
+      } catch {
+        // Progress message edit failure — non-critical
+      }
+    }).catch(() => {});
   }
 
   /** Find a tracked sub-agent by tool_use_id. */

@@ -117,6 +117,8 @@ export class CCProcess extends EventEmitter {
   private logger: pino.Logger;
   private options: CCProcessOptions;
   private _sessionId: string | null = null;
+  private _activeBackgroundTasks = new Set<string>();
+  private backgroundTaskCheckTimer: ReturnType<typeof setInterval> | null = null;
   private _totalCostUsd = 0;
   private _spawnedAt: Date | null = null;
   private _killedByUs = false;
@@ -138,6 +140,7 @@ export class CCProcess extends EventEmitter {
   get totalCostUsd(): number { return this._totalCostUsd; }
   get spawnedAt(): Date | null { return this._spawnedAt; }
   get pid(): number | undefined { return this.process?.pid; }
+  get hasBackgroundTasks(): boolean { return this._activeBackgroundTasks.size > 0; }
   get takenOver(): boolean { return this._takenOver; }
 
   // ── Spawn ──
@@ -269,13 +272,24 @@ export class CCProcess extends EventEmitter {
         } else if (event.subtype === 'api_error') {
           this.emit('api_error', event as ApiErrorEvent);
         } else if (event.subtype === 'task_started') {
-          this.logger.info({ taskId: (event as TaskStartedEvent).task_id, description: (event as TaskStartedEvent).description }, 'Background task started');
+          const taskId = (event as TaskStartedEvent).task_id;
+          this._activeBackgroundTasks.add(taskId);
+          this.logger.info({ taskId, description: (event as TaskStartedEvent).description, activeTasks: this._activeBackgroundTasks.size }, 'Background task started');
+          // Suppress idle timeout while background tasks are running
+          this.clearIdleTimer();
+          this.startBackgroundTaskCheck();
           this.emit('task_started', event as TaskStartedEvent);
         } else if (event.subtype === 'task_progress') {
           this.logger.debug({ taskId: (event as TaskProgressEvent).task_id, lastTool: (event as TaskProgressEvent).last_tool_name }, 'Background task progress');
           this.emit('task_progress', event as TaskProgressEvent);
         } else if (event.subtype === 'task_completed') {
-          this.logger.info({ taskId: (event as TaskCompletedEvent).task_id }, 'Background task completed');
+          const taskId = (event as TaskCompletedEvent).task_id;
+          this._activeBackgroundTasks.delete(taskId);
+          this.logger.info({ taskId, activeTasks: this._activeBackgroundTasks.size }, 'Background task completed');
+          if (this._activeBackgroundTasks.size === 0) {
+            this.stopBackgroundTaskCheck();
+            this.startIdleTimer();
+          }
           this.emit('task_completed', event as TaskCompletedEvent);
         }
         break;
@@ -333,6 +347,7 @@ export class CCProcess extends EventEmitter {
                 type: 'tool_result' as const,
                 tool_use_id: block.tool_use_id,
                 content: resultText,
+                is_error: block.is_error === true,
                 // Forward the rich structured metadata if present
                 tool_use_result: (event as { tool_use_result?: Record<string, unknown> }).tool_use_result,
               });
@@ -442,7 +457,17 @@ export class CCProcess extends EventEmitter {
 
   private startIdleTimer(): void {
     this.clearIdleTimer();
+    // Don't start idle timer if background tasks are running
+    if (this._activeBackgroundTasks.size > 0) {
+      this.logger.debug({ activeTasks: this._activeBackgroundTasks.size }, 'Skipping idle timer — background tasks active');
+      return;
+    }
     this.idleTimer = setTimeout(() => {
+      // Double-check at fire time in case a task started during the timeout
+      if (this._activeBackgroundTasks.size > 0) {
+        this.logger.debug({ activeTasks: this._activeBackgroundTasks.size }, 'Idle timer fired but background tasks active — skipping kill');
+        return;
+      }
       this.logger.info('Idle timeout — killing CC process');
       this.kill();
     }, this.options.userConfig.idleTimeoutMs);
@@ -515,6 +540,31 @@ export class CCProcess extends EventEmitter {
     }
   }
 
+  /** Periodically check if background tasks are truly still running (every 30s). */
+  private startBackgroundTaskCheck(): void {
+    if (this.backgroundTaskCheckTimer) return; // already running
+    this.backgroundTaskCheckTimer = setInterval(() => {
+      if (this._activeBackgroundTasks.size === 0) {
+        this.stopBackgroundTaskCheck();
+        return;
+      }
+      // Check if CC process still has child processes running
+      if (!hasActiveChildren(this.pid)) {
+        this.logger.info({ tasks: [...this._activeBackgroundTasks] }, 'Background tasks registered but no child processes found — clearing');
+        this._activeBackgroundTasks.clear();
+        this.stopBackgroundTaskCheck();
+        this.startIdleTimer();
+      }
+    }, 30_000);
+  }
+
+  private stopBackgroundTaskCheck(): void {
+    if (this.backgroundTaskCheckTimer) {
+      clearInterval(this.backgroundTaskCheckTimer);
+      this.backgroundTaskCheckTimer = null;
+    }
+  }
+
   private clearForceKillTimer(): void {
     if (this.forceKillTimer) {
       clearTimeout(this.forceKillTimer);
@@ -572,6 +622,8 @@ export class CCProcess extends EventEmitter {
     this.clearIdleTimer();
     this.clearHangTimer();
     this.clearForceKillTimer();
+    this.stopBackgroundTaskCheck();
+    this._activeBackgroundTasks.clear();
     this._state = 'idle';
     this._ccActivity = 'idle';
     this._killedByUs = false;
