@@ -1,6 +1,6 @@
 {
   "name": "@fonz/tgcc",
-  "version": "0.6.12",
+  "version": "0.6.13",
   "description": "Telegram ↔ Claude Code CLI bridge",
   "type": "module",
   "main": "dist/index.js",
@@ -71,7 +71,11 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/fonzio/tgcc"
+    "url": "https://github.com/botverse/tgcc"
+  },
+  "homepage": "https://github.com/botverse/tgcc#readme",
+  "bugs": {
+    "url": "https://github.com/botverse/tgcc/issues"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.26.0",

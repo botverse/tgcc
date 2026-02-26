@@ -326,6 +326,39 @@ export interface ApiErrorEvent {
   uuid?: string;
 }
 
+// ── System events for background tasks ──
+
+export interface TaskStartedEvent {
+  type: 'system';
+  subtype: 'task_started';
+  task_id: string;
+  tool_use_id: string;
+  description: string;
+  task_type?: string;
+}
+
+export interface TaskProgressEvent {
+  type: 'system';
+  subtype: 'task_progress';
+  task_id: string;
+  tool_use_id: string;
+  description: string;
+  usage?: {
+    total_tokens?: number;
+    tool_uses?: number;
+    duration_ms?: number;
+  };
+  last_tool_name?: string;
+}
+
+export interface TaskCompletedEvent {
+  type: 'system';
+  subtype: 'task_completed';
+  task_id: string;
+  tool_use_id: string;
+  description?: string;
+}
+
 // ── Union of all CC output events ──
 
 /** User output message — wraps tool_result content blocks (sub-agent results). */
@@ -362,6 +395,9 @@ export type CCOutputEvent =
   | StreamEvent
   | ControlResponse
   | ApiErrorEvent
+  | TaskStartedEvent
+  | TaskProgressEvent
+  | TaskCompletedEvent
   | PermissionRequest;
 
 // ── Parser ──

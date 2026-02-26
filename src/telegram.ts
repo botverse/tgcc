@@ -42,6 +42,7 @@ export type CallbackHandler = (query: CallbackQuery) => void;
 export const COMMANDS = [
   { command: 'start', description: 'Welcome message & register commands' },
   { command: 'new', description: 'Start a fresh session' },
+  { command: 'continue', description: 'Respawn process, keep session' },
   { command: 'sessions', description: 'List recent sessions' },
   { command: 'resume', description: 'Resume a session by ID' },
   { command: 'session', description: 'Current session info' },

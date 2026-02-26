@@ -9,6 +9,9 @@ import {
   type UserMessage,
   type StreamInnerEvent,
   type ApiErrorEvent,
+  type TaskStartedEvent,
+  type TaskProgressEvent,
+  type TaskCompletedEvent,
   type PermissionRequest,
   type ControlResponse,
   parseCCOutputLine,
@@ -265,6 +268,15 @@ export class CCProcess extends EventEmitter {
           this.flushQueue();
         } else if (event.subtype === 'api_error') {
           this.emit('api_error', event as ApiErrorEvent);
+        } else if (event.subtype === 'task_started') {
+          this.logger.info({ taskId: (event as TaskStartedEvent).task_id, description: (event as TaskStartedEvent).description }, 'Background task started');
+          this.emit('task_started', event as TaskStartedEvent);
+        } else if (event.subtype === 'task_progress') {
+          this.logger.debug({ taskId: (event as TaskProgressEvent).task_id, lastTool: (event as TaskProgressEvent).last_tool_name }, 'Background task progress');
+          this.emit('task_progress', event as TaskProgressEvent);
+        } else if (event.subtype === 'task_completed') {
+          this.logger.info({ taskId: (event as TaskCompletedEvent).task_id }, 'Background task completed');
+          this.emit('task_completed', event as TaskCompletedEvent);
         }
         break;
 

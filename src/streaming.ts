@@ -476,37 +476,48 @@ export function extractSubAgentSummary(jsonInput: string, maxLen = 150): string 
   return '';
 }
 
+/** Label fields in priority order (index 0 = highest priority). */
+const LABEL_FIELDS = ['name', 'description', 'subagent_type', 'team_name'] as const;
+
+/** Priority index for a label source field. Lower = better. */
+export function labelFieldPriority(field: string | null): number {
+  if (!field) return LABEL_FIELDS.length + 1; // worst
+  const idx = LABEL_FIELDS.indexOf(field as typeof LABEL_FIELDS[number]);
+  return idx >= 0 ? idx : LABEL_FIELDS.length;
+}
+
 /**
  * Extract a human-readable label for a sub-agent from its JSON tool input.
- * Uses CC's Task tool structured fields: name, description, subagent_type, team_name.
- * No regex guessing — purely structural JSON field extraction.
+ * Returns { label, field } so callers can track priority and upgrade labels
+ * when higher-priority fields become available during streaming.
  */
-export function extractAgentLabel(jsonInput: string): string {
-  // Priority order of CC Task tool fields
-  const labelFields = ['name', 'description', 'subagent_type', 'team_name'];
+export function extractAgentLabel(jsonInput: string): { label: string; field: string | null } {
   const summaryField = 'prompt'; // last resort — first line of prompt
 
   try {
     const parsed = JSON.parse(jsonInput);
-    for (const key of labelFields) {
+    for (const key of LABEL_FIELDS) {
       const val = parsed[key];
       if (typeof val === 'string' && val.trim()) {
-        return val.trim().slice(0, 80);
+        return { label: val.trim().slice(0, 80), field: key };
       }
     }
     if (typeof parsed[summaryField] === 'string' && parsed[summaryField].trim()) {
       const firstLine = parsed[summaryField].trim().split('\n')[0];
-      return firstLine.length > 60 ? firstLine.slice(0, 60) + '…' : firstLine;
+      const label = firstLine.length > 60 ? firstLine.slice(0, 60) + '…' : firstLine;
+      return { label, field: 'prompt' };
     }
-    return '';
+    return { label: '', field: null };
   } catch {
     // JSON incomplete during streaming — extract first complete field value
-    return extractFieldFromPartialJson(jsonInput, labelFields) ?? '';
+    const result = extractFieldFromPartialJsonWithField(jsonInput, LABEL_FIELDS as unknown as string[]);
+    return result ?? { label: '', field: null };
   }
 }
 
-/** Extract the first complete string value for any of the given keys from partial JSON. */
-function extractFieldFromPartialJson(input: string, keys: string[]): string | null {
+/** Extract the first complete string value for any of the given keys from partial JSON.
+ *  Returns { label, field } so callers know which field matched. */
+function extractFieldFromPartialJsonWithField(input: string, keys: string[]): { label: string; field: string } | null {
   for (const key of keys) {
     const idx = input.indexOf(`"${key}"`);
     if (idx === -1) continue;
@@ -522,7 +533,7 @@ function extractFieldFromPartialJson(input: string, keys: string[]): string | nu
         value += afterColon[i + 1] === 'n' ? ' ' : afterColon[i + 1];
         i += 2;
       } else if (afterColon[i] === '"') {
-        if (value.trim()) return value.trim().slice(0, 80);
+        if (value.trim()) return { label: value.trim().slice(0, 80), field: key };
         break;
       } else {
         value += afterColon[i];
@@ -533,6 +544,8 @@ function extractFieldFromPartialJson(input: string, keys: string[]): string | nu
   return null;
 }
 
+
+
 // ── Sub-Agent Tracker ──
 
 export interface SubAgentInfo {
@@ -542,6 +555,7 @@ export interface SubAgentInfo {
   tgMessageId: number | null;
   status: 'running' | 'dispatched' | 'completed' | 'failed';
   label: string;
+  labelField: string | null;  // which JSON field the label came from (for priority upgrades)
   agentName: string;  // CC's agent name (used as 'from' in mailbox)
   inputPreview: string;
   dispatchedAt: number | null;         // timestamp when dispatched
@@ -730,6 +744,7 @@ export class SubAgentTracker {
       tgMessageId: null,
       status: 'running',
       label: '',
+      labelField: null,
       agentName: '',
       inputPreview: '',
       dispatchedAt: null,
@@ -806,13 +821,13 @@ export class SubAgentTracker {
       }
     }
 
-    // Try to extract an agent label
-    if (!info.label) {
-      const label = extractAgentLabel(info.inputPreview);
-      if (label) {
-        info.label = label;
-        this.updateConsolidatedAgentMessage();
-      }
+    // Try to extract an agent label — keep trying for higher-priority fields
+    // (e.g., upgrade from subagent_type "general-purpose" to description "Fix the bug")
+    const extracted = extractAgentLabel(info.inputPreview);
+    if (extracted.label && labelFieldPriority(extracted.field) < labelFieldPriority(info.labelField)) {
+      info.label = extracted.label;
+      info.labelField = extracted.field;
+      this.updateConsolidatedAgentMessage();
     }
   }
 
@@ -827,10 +842,11 @@ export class SubAgentTracker {
     info.status = 'dispatched';
     info.dispatchedAt = Date.now();
 
-    // Final chance to extract label from complete input
-    if (!info.label) {
-      const label = extractAgentLabel(info.inputPreview);
-      if (label) info.label = label;
+    // Final chance to extract label from complete input (may upgrade to higher-priority field)
+    const finalExtracted = extractAgentLabel(info.inputPreview);
+    if (finalExtracted.label && labelFieldPriority(finalExtracted.field) < labelFieldPriority(info.labelField)) {
+      info.label = finalExtracted.label;
+      info.labelField = finalExtracted.field;
     }
 
     this.updateConsolidatedAgentMessage();
@@ -970,6 +986,79 @@ export class SubAgentTracker {
       }
     }
     return null;
+  }
+
+  /** Handle a system task_started event — update the sub-agent status display. */
+  handleTaskStarted(toolUseId: string, description: string, taskType?: string): void {
+    const info = this.agents.get(toolUseId);
+    if (!info) return;
+
+    // Use task_started description as label if we don't have one yet or current is low-priority
+    if (description && labelFieldPriority('description') < labelFieldPriority(info.labelField)) {
+      info.label = description.slice(0, 80);
+      info.labelField = 'description';
+    }
+
+    info.status = 'dispatched';
+    if (!info.dispatchedAt) info.dispatchedAt = Date.now();
+    this.updateConsolidatedAgentMessage();
+  }
+
+  /** Handle a system task_progress event — update the sub-agent status with current activity. */
+  handleTaskProgress(toolUseId: string, description: string, lastToolName?: string): void {
+    const info = this.agents.get(toolUseId);
+    if (!info) return;
+    if (info.status === 'completed') return; // Don't update completed agents
+
+    // Update the consolidated message with progress info
+    this.updateConsolidatedAgentMessageWithProgress(toolUseId, description, lastToolName);
+  }
+
+  /** Handle a system task_completed event. */
+  handleTaskCompleted(toolUseId: string): void {
+    const info = this.agents.get(toolUseId);
+    if (!info || info.status === 'completed') return;
+
+    info.status = 'completed';
+    this.updateConsolidatedAgentMessage();
+
+    // Check if all agents are done
+    const allDone = ![...this.agents.values()].some(a => a.status === 'dispatched');
+    if (allDone && this.onAllReported) {
+      this.onAllReported();
+      this.stopMailboxWatch();
+    }
+  }
+
+  /** Build and edit the shared sub-agent status message with progress info. */
+  private updateConsolidatedAgentMessageWithProgress(progressToolUseId: string, progressDesc: string, lastTool?: string): void {
+    if (!this.consolidatedAgentMsgId) return;
+    const msgId = this.consolidatedAgentMsgId;
+    const lines: string[] = [];
+    for (const info of this.agents.values()) {
+      const label = info.label || info.agentName || info.toolName;
+      if (info.toolUseId === progressToolUseId && info.status !== 'completed') {
+        const toolInfo = lastTool ? ` (${lastTool})` : '';
+        const desc = progressDesc ? `: ${progressDesc.slice(0, 60)}` : '';
+        lines.push(`🤖 ${escapeHtml(label)} — Working${toolInfo}${desc}`);
+      } else {
+        const status = info.status === 'completed' ? '✅ Done'
+          : info.status === 'dispatched' ? 'Waiting for results…'
+          : 'Working…';
+        lines.push(`🤖 ${escapeHtml(label)} — ${status}`);
+      }
+    }
+    const text = lines.join('\n');
+    this.sendQueue = this.sendQueue.then(async () => {
+      try {
+        await this.sender.editMessage(this.chatId, msgId, text, 'HTML');
+      } catch { /* ignore */ }
+    });
+  }
+
+  /** Find a tracked sub-agent by tool_use_id. */
+  getAgentByToolUseId(toolUseId: string): SubAgentInfo | undefined {
+    return this.agents.get(toolUseId);
   }
 
   reset(): void {

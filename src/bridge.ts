@@ -8,7 +8,7 @@ import type {
   AgentConfig,
   ConfigDiff,
 } from './config.js';
-import type { ApiErrorEvent, PermissionRequest, ToolResultEvent } from './cc-protocol.js';
+import type { ApiErrorEvent, PermissionRequest, ToolResultEvent, TaskStartedEvent, TaskProgressEvent, TaskCompletedEvent } from './cc-protocol.js';
 import { resolveUserConfig, resolveRepoPath, updateConfig, isValidRepoName, findRepoOwner } from './config.js';
 import { CCProcess, generateMcpConfig } from './cc-process.js';
 import {
@@ -131,6 +131,7 @@ const HELP_TEXT = `<b>TGCC Commands</b>
 
 <b>Session</b>
 /new — Start a fresh session
+/continue — Respawn process, keep session
 /sessions — List recent sessions
 /resume &lt;id&gt; — Resume a session by ID
 /session — Current session info
@@ -628,6 +629,31 @@ export class Bridge extends EventEmitter implements CtlHandler {
       }
     });
 
+    // System events for background task tracking
+    proc.on('task_started', (event: TaskStartedEvent) => {
+      const accKey = `${userId}:${chatId}`;
+      const tracker = agent.subAgentTrackers.get(accKey);
+      if (tracker) {
+        tracker.handleTaskStarted(event.tool_use_id, event.description, event.task_type);
+      }
+    });
+
+    proc.on('task_progress', (event: TaskProgressEvent) => {
+      const accKey = `${userId}:${chatId}`;
+      const tracker = agent.subAgentTrackers.get(accKey);
+      if (tracker) {
+        tracker.handleTaskProgress(event.tool_use_id, event.description, event.last_tool_name);
+      }
+    });
+
+    proc.on('task_completed', (event: TaskCompletedEvent) => {
+      const accKey = `${userId}:${chatId}`;
+      const tracker = agent.subAgentTrackers.get(accKey);
+      if (tracker) {
+        tracker.handleTaskCompleted(event.tool_use_id);
+      }
+    });
+
     // Media from tool results (images, PDFs, etc.)
     proc.on('media', (media: { kind: string; media_type: string; data: string }) => {
       const buf = Buffer.from(media.data, 'base64');
@@ -887,7 +913,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
       case 'ping': {
         const proc = agent.processes.get(cmd.userId);
         const state = proc?.state ?? 'idle';
-        await agent.tgBot.sendText(cmd.chatId, `pong — process: ${state.toUpperCase()}`);
+        await agent.tgBot.sendText(cmd.chatId, `pong — process: <b>${state.toUpperCase()}</b>`, 'HTML');
         break;
       }
 
@@ -912,7 +938,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
       case 'cost': {
         const proc = agent.processes.get(cmd.userId);
-        await agent.tgBot.sendText(cmd.chatId, `Session cost: $${(proc?.totalCostUsd ?? 0).toFixed(4)}`);
+        await agent.tgBot.sendText(cmd.chatId, `<b>Session cost:</b> $${(proc?.totalCostUsd ?? 0).toFixed(4)}`, 'HTML');
         break;
       }
 
@@ -924,6 +950,16 @@ export class Bridge extends EventEmitter implements CtlHandler {
         }
         this.sessionStore.clearSession(agentId, cmd.userId);
         await agent.tgBot.sendText(cmd.chatId, 'Session cleared. Next message starts fresh.');
+        break;
+      }
+
+      case 'continue': {
+        const proc = agent.processes.get(cmd.userId);
+        if (proc) {
+          proc.destroy();
+          agent.processes.delete(cmd.userId);
+        }
+        await agent.tgBot.sendText(cmd.chatId, 'Process respawned. Session kept — next message continues where you left off.');
         break;
       }
 
@@ -992,14 +1028,31 @@ export class Bridge extends EventEmitter implements CtlHandler {
       }
 
       case 'model': {
+        const MODEL_OPTIONS = ['opus', 'sonnet', 'haiku'];
         if (!cmd.args) {
           const current = this.sessionStore.getUser(agentId, cmd.userId).model
             || resolveUserConfig(agent.config, cmd.userId).model;
-          await agent.tgBot.sendText(cmd.chatId, `Current model: ${current}\n\nUsage: /model <model-name>`);
+          const keyboard = new InlineKeyboard();
+          for (const m of MODEL_OPTIONS) {
+            const isCurrent = current.includes(m);
+            keyboard.text(isCurrent ? `${m} ✓` : m, `model:${m}`);
+          }
+          keyboard.row().text('Custom…', `model:custom`);
+          await agent.tgBot.sendTextWithKeyboard(
+            cmd.chatId,
+            `<b>Current model:</b> <code>${escapeHtml(current)}</code>`,
+            keyboard,
+            'HTML',
+          );
           break;
         }
         this.sessionStore.setModel(agentId, cmd.userId, cmd.args.trim());
-        await agent.tgBot.sendText(cmd.chatId, `Model set to <code>${escapeHtml(cmd.args.trim())}</code>. Takes effect on next spawn.`, 'HTML');
+        const proc = agent.processes.get(cmd.userId);
+        if (proc) {
+          proc.destroy();
+          agent.processes.delete(cmd.userId);
+        }
+        await agent.tgBot.sendText(cmd.chatId, `Model set to <code>${escapeHtml(cmd.args.trim())}</code>. Process respawned.`, 'HTML');
         break;
       }
 
@@ -1021,11 +1074,11 @@ export class Bridge extends EventEmitter implements CtlHandler {
             break;
           }
           if (!existsSync(repoAddPath)) {
-            await agent.tgBot.sendText(cmd.chatId, `Path not found: ${repoAddPath}`);
+            await agent.tgBot.sendText(cmd.chatId, `Path not found: <code>${escapeHtml(repoAddPath)}</code>`, 'HTML');
             break;
           }
           if (this.config.repos[repoName]) {
-            await agent.tgBot.sendText(cmd.chatId, `Repo "${repoName}" already exists.`);
+            await agent.tgBot.sendText(cmd.chatId, `Repo <code>${escapeHtml(repoName)}</code> already exists.`, 'HTML');
             break;
           }
           updateConfig((cfg) => {
@@ -1045,14 +1098,14 @@ export class Bridge extends EventEmitter implements CtlHandler {
             break;
           }
           if (!this.config.repos[repoName]) {
-            await agent.tgBot.sendText(cmd.chatId, `Repo "${repoName}" not found.`);
+            await agent.tgBot.sendText(cmd.chatId, `Repo <code>${escapeHtml(repoName)}</code> not found.`, 'HTML');
             break;
           }
           // Check if any agent has it assigned
           const rawCfg = JSON.parse(readFileSync(join(homedir(), '.tgcc', 'config.json'), 'utf-8'));
           const owner = findRepoOwner(rawCfg, repoName);
           if (owner) {
-            await agent.tgBot.sendText(cmd.chatId, `Can't remove: repo "${repoName}" is assigned to agent "${owner}". Use /repo clear on that agent first.`);
+            await agent.tgBot.sendText(cmd.chatId, `Can't remove: repo <code>${escapeHtml(repoName)}</code> is assigned to agent <code>${escapeHtml(owner)}</code>. Use /repo clear on that agent first.`, 'HTML');
             break;
           }
           updateConfig((cfg) => {
@@ -1072,13 +1125,13 @@ export class Bridge extends EventEmitter implements CtlHandler {
             break;
           }
           if (!this.config.repos[repoName]) {
-            await agent.tgBot.sendText(cmd.chatId, `Repo "${repoName}" not found in registry.`);
+            await agent.tgBot.sendText(cmd.chatId, `Repo <code>${escapeHtml(repoName)}</code> not found in registry.`, 'HTML');
             break;
           }
           const rawCfg2 = JSON.parse(readFileSync(join(homedir(), '.tgcc', 'config.json'), 'utf-8'));
           const existingOwner = findRepoOwner(rawCfg2, repoName);
           if (existingOwner && existingOwner !== agentId) {
-            await agent.tgBot.sendText(cmd.chatId, `Repo "${repoName}" is already assigned to agent "${existingOwner}".`);
+            await agent.tgBot.sendText(cmd.chatId, `Repo <code>${escapeHtml(repoName)}</code> is already assigned to agent <code>${escapeHtml(existingOwner)}</code>.`, 'HTML');
             break;
           }
           updateConfig((cfg) => {
@@ -1142,7 +1195,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
               'HTML',
             );
           } else {
-            await agent.tgBot.sendText(cmd.chatId, `Current repo: ${current}\n\nUsage: /repo <path>`);
+            await agent.tgBot.sendText(cmd.chatId, `<b>Current repo:</b> <code>${escapeHtml(current)}</code>\n\nUsage: /repo &lt;path&gt;`, 'HTML');
           }
           break;
         }
@@ -1150,7 +1203,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
         // Fallback: /repo <path-or-name> — switch working directory for session
         const repoPath = resolveRepoPath(this.config.repos, cmd.args.trim());
         if (!existsSync(repoPath)) {
-          await agent.tgBot.sendText(cmd.chatId, `Path not found: ${repoPath}`);
+          await agent.tgBot.sendText(cmd.chatId, `Path not found: <code>${escapeHtml(repoPath)}</code>`, 'HTML');
           break;
         }
         // Kill current process (different CWD needs new process)
@@ -1300,6 +1353,24 @@ export class Bridge extends EventEmitter implements CtlHandler {
       case 'repo_add': {
         await agent.tgBot.answerCallbackQuery(query.callbackQueryId, 'Usage below');
         await agent.tgBot.sendText(query.chatId, 'Send: <code>/repo add &lt;name&gt; &lt;path&gt;</code>', 'HTML');
+        break;
+      }
+
+      case 'model': {
+        const model = query.data;
+        if (model === 'custom') {
+          await agent.tgBot.answerCallbackQuery(query.callbackQueryId, 'Usage below');
+          await agent.tgBot.sendText(query.chatId, 'Send: <code>/model &lt;model-name&gt;</code>', 'HTML');
+          break;
+        }
+        this.sessionStore.setModel(agentId, query.userId, model);
+        const proc = agent.processes.get(query.userId);
+        if (proc) {
+          proc.destroy();
+          agent.processes.delete(query.userId);
+        }
+        await agent.tgBot.answerCallbackQuery(query.callbackQueryId, `Model: ${model}`);
+        await agent.tgBot.sendText(query.chatId, `Model set to <code>${escapeHtml(model)}</code>. Process respawned.`, 'HTML');
         break;
       }
 

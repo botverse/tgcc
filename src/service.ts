@@ -95,7 +95,15 @@ export async function main(): Promise<void> {
   logger.info('TGCC is running');
 }
 
-main().catch((err) => {
-  console.error('Fatal error:', err);
-  process.exit(1);
-});
+// Self-execute only when run directly (node dist/service.js / tsx src/service.ts),
+// not when imported by cli.ts — otherwise main() runs twice.
+const isDirectRun =
+  import.meta.url === `file://${process.argv[1]}` ||
+  import.meta.url === `file://${process.argv[1].replace(/\.ts$/, '.js')}`;
+
+if (isDirectRun) {
+  main().catch((err) => {
+    console.error('Fatal error:', err);
+    process.exit(1);
+  });
+}
