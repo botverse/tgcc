@@ -27,10 +27,8 @@ import { InlineKeyboard } from 'grammy';
 import { McpBridgeServer, type McpToolRequest, type McpToolResponse } from './mcp-bridge.js';
 import {
   SessionStore,
-  findMissedSessions,
-  formatCatchupMessage,
   getSessionJsonlPath,
-  summarizeJsonlDelta,
+  discoverCCSessions,
 } from './session.js';
 import {
   CtlServer,
@@ -38,6 +36,7 @@ import {
   type CtlAckResponse,
   type CtlStatusResponse,
 } from './ctl-server.js';
+import { ProcessRegistry, type ClientRef, type ProcessEntry } from './process-registry.js';
 
 // ── Types ──
 
@@ -56,7 +55,6 @@ interface AgentInstance {
   accumulators: Map<string, StreamAccumulator>; // `${userId}:${chatId}` → accumulator
   subAgentTrackers: Map<string, SubAgentTracker>; // `${userId}:${chatId}` → tracker
   batchers: Map<string, MessageBatcher>;   // userId → batcher
-  pendingTitles: Map<string, string>;      // userId → first message text for session title
   pendingPermissions: Map<string, PendingPermission>; // requestId → pending permission
   typingIntervals: Map<string, ReturnType<typeof setInterval>>; // `${userId}:${chatId}` → interval
 }
@@ -160,6 +158,8 @@ const HELP_TEXT = `<b>TGCC Commands</b>
 export class Bridge extends EventEmitter implements CtlHandler {
   private config: TgccConfig;
   private agents = new Map<string, AgentInstance>();
+  private processRegistry = new ProcessRegistry();
+  private sessionModelOverrides = new Map<string, string>();  // "agentId:userId" → model (from /model cmd, not persisted)
   private mcpServer: McpBridgeServer;
   private ctlServer: CtlServer;
   private sessionStore: SessionStore;
@@ -210,7 +210,6 @@ export class Bridge extends EventEmitter implements CtlHandler {
       accumulators: new Map(),
       subAgentTrackers: new Map(),
       batchers: new Map(),
-      pendingTitles: new Map(),
       pendingPermissions: new Map(),
       typingIntervals: new Map(),
     };
@@ -266,6 +265,13 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
     // Stop bot
     await agent.tgBot.stop();
+
+    // Unsubscribe all clients for this agent from the registry
+    for (const [userId] of agent.processes) {
+      const chatId = Number(userId); // In TG, private chat ID === user ID
+      const clientRef: ClientRef = { agentId, userId, chatId };
+      this.processRegistry.unsubscribe(clientRef);
+    }
 
     // Kill all CC processes and wait for them to exit
     const processExitPromises: Promise<void>[] = [];
@@ -326,7 +332,6 @@ export class Bridge extends EventEmitter implements CtlHandler {
     }
     agent.typingIntervals.clear();
 
-    agent.pendingTitles.clear();
     agent.pendingPermissions.clear();
     agent.processes.clear();
     agent.batchers.clear();
@@ -392,13 +397,19 @@ export class Bridge extends EventEmitter implements CtlHandler {
       ccMsg = createTextMessage(data.text);
     }
 
-    // Get or create CC process
-    let proc = agent.processes.get(userId);
+    const clientRef: ClientRef = { agentId, userId, chatId };
+
+    // Check if this client already has a process via the registry
+    let existingEntry = this.processRegistry.findByClient(clientRef);
+    let proc = existingEntry?.ccProcess;
+
     if (proc?.takenOver) {
       // Session was taken over externally — discard old process
-      proc.destroy();
+      const entry = this.processRegistry.findByClient(clientRef)!;
+      this.processRegistry.destroy(entry.repo, entry.sessionId);
       agent.processes.delete(userId);
       proc = undefined;
+      existingEntry = null;
     }
 
     // Staleness check: detect if session was modified by another client
@@ -412,9 +423,11 @@ export class Bridge extends EventEmitter implements CtlHandler {
       if (staleInfo) {
         // Session was modified externally — silently reconnect for roaming support
         this.logger.info({ agentId, userId }, 'Session modified externally — reconnecting for roaming');
-        proc.destroy();
+        const entry = this.processRegistry.findByClient(clientRef)!;
+        this.processRegistry.unsubscribe(clientRef);
         agent.processes.delete(userId);
         proc = undefined;
+        existingEntry = null;
       }
     }
 
@@ -430,9 +443,32 @@ export class Bridge extends EventEmitter implements CtlHandler {
         ).catch(err => this.logger.error({ err }, 'Failed to send no-repo warning'));
       }
 
+      // Check if another client already has a process for this repo+session
+      const sessionId = userState2.currentSessionId;
+      if (sessionId && resolvedRepo) {
+        const sharedEntry = this.processRegistry.get(resolvedRepo, sessionId);
+        if (sharedEntry && sharedEntry.ccProcess.state !== 'idle') {
+          // Attach to existing process as subscriber
+          this.processRegistry.subscribe(resolvedRepo, sessionId, clientRef);
+          proc = sharedEntry.ccProcess;
+          agent.processes.set(userId, proc);
+
+          // Notify the user they've attached
+          agent.tgBot.sendText(
+            chatId,
+            '<blockquote>📎 Attached to existing session process.</blockquote>',
+            'HTML',
+          ).catch(err => this.logger.error({ err }, 'Failed to send attach notification'));
+
+          // Show typing indicator and forward message
+          this.startTypingIndicator(agent, userId, chatId);
+          proc.sendMessage(ccMsg);
+          return;
+        }
+      }
+
       // Save first message text as pending session title
       if (data.text) {
-        agent.pendingTitles.set(userId, data.text);
       }
       proc = this.spawnCCProcess(agentId, userId, chatId);
       agent.processes.set(userId, proc);
@@ -442,62 +478,37 @@ export class Bridge extends EventEmitter implements CtlHandler {
     this.startTypingIndicator(agent, userId, chatId);
 
     proc.sendMessage(ccMsg);
-    this.sessionStore.updateSessionActivity(agentId, userId);
   }
 
   /** Check if the session JSONL was modified externally since we last tracked it. */
-  private checkSessionStaleness(agentId: string, userId: string): { summary: string } | null {
-    const userState = this.sessionStore.getUser(agentId, userId);
-    const sessionId = userState.currentSessionId;
-    if (!sessionId) return null;
-
-    const repo = userState.repo || resolveUserConfig(
-      this.agents.get(agentId)!.config, userId,
-    ).repo;
-
-    const jsonlPath = getSessionJsonlPath(sessionId, repo);
-    const tracking = this.sessionStore.getJsonlTracking(agentId, userId);
-
-    // No tracking yet (first message or new session) — not stale
-    if (!tracking) return null;
-
-    try {
-      const stat = statSync(jsonlPath);
-      // File grew or was modified since we last tracked
-      if (stat.size <= tracking.size && stat.mtimeMs <= tracking.mtimeMs) {
-        return null;
-      }
-
-      // Session is stale — build a summary of what happened
-      const summary = summarizeJsonlDelta(jsonlPath, tracking.size)
-        ?? '<i>ℹ️ Session was updated from another client. Reconnecting...</i>';
-
-      return { summary };
-    } catch {
-      // File doesn't exist or stat failed — skip check
-      return null;
-    }
+  private checkSessionStaleness(_agentId: string, _userId: string): { summary: string } | null {
+    // With shared process registry, staleness is handled by the registry itself
+    return null;
   }
 
-  /** Update JSONL tracking from the current file state. */
-  private updateJsonlTracking(agentId: string, userId: string): void {
-    const userState = this.sessionStore.getUser(agentId, userId);
-    const sessionId = userState.currentSessionId;
-    if (!sessionId) return;
+  // ── Process cleanup helper ──
 
-    const repo = userState.repo || resolveUserConfig(
-      this.agents.get(agentId)!.config, userId,
-    ).repo;
+  /**
+   * Disconnect a client from its CC process.
+   * If other subscribers remain, the process stays alive.
+   * If this was the last subscriber, the process is destroyed.
+   */
+  private disconnectClient(agentId: string, userId: string, chatId: number): void {
+    const agent = this.agents.get(agentId);
+    if (!agent) return;
 
-    const jsonlPath = getSessionJsonlPath(sessionId, repo);
+    const clientRef: ClientRef = { agentId, userId, chatId };
+    const proc = agent.processes.get(userId);
+    const destroyed = this.processRegistry.unsubscribe(clientRef);
 
-    try {
-      const stat = statSync(jsonlPath);
-      this.sessionStore.updateJsonlTracking(agentId, userId, stat.size, stat.mtimeMs);
-    } catch {
-      // File doesn't exist yet — clear tracking
-      this.sessionStore.clearJsonlTracking(agentId, userId);
+    if (!destroyed && proc) {
+      // Other subscribers still attached — just remove from this agent's map
+    } else if (proc && !destroyed) {
+      // Not in registry but has a process — destroy directly (legacy path)
+      proc.destroy();
     }
+
+    agent.processes.delete(userId);
   }
 
   // ── Typing indicator management ──
@@ -527,10 +538,30 @@ export class Bridge extends EventEmitter implements CtlHandler {
     const agent = this.agents.get(agentId)!;
     const userConfig = resolveUserConfig(agent.config, userId);
 
-    // Check session store for model/repo/permission overrides
+    // Check session store for repo/permission overrides
     const userState = this.sessionStore.getUser(agentId, userId);
-    if (userState.model) userConfig.model = userState.model;
     if (userState.repo) userConfig.repo = userState.repo;
+
+    // Model priority: /model override > running process > session JSONL > agent config default
+    const modelOverride = this.sessionModelOverrides.get(`${agentId}:${userId}`);
+    if (modelOverride) {
+      userConfig.model = modelOverride;
+      // Don't delete yet — cleared when CC writes first assistant message
+    } else {
+      const currentSessionId = userState.currentSessionId;
+      if (currentSessionId && userConfig.repo) {
+        const registryEntry = this.processRegistry.get(userConfig.repo, currentSessionId);
+        if (registryEntry?.model) {
+          userConfig.model = registryEntry.model;
+        } else {
+          const sessions = discoverCCSessions(userConfig.repo, 20);
+          const sessionInfo = sessions.find(s => s.id === currentSessionId);
+          if (sessionInfo?.model) {
+            userConfig.model = sessionInfo.model;
+          }
+        }
+      }
+    }
     if (userState.permissionMode) {
       userConfig.permissionMode = userState.permissionMode as typeof userConfig.permissionMode;
     }
@@ -559,123 +590,194 @@ export class Bridge extends EventEmitter implements CtlHandler {
       logger: this.logger,
     });
 
-    // ── Wire up event handlers ──
+    // Register in the process registry
+    const ownerRef: ClientRef = { agentId, userId, chatId };
+    // We'll register once we know the sessionId (on init), but we need a
+    // temporary entry for pre-init event routing. Use a placeholder sessionId
+    // that gets updated on init.
+    const tentativeSessionId = userState.currentSessionId ?? `pending-${Date.now()}`;
+    const registryEntry = this.processRegistry.register(
+      userConfig.repo,
+      tentativeSessionId,
+      userConfig.model || 'default',
+      proc,
+      ownerRef,
+    );
+
+    // ── Helper: get all subscribers for this process from the registry ──
+    const getEntry = (): ProcessEntry | null => this.processRegistry.findByProcess(proc);
+
+    // ── Wire up event handlers (broadcast to all subscribers) ──
 
     proc.on('init', (event: InitEvent) => {
       this.sessionStore.setCurrentSession(agentId, userId, event.session_id);
-      // Set session title from the first user message
-      const pendingTitle = agent.pendingTitles.get(userId);
-      if (pendingTitle) {
-        this.sessionStore.setSessionTitle(agentId, userId, event.session_id, pendingTitle);
-        agent.pendingTitles.delete(userId);
+
+      // Update registry key if session ID changed from tentative
+      if (event.session_id !== tentativeSessionId) {
+        // Re-register with the real session ID
+        const entry = getEntry();
+        if (entry) {
+          // Save subscribers before removing
+          const savedSubs = [...entry.subscribers.entries()];
+          this.processRegistry.remove(userConfig.repo, tentativeSessionId);
+          const newEntry = this.processRegistry.register(userConfig.repo, event.session_id, userConfig.model || 'default', proc, ownerRef);
+          // Restore additional subscribers
+          for (const [, sub] of savedSubs) {
+            if (sub.client.agentId !== agentId || sub.client.userId !== userId || sub.client.chatId !== chatId) {
+              this.processRegistry.subscribe(userConfig.repo, event.session_id, sub.client);
+              const newSub = this.processRegistry.getSubscriber(newEntry, sub.client);
+              if (newSub) {
+                newSub.accumulator = sub.accumulator;
+                newSub.tracker = sub.tracker;
+              }
+            }
+          }
+        }
       }
-      // Initialize JSONL tracking for staleness detection
-      this.updateJsonlTracking(agentId, userId);
     });
 
     proc.on('stream_event', (event: StreamInnerEvent) => {
-      this.handleStreamEvent(agentId, userId, chatId, event);
+      const entry = getEntry();
+      if (!entry) {
+        // Fallback: single subscriber mode (shouldn't happen)
+        this.handleStreamEvent(agentId, userId, chatId, event);
+        return;
+      }
+      for (const sub of this.processRegistry.subscribers(entry)) {
+        this.handleStreamEvent(sub.client.agentId, sub.client.userId, sub.client.chatId, event);
+      }
     });
 
     proc.on('tool_result', (event: ToolResultEvent) => {
-      const accKey = `${userId}:${chatId}`;
+      const entry = getEntry();
+      const subscriberList = entry ? [...this.processRegistry.subscribers(entry)] : [{ client: ownerRef }];
 
-      // Resolve tool indicator message with success/failure status
-      const acc2 = agent.accumulators.get(accKey);
-      if (acc2 && event.tool_use_id) {
-        const isError = event.is_error === true;
-        const contentStr = typeof event.content === 'string' ? event.content : JSON.stringify(event.content);
-        const errorMsg = isError ? contentStr : undefined;
-        acc2.resolveToolMessage(event.tool_use_id, isError, errorMsg, contentStr);
-      }
+      for (const sub of subscriberList) {
+        const subAgent = this.agents.get(sub.client.agentId);
+        if (!subAgent) continue;
 
-      const tracker = agent.subAgentTrackers.get(accKey);
-      if (!tracker) return;
+        const accKey = `${sub.client.userId}:${sub.client.chatId}`;
 
-      const resultText = typeof event.content === 'string' ? event.content : JSON.stringify(event.content);
-      const meta = event.tool_use_result;
-
-      // Log warning if structured metadata is missing
-      if (!meta && /agent_id:\s*\S+@\S+/.test(resultText)) {
-        this.logger.warn({ agentId, toolUseId: event.tool_use_id }, 'Spawn detected in text but no structured tool_use_result metadata - skipping');
-      }
-
-      const spawnMeta = meta?.status === 'teammate_spawned' ? meta : undefined;
-
-      if (spawnMeta?.status === 'teammate_spawned' && spawnMeta.team_name) {
-        if (!tracker.currentTeamName) {
-          this.logger.info({ agentId, teamName: spawnMeta.team_name, agentName: spawnMeta.name, agentType: spawnMeta.agent_type }, 'Spawn detected');
-          tracker.setTeamName(spawnMeta.team_name!);
-
-          // Wire the "all agents reported" callback to send follow-up to CC
-          tracker.setOnAllReported(() => {
-            const ccProc = agent.processes.get(userId);
-            if (ccProc && ccProc.state === 'active') {
-              ccProc.sendMessage(createTextMessage(
-                '[System] All background agents have reported back. Please read their results from the mailbox/files and provide a synthesis to the user.',
-              ));
-            }
-          });
+        // Resolve tool indicator message with success/failure status
+        const acc2 = subAgent.accumulators.get(accKey);
+        if (acc2 && event.tool_use_id) {
+          const isError = event.is_error === true;
+          const contentStr = typeof event.content === 'string' ? event.content : JSON.stringify(event.content);
+          const errorMsg = isError ? contentStr : undefined;
+          acc2.resolveToolMessage(event.tool_use_id, isError, errorMsg, contentStr, event.tool_use_result);
         }
 
-        // Set agent metadata from structured data or text fallback
-        if (event.tool_use_id && spawnMeta.name) {
-          tracker.setAgentMetadata(event.tool_use_id, {
-            agentName: spawnMeta.name,
-            agentType: spawnMeta.agent_type,
-            color: spawnMeta.color,
-          });
+        const tracker = subAgent.subAgentTrackers.get(accKey);
+        if (!tracker) continue;
+
+        const resultText = typeof event.content === 'string' ? event.content : JSON.stringify(event.content);
+        const meta = event.tool_use_result;
+
+        // Log warning if structured metadata is missing
+        if (!meta && /agent_id:\s*\S+@\S+/.test(resultText)) {
+          this.logger.warn({ agentId: sub.client.agentId, toolUseId: event.tool_use_id }, 'Spawn detected in text but no structured tool_use_result metadata - skipping');
         }
-      }
 
-      // Handle tool result (sets status, edits TG message)
-      if (event.tool_use_id) {
-        tracker.handleToolResult(event.tool_use_id, resultText);
-      }
+        const spawnMeta = meta?.status === 'teammate_spawned' ? meta : undefined;
 
-      // Start mailbox watch AFTER handleToolResult has set agent names
-      if (tracker.currentTeamName && tracker.hasDispatchedAgents && !tracker.isMailboxWatching) {
-        tracker.startMailboxWatch();
+        if (spawnMeta?.status === 'teammate_spawned' && spawnMeta.team_name) {
+          if (!tracker.currentTeamName) {
+            this.logger.info({ agentId: sub.client.agentId, teamName: spawnMeta.team_name, agentName: spawnMeta.name, agentType: spawnMeta.agent_type }, 'Spawn detected');
+            tracker.setTeamName(spawnMeta.team_name!);
+
+            // Wire the "all agents reported" callback to send follow-up to CC
+            tracker.setOnAllReported(() => {
+              if (proc.state === 'active') {
+                proc.sendMessage(createTextMessage(
+                  '[System] All background agents have reported back. Please read their results from the mailbox/files and provide a synthesis to the user.',
+                ));
+              }
+            });
+          }
+
+          // Set agent metadata from structured data or text fallback
+          if (event.tool_use_id && spawnMeta.name) {
+            tracker.setAgentMetadata(event.tool_use_id, {
+              agentName: spawnMeta.name,
+              agentType: spawnMeta.agent_type,
+              color: spawnMeta.color,
+            });
+          }
+        }
+
+        // Handle tool result (sets status, edits TG message)
+        if (event.tool_use_id) {
+          tracker.handleToolResult(event.tool_use_id, resultText);
+        }
+
+        // Start mailbox watch AFTER handleToolResult has set agent names
+        if (tracker.currentTeamName && tracker.hasDispatchedAgents && !tracker.isMailboxWatching) {
+          tracker.startMailboxWatch();
+        }
       }
     });
 
-    // System events for background task tracking
+    // System events for background task tracking — broadcast to all subscribers
     proc.on('task_started', (event: TaskStartedEvent) => {
-      const accKey = `${userId}:${chatId}`;
-      const tracker = agent.subAgentTrackers.get(accKey);
-      if (tracker) {
-        tracker.handleTaskStarted(event.tool_use_id, event.description, event.task_type);
+      const entry = getEntry();
+      const subscriberList = entry ? [...this.processRegistry.subscribers(entry)] : [{ client: ownerRef }];
+      for (const sub of subscriberList) {
+        const subAgent = this.agents.get(sub.client.agentId);
+        if (!subAgent) continue;
+        const accKey = `${sub.client.userId}:${sub.client.chatId}`;
+        const tracker = subAgent.subAgentTrackers.get(accKey);
+        if (tracker) {
+          tracker.handleTaskStarted(event.tool_use_id, event.description, event.task_type);
+        }
       }
     });
 
     proc.on('task_progress', (event: TaskProgressEvent) => {
-      const accKey = `${userId}:${chatId}`;
-      const tracker = agent.subAgentTrackers.get(accKey);
-      if (tracker) {
-        tracker.handleTaskProgress(event.tool_use_id, event.description, event.last_tool_name);
+      const entry = getEntry();
+      const subscriberList = entry ? [...this.processRegistry.subscribers(entry)] : [{ client: ownerRef }];
+      for (const sub of subscriberList) {
+        const subAgent = this.agents.get(sub.client.agentId);
+        if (!subAgent) continue;
+        const accKey = `${sub.client.userId}:${sub.client.chatId}`;
+        const tracker = subAgent.subAgentTrackers.get(accKey);
+        if (tracker) {
+          tracker.handleTaskProgress(event.tool_use_id, event.description, event.last_tool_name);
+        }
       }
     });
 
     proc.on('task_completed', (event: TaskCompletedEvent) => {
-      const accKey = `${userId}:${chatId}`;
-      const tracker = agent.subAgentTrackers.get(accKey);
-      if (tracker) {
-        tracker.handleTaskCompleted(event.tool_use_id);
+      const entry = getEntry();
+      const subscriberList = entry ? [...this.processRegistry.subscribers(entry)] : [{ client: ownerRef }];
+      for (const sub of subscriberList) {
+        const subAgent = this.agents.get(sub.client.agentId);
+        if (!subAgent) continue;
+        const accKey = `${sub.client.userId}:${sub.client.chatId}`;
+        const tracker = subAgent.subAgentTrackers.get(accKey);
+        if (tracker) {
+          tracker.handleTaskCompleted(event.tool_use_id);
+        }
       }
     });
 
-    // Media from tool results (images, PDFs, etc.)
+    // Media from tool results (images, PDFs, etc.) — broadcast to all subscribers
     proc.on('media', (media: { kind: string; media_type: string; data: string }) => {
       const buf = Buffer.from(media.data, 'base64');
-      if (media.kind === 'image') {
-        agent.tgBot.sendPhotoBuffer(chatId, buf).catch(err => {
-          this.logger.error({ err, agentId, userId }, 'Failed to send tool_result image');
-        });
-      } else if (media.kind === 'document') {
-        const ext = media.media_type === 'application/pdf' ? '.pdf' : '';
-        agent.tgBot.sendDocumentBuffer(chatId, buf, `document${ext}`).catch(err => {
-          this.logger.error({ err, agentId, userId }, 'Failed to send tool_result document');
-        });
+      const entry = getEntry();
+      const subscriberList = entry ? [...this.processRegistry.subscribers(entry)] : [{ client: ownerRef }];
+      for (const sub of subscriberList) {
+        const subAgent = this.agents.get(sub.client.agentId);
+        if (!subAgent) continue;
+        if (media.kind === 'image') {
+          subAgent.tgBot.sendPhotoBuffer(sub.client.chatId, buf).catch(err => {
+            this.logger.error({ err, agentId: sub.client.agentId, userId: sub.client.userId }, 'Failed to send tool_result image');
+          });
+        } else if (media.kind === 'document') {
+          const ext = media.media_type === 'application/pdf' ? '.pdf' : '';
+          subAgent.tgBot.sendDocumentBuffer(sub.client.chatId, buf, `document${ext}`).catch(err => {
+            this.logger.error({ err, agentId: sub.client.agentId, userId: sub.client.userId }, 'Failed to send tool_result document');
+          });
+        }
       }
     });
 
@@ -685,15 +787,26 @@ export class Bridge extends EventEmitter implements CtlHandler {
     });
 
     proc.on('result', (event: ResultEvent) => {
-      this.stopTypingIndicator(agent, userId, chatId);
-      this.handleResult(agentId, userId, chatId, event);
+      // Model override consumed — CC has written to JSONL
+      this.sessionModelOverrides.delete(`${agentId}:${userId}`);
+
+      // Broadcast result to all subscribers
+      const entry = getEntry();
+      const subscriberList = entry ? [...this.processRegistry.subscribers(entry)] : [{ client: ownerRef }];
+      for (const sub of subscriberList) {
+        const subAgent = this.agents.get(sub.client.agentId);
+        if (!subAgent) continue;
+        this.stopTypingIndicator(subAgent, sub.client.userId, sub.client.chatId);
+        this.handleResult(sub.client.agentId, sub.client.userId, sub.client.chatId, event);
+      }
     });
 
     proc.on('permission_request', (event: PermissionRequest) => {
+      // Send permission request only to the owner (first subscriber)
       const req = event.request;
       const requestId = event.request_id;
 
-      // Store pending permission
+      // Store pending permission on the owner's agent
       agent.pendingPermissions.set(requestId, {
         requestId,
         userId,
@@ -732,46 +845,99 @@ export class Bridge extends EventEmitter implements CtlHandler {
         ? `<blockquote>⚠️ API overloaded, retrying...${retryInfo}</blockquote>`
         : `<blockquote>⚠️ ${escapeHtml(errMsg)}${retryInfo}</blockquote>`;
 
-      agent.tgBot.sendText(chatId, text, 'HTML')
-        .catch(err => this.logger.error({ err }, 'Failed to send API error notification'));
+      // Broadcast API error to all subscribers
+      const entry = getEntry();
+      const subscriberList = entry ? [...this.processRegistry.subscribers(entry)] : [{ client: ownerRef }];
+      for (const sub of subscriberList) {
+        const subAgent = this.agents.get(sub.client.agentId);
+        if (!subAgent) continue;
+        subAgent.tgBot.sendText(sub.client.chatId, text, 'HTML')
+          .catch(err => this.logger.error({ err }, 'Failed to send API error notification'));
+      }
     });
 
     proc.on('hang', () => {
-      this.stopTypingIndicator(agent, userId, chatId);
-      agent.tgBot.sendText(chatId, '<blockquote>⏸ Session paused. Send a message to continue.</blockquote>', 'HTML')
-        .catch(err => this.logger.error({ err }, 'Failed to send hang notification'));
+      // Broadcast hang notification to all subscribers
+      const entry = getEntry();
+      const subscriberList = entry ? [...this.processRegistry.subscribers(entry)] : [{ client: ownerRef }];
+      for (const sub of subscriberList) {
+        const subAgent = this.agents.get(sub.client.agentId);
+        if (!subAgent) continue;
+        this.stopTypingIndicator(subAgent, sub.client.userId, sub.client.chatId);
+        subAgent.tgBot.sendText(sub.client.chatId, '<blockquote>⏸ Session paused. Send a message to continue.</blockquote>', 'HTML')
+          .catch(err => this.logger.error({ err }, 'Failed to send hang notification'));
+      }
     });
 
     proc.on('takeover', () => {
-      this.stopTypingIndicator(agent, userId, chatId);
       this.logger.warn({ agentId, userId }, 'Session takeover detected — keeping session for roaming');
+      // Notify and clean up all subscribers
+      const entry = getEntry();
+      if (entry) {
+        for (const sub of this.processRegistry.subscribers(entry)) {
+          const subAgent = this.agents.get(sub.client.agentId);
+          if (!subAgent) continue;
+          this.stopTypingIndicator(subAgent, sub.client.userId, sub.client.chatId);
+          subAgent.processes.delete(sub.client.userId);
+        }
+        // Remove from registry without destroying (already handling exit)
+        this.processRegistry.remove(entry.repo, entry.sessionId);
+      }
       // Don't clear session — allow roaming between clients.
-      // Just kill the current process; next message will --resume the same session.
       proc.destroy();
-      agent.processes.delete(userId);
     });
 
     proc.on('exit', () => {
-      this.stopTypingIndicator(agent, userId, chatId);
-      // Finalize any active accumulator
-      const accKey = `${userId}:${chatId}`;
-      const acc = agent.accumulators.get(accKey);
-      if (acc) {
-        acc.finalize();
-        agent.accumulators.delete(accKey);
+      // Clean up all subscribers
+      const entry = getEntry();
+      if (entry) {
+        for (const sub of this.processRegistry.subscribers(entry)) {
+          const subAgent = this.agents.get(sub.client.agentId);
+          if (!subAgent) continue;
+          this.stopTypingIndicator(subAgent, sub.client.userId, sub.client.chatId);
+
+          const accKey = `${sub.client.userId}:${sub.client.chatId}`;
+          const acc = subAgent.accumulators.get(accKey);
+          if (acc) {
+            acc.finalize();
+            subAgent.accumulators.delete(accKey);
+          }
+          const exitTracker = subAgent.subAgentTrackers.get(accKey);
+          if (exitTracker) {
+            exitTracker.stopMailboxWatch();
+          }
+          subAgent.subAgentTrackers.delete(accKey);
+        }
+        // Remove from registry (process already exited)
+        this.processRegistry.remove(entry.repo, entry.sessionId);
+      } else {
+        // Fallback: clean up owner only
+        this.stopTypingIndicator(agent, userId, chatId);
+        const accKey = `${userId}:${chatId}`;
+        const acc = agent.accumulators.get(accKey);
+        if (acc) {
+          acc.finalize();
+          agent.accumulators.delete(accKey);
+        }
+        const exitTracker = agent.subAgentTrackers.get(accKey);
+        if (exitTracker) {
+          exitTracker.stopMailboxWatch();
+        }
+        agent.subAgentTrackers.delete(accKey);
       }
-      // Clean up sub-agent tracker (stops mailbox watch)
-      const exitTracker = agent.subAgentTrackers.get(accKey);
-      if (exitTracker) {
-        exitTracker.stopMailboxWatch();
-      }
-      agent.subAgentTrackers.delete(accKey);
     });
 
     proc.on('error', (err: Error) => {
-      this.stopTypingIndicator(agent, userId, chatId);
-      agent.tgBot.sendText(chatId, `<blockquote>⚠️ ${escapeHtml(String(err.message))}</blockquote>`, 'HTML')
-        .catch(err2 => this.logger.error({ err: err2 }, 'Failed to send process error notification'));
+      // Broadcast error to all subscribers
+      const entry = getEntry();
+      const subscriberList = entry ? [...this.processRegistry.subscribers(entry)] : [{ client: ownerRef }];
+      for (const sub of subscriberList) {
+        const subAgent = this.agents.get(sub.client.agentId);
+        if (!subAgent) continue;
+        this.stopTypingIndicator(subAgent, sub.client.userId, sub.client.chatId);
+        subAgent.tgBot.sendText(sub.client.chatId, `<blockquote>⚠️ ${escapeHtml(String(err.message))}</blockquote>`, 'HTML')
+          .catch(err2 => this.logger.error({ err: err2 }, 'Failed to send process error notification'));
+      }
     });
 
     return proc;
@@ -857,12 +1023,10 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
     // Update session store with cost
     if (event.total_cost_usd) {
-      this.sessionStore.updateSessionActivity(agentId, userId, event.total_cost_usd);
     }
 
     // Update JSONL tracking after our own CC turn completes
     // This prevents false-positive staleness on our own writes
-    this.updateJsonlTracking(agentId, userId);
 
     // Handle errors
     if (event.is_error && event.result) {
@@ -911,10 +1075,28 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
     switch (cmd.command) {
       case 'start': {
-        await agent.tgBot.sendText(
-          cmd.chatId,
-          '👋 TGCC — Telegram ↔ Claude Code bridge\n\nSend me a message to start a CC session, or use /help for commands.',
-        );
+        const userConf = resolveUserConfig(agent.config, cmd.userId);
+        const userState = this.sessionStore.getUser(agentId, cmd.userId);
+        const repo = userState.repo || userConf.repo;
+        const session = userState.currentSessionId;
+        // Model: running process > session JSONL > user default
+        let model = userConf.model;
+        if (session && repo) {
+          const registryEntry = this.processRegistry.get(repo, session);
+          if (registryEntry?.model) {
+            model = registryEntry.model;
+          } else {
+            const sessions = discoverCCSessions(repo, 20);
+            const sessionInfo = sessions.find(s => s.id === session);
+            if (sessionInfo?.model) model = sessionInfo.model;
+          }
+        }
+        const lines = ['👋 <b>TGCC</b> — Telegram ↔ Claude Code bridge'];
+        if (repo) lines.push(`📂 <code>${escapeHtml(shortenRepoPath(repo))}</code>`);
+        if (model) lines.push(`🤖 ${escapeHtml(model)}`);
+        if (session) lines.push(`📎 Session: <code>${escapeHtml(session.slice(0, 8))}</code>`);
+        lines.push('', 'Send a message to start, or use /help for commands.');
+        await agent.tgBot.sendText(cmd.chatId, lines.join('\n'), 'HTML');
         // Re-register commands with BotFather to ensure menu is up to date
         try {
           const { COMMANDS } = await import('./telegram.js');
@@ -945,7 +1127,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
           `<b>Agent:</b> ${escapeHtml(agentId)}`,
           `<b>Process:</b> ${(proc?.state ?? 'idle').toUpperCase()} (uptime: ${uptime})`,
           `<b>Session:</b> <code>${escapeHtml(proc?.sessionId?.slice(0, 8) ?? 'none')}</code>`,
-          `<b>Model:</b> ${escapeHtml(userState.model || resolveUserConfig(agent.config, cmd.userId).model)}`,
+          `<b>Model:</b> ${escapeHtml(resolveUserConfig(agent.config, cmd.userId).model)}`,
           `<b>Repo:</b> ${escapeHtml(userState.repo || resolveUserConfig(agent.config, cmd.userId).repo)}`,
           `<b>Cost:</b> $${(proc?.totalCostUsd ?? 0).toFixed(4)}`,
         ].join('\n');
@@ -960,58 +1142,108 @@ export class Bridge extends EventEmitter implements CtlHandler {
       }
 
       case 'new': {
-        const proc = agent.processes.get(cmd.userId);
-        if (proc) {
-          proc.destroy();
-          agent.processes.delete(cmd.userId);
-        }
+        this.disconnectClient(agentId, cmd.userId, cmd.chatId);
         this.sessionStore.clearSession(agentId, cmd.userId);
-        await agent.tgBot.sendText(cmd.chatId, '<blockquote>Session cleared. Next message starts fresh.</blockquote>', 'HTML');
+        const newConf = resolveUserConfig(agent.config, cmd.userId);
+        const newState = this.sessionStore.getUser(agentId, cmd.userId);
+        const newRepo = newState.repo || newConf.repo;
+        const newModel = newState.model || newConf.model;
+        const newLines = ['Session cleared. Next message starts fresh.'];
+        if (newRepo) newLines.push(`📂 <code>${escapeHtml(shortenRepoPath(newRepo))}</code>`);
+        if (newModel) newLines.push(`🤖 ${escapeHtml(newModel)}`);
+        await agent.tgBot.sendText(cmd.chatId, `<blockquote>${newLines.join('\n')}</blockquote>`, 'HTML');
         break;
       }
 
       case 'continue': {
-        const proc = agent.processes.get(cmd.userId);
-        if (proc) {
-          proc.destroy();
-          agent.processes.delete(cmd.userId);
+        this.disconnectClient(agentId, cmd.userId, cmd.chatId);
+        const contConf = resolveUserConfig(agent.config, cmd.userId);
+        const contState = this.sessionStore.getUser(agentId, cmd.userId);
+        const contRepo = contState.repo || contConf.repo;
+        let contSession = contState.currentSessionId;
+
+        // If no current session, auto-pick the most recent one
+        if (!contSession && contRepo) {
+          const recent = discoverCCSessions(contRepo, 1);
+          if (recent.length > 0) {
+            contSession = recent[0].id;
+            this.sessionStore.setCurrentSession(agentId, cmd.userId, contSession);
+          }
         }
-        await agent.tgBot.sendText(cmd.chatId, '<blockquote>Process respawned. Session kept — next message continues where you left off.</blockquote>', 'HTML');
+
+        // Model priority: running process registry > session JSONL > user default
+        let contModel = contConf.model;
+        if (contSession && contRepo) {
+          // Check if a process is already running for this session
+          const registryEntry = this.processRegistry.get(contRepo, contSession);
+          if (registryEntry?.model) {
+            contModel = registryEntry.model;
+          } else {
+            const sessions = discoverCCSessions(contRepo, 20);
+            const sessionInfo = sessions.find(s => s.id === contSession);
+            if (sessionInfo?.model) contModel = sessionInfo.model;
+          }
+        }
+        const contLines = ['Process respawned. Session kept.'];
+        if (contRepo) contLines.push(`📂 <code>${escapeHtml(shortenRepoPath(contRepo))}</code>`);
+        if (contModel) contLines.push(`🤖 ${escapeHtml(contModel)}`);
+        if (contSession) contLines.push(`📎 <code>${escapeHtml(contSession.slice(0, 8))}</code>`);
+        await agent.tgBot.sendText(cmd.chatId, `<blockquote>${contLines.join('\n')}</blockquote>`, 'HTML');
         break;
       }
 
       case 'sessions': {
-        const sessions = this.sessionStore.getRecentSessions(agentId, cmd.userId);
-        if (sessions.length === 0) {
-          await agent.tgBot.sendText(cmd.chatId, '<blockquote>No recent sessions.</blockquote>', 'HTML');
-          break;
-        }
-        const currentSessionId = this.sessionStore.getUser(agentId, cmd.userId).currentSessionId;
+        const userConf = resolveUserConfig(agent.config, cmd.userId);
+        const userState = this.sessionStore.getUser(agentId, cmd.userId);
+        const repo = userState.repo || userConf.repo;
+        const currentSessionId = userState.currentSessionId;
 
-        const lines: string[] = [];
-        const keyboard = new InlineKeyboard();
+        // Discover sessions from CC's session directory
+        const discovered = repo ? discoverCCSessions(repo, 5) : [];
 
-        sessions.forEach((s, i) => {
-          const rawTitle = s.title || s.id.slice(0, 8);
-          const displayTitle = s.title ? escapeHtml(s.title) : `<code>${escapeHtml(s.id.slice(0, 8))}</code>`;
-          const age = formatAge(new Date(s.lastActivity));
-          const isCurrent = s.id === currentSessionId;
-          const current = isCurrent ? ' ✓' : '';
-          lines.push(`<b>${i + 1}.</b> ${displayTitle}${current}\n    ${s.messageCount} msgs · $${s.totalCostUsd.toFixed(2)} · ${age}`);
-
-          // Button: full title (TG allows up to ~40 chars visible), no ellipsis
-          if (!isCurrent) {
-            const btnLabel = rawTitle.length > 35 ? rawTitle.slice(0, 35) : rawTitle;
-            keyboard.text(`${i + 1}. ${btnLabel}`, `resume:${s.id}`).row();
-          }
+        type MergedSession = { id: string; title: string; age: string; detail: string; isCurrent: boolean };
+        const merged: MergedSession[] = discovered.map(d => {
+          const ctx = d.contextPct !== null ? ` · ${d.contextPct}% ctx` : '';
+          const modelTag = d.model ? ` · ${shortModel(d.model)}` : '';
+          return {
+            id: d.id,
+            title: d.title,
+            age: formatAge(d.mtime),
+            detail: `~${d.lineCount} entries${ctx}${modelTag}`,
+            isCurrent: d.id === currentSessionId,
+          };
         });
 
-        await agent.tgBot.sendTextWithKeyboard(
-          cmd.chatId,
-          `📋 <b>Sessions</b>\n\n${lines.join('\n\n')}`,
-          keyboard,
-          'HTML',
-        );
+        if (merged.length === 0) {
+          await agent.tgBot.sendText(cmd.chatId, '<blockquote>No sessions found.</blockquote>', 'HTML');
+          break;
+        }
+
+        // Sort: current session first, then by recency
+        merged.sort((a, b) => {
+          if (a.isCurrent && !b.isCurrent) return -1;
+          if (!a.isCurrent && b.isCurrent) return 1;
+          return 0; // already sorted by mtime from discovery
+        });
+
+        // One message per session, each with its own resume button
+        for (const s of merged.slice(0, 5)) {
+          const displayTitle = escapeHtml(s.title);
+          const kb = new InlineKeyboard();
+          if (s.isCurrent) {
+            const repoLine = repo ? `\n📂 <code>${escapeHtml(shortenRepoPath(repo))}</code>` : '';
+            const sessModel = userConf.model;
+            const modelLine = sessModel ? `\n🤖 ${escapeHtml(sessModel)}` : '';
+            const sessionLine = `\n📎 <code>${escapeHtml(s.id.slice(0, 8))}</code>`;
+            const text = `<blockquote><b>Current session:</b>\n${displayTitle}\n${s.detail} · ${s.age}${repoLine}${modelLine}${sessionLine}</blockquote>`;
+            await agent.tgBot.sendText(cmd.chatId, text, 'HTML');
+          } else {
+            const text = `${displayTitle}\n<code>${escapeHtml(s.id.slice(0, 8))}</code> · ${s.detail} · ${s.age}`;
+            const btnTitle = s.title.length > 30 ? s.title.slice(0, 30) + '…' : s.title;
+            kb.text(`▶ ${btnTitle}`, `resume:${s.id}`);
+            await agent.tgBot.sendTextWithKeyboard(cmd.chatId, text, kb, 'HTML');
+          }
+        }
         break;
       }
 
@@ -1020,11 +1252,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
           await agent.tgBot.sendText(cmd.chatId, '<blockquote>Usage: /resume &lt;session-id&gt;</blockquote>', 'HTML');
           break;
         }
-        const proc = agent.processes.get(cmd.userId);
-        if (proc) {
-          proc.destroy();
-          agent.processes.delete(cmd.userId);
-        }
+        this.disconnectClient(agentId, cmd.userId, cmd.chatId);
         this.sessionStore.setCurrentSession(agentId, cmd.userId, cmd.args.trim());
         await agent.tgBot.sendText(cmd.chatId, `Will resume session <code>${escapeHtml(cmd.args.trim().slice(0, 8))}</code> on next message.`, 'HTML');
         break;
@@ -1032,13 +1260,21 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
       case 'session': {
         const userState = this.sessionStore.getUser(agentId, cmd.userId);
-        const session = userState.sessions.find(s => s.id === userState.currentSessionId);
-        if (!session) {
+        if (!userState.currentSessionId) {
           await agent.tgBot.sendText(cmd.chatId, '<blockquote>No active session.</blockquote>', 'HTML');
           break;
         }
+        const sessRepo = userState.repo || resolveUserConfig(agent.config, cmd.userId).repo;
+        const discovered = sessRepo ? discoverCCSessions(sessRepo, 20) : [];
+        const info = discovered.find(d => d.id === userState.currentSessionId);
+        if (!info) {
+          await agent.tgBot.sendText(cmd.chatId, `<b>Session:</b> <code>${escapeHtml(userState.currentSessionId.slice(0, 8))}</code>`, 'HTML');
+          break;
+        }
+        const ctxLine = info.contextPct !== null ? `\n<b>Context:</b> ${info.contextPct}%` : '';
+        const modelLine = info.model ? `\n<b>Model:</b> ${escapeHtml(info.model)}` : '';
         await agent.tgBot.sendText(cmd.chatId,
-          `<b>Session:</b> <code>${escapeHtml(session.id.slice(0, 8))}</code>\n<b>Messages:</b> ${session.messageCount}\n<b>Cost:</b> $${session.totalCostUsd.toFixed(4)}\n<b>Started:</b> ${session.startedAt}`,
+          `<b>Session:</b> <code>${escapeHtml(info.id.slice(0, 8))}</code>\n<b>Title:</b> ${escapeHtml(info.title)}${modelLine}${ctxLine}\n<b>Age:</b> ${formatAge(info.mtime)}`,
           'HTML'
         );
         break;
@@ -1047,8 +1283,21 @@ export class Bridge extends EventEmitter implements CtlHandler {
       case 'model': {
         const MODEL_OPTIONS = ['opus', 'sonnet', 'haiku'];
         if (!cmd.args) {
-          const current = this.sessionStore.getUser(agentId, cmd.userId).model
-            || resolveUserConfig(agent.config, cmd.userId).model;
+          // Show model from: running process > JSONL > agent config
+          const uState = this.sessionStore.getUser(agentId, cmd.userId);
+          const uConf = resolveUserConfig(agent.config, cmd.userId);
+          const uRepo = uState.repo || uConf.repo;
+          const uSession = uState.currentSessionId;
+          let current = uConf.model || 'default';
+          if (uSession && uRepo) {
+            const re = this.processRegistry.get(uRepo, uSession);
+            if (re?.model) current = re.model;
+            else {
+              const ds = discoverCCSessions(uRepo, 20);
+              const si = ds.find(s => s.id === uSession);
+              if (si?.model) current = si.model;
+            }
+          }
           const keyboard = new InlineKeyboard();
           for (const m of MODEL_OPTIONS) {
             const isCurrent = current.includes(m);
@@ -1063,13 +1312,12 @@ export class Bridge extends EventEmitter implements CtlHandler {
           );
           break;
         }
-        this.sessionStore.setModel(agentId, cmd.userId, cmd.args.trim());
-        const proc = agent.processes.get(cmd.userId);
-        if (proc) {
-          proc.destroy();
-          agent.processes.delete(cmd.userId);
-        }
-        await agent.tgBot.sendText(cmd.chatId, `Model set to <code>${escapeHtml(cmd.args.trim())}</code>. Process respawned.`, 'HTML');
+        const newModel = cmd.args.trim();
+        // Store as session-level override (not user default)
+        const curSession = this.sessionStore.getUser(agentId, cmd.userId).currentSessionId;
+        this.sessionModelOverrides.set(`${agentId}:${cmd.userId}`, newModel);
+        this.disconnectClient(agentId, cmd.userId, cmd.chatId);
+        await agent.tgBot.sendText(cmd.chatId, `<blockquote>Model set to <code>${escapeHtml(newModel)}</code>. Process respawned.</blockquote>`, 'HTML');
         break;
       }
 
@@ -1224,11 +1472,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
           break;
         }
         // Kill current process (different CWD needs new process)
-        const proc = agent.processes.get(cmd.userId);
-        if (proc) {
-          proc.destroy();
-          agent.processes.delete(cmd.userId);
-        }
+        this.disconnectClient(agentId, cmd.userId, cmd.chatId);
         this.sessionStore.setRepo(agentId, cmd.userId, repoPath);
         const userState = this.sessionStore.getUser(agentId, cmd.userId);
         const lastActive = new Date(userState.lastActivity).getTime();
@@ -1254,12 +1498,8 @@ export class Bridge extends EventEmitter implements CtlHandler {
       }
 
       case 'catchup': {
-        const userState = this.sessionStore.getUser(agentId, cmd.userId);
-        const repo = userState.repo || resolveUserConfig(agent.config, cmd.userId).repo;
-        const lastActivity = new Date(userState.lastActivity || 0);
-        const missed = findMissedSessions(repo, userState.knownSessionIds, lastActivity);
-        const message = formatCatchupMessage(repo, missed);
-        await agent.tgBot.sendText(cmd.chatId, message, 'HTML');
+        // Catchup now just shows recent sessions via /sessions
+        await agent.tgBot.sendText(cmd.chatId, '<blockquote>Use /sessions to see recent sessions.</blockquote>', 'HTML');
         break;
       }
 
@@ -1277,11 +1517,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
           }
           this.sessionStore.setPermissionMode(agentId, cmd.userId, mode);
           // Kill current process so new mode takes effect on next spawn
-          const proc = agent.processes.get(cmd.userId);
-          if (proc) {
-            proc.destroy();
-            agent.processes.delete(cmd.userId);
-          }
+          this.disconnectClient(agentId, cmd.userId, cmd.chatId);
           await agent.tgBot.sendText(cmd.chatId, `Permission mode set to <code>${escapeHtml(mode)}</code>. Takes effect on next message.`, 'HTML');
           break;
         }
@@ -1313,11 +1549,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
     switch (query.action) {
       case 'resume': {
         const sessionId = query.data;
-        const proc = agent.processes.get(query.userId);
-        if (proc) {
-          proc.destroy();
-          agent.processes.delete(query.userId);
-        }
+        this.disconnectClient(agentId, query.userId, query.chatId);
         this.sessionStore.setCurrentSession(agentId, query.userId, sessionId);
         await agent.tgBot.answerCallbackQuery(query.callbackQueryId, 'Session set');
         await agent.tgBot.sendText(
@@ -1330,13 +1562,13 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
       case 'delete': {
         const sessionId = query.data;
-        const deleted = this.sessionStore.deleteSession(agentId, query.userId, sessionId);
-        if (deleted) {
-          await agent.tgBot.answerCallbackQuery(query.callbackQueryId, 'Session deleted');
-          await agent.tgBot.sendText(query.chatId, `Session <code>${escapeHtml(sessionId.slice(0, 8))}</code> deleted.`, 'HTML');
-        } else {
-          await agent.tgBot.answerCallbackQuery(query.callbackQueryId, 'Session not found');
+        // Clear current session if it matches
+        const uState = this.sessionStore.getUser(agentId, query.userId);
+        if (uState.currentSessionId === sessionId) {
+          this.sessionStore.setCurrentSession(agentId, query.userId, '');
         }
+        await agent.tgBot.answerCallbackQuery(query.callbackQueryId, 'Session cleared');
+        await agent.tgBot.sendText(query.chatId, `Session <code>${escapeHtml(sessionId.slice(0, 8))}</code> cleared.`, 'HTML');
         break;
       }
 
@@ -1348,11 +1580,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
           break;
         }
         // Kill current process (different CWD needs new process)
-        const proc = agent.processes.get(query.userId);
-        if (proc) {
-          proc.destroy();
-          agent.processes.delete(query.userId);
-        }
+        this.disconnectClient(agentId, query.userId, query.chatId);
         this.sessionStore.setRepo(agentId, query.userId, repoPath);
         const userState2 = this.sessionStore.getUser(agentId, query.userId);
         const lastActive2 = new Date(userState2.lastActivity).getTime();
@@ -1380,14 +1608,10 @@ export class Bridge extends EventEmitter implements CtlHandler {
           await agent.tgBot.sendText(query.chatId, 'Send: <code>/model &lt;model-name&gt;</code>', 'HTML');
           break;
         }
-        this.sessionStore.setModel(agentId, query.userId, model);
-        const proc = agent.processes.get(query.userId);
-        if (proc) {
-          proc.destroy();
-          agent.processes.delete(query.userId);
-        }
+        this.sessionModelOverrides.set(`${agentId}:${query.userId}`, model);
+        this.disconnectClient(agentId, query.userId, query.chatId);
         await agent.tgBot.answerCallbackQuery(query.callbackQueryId, `Model: ${model}`);
-        await agent.tgBot.sendText(query.chatId, `Model set to <code>${escapeHtml(model)}</code>. Process respawned.`, 'HTML');
+        await agent.tgBot.sendText(query.chatId, `<blockquote>Model set to <code>${escapeHtml(model)}</code>. Process respawned.</blockquote>`, 'HTML');
         break;
       }
 
@@ -1400,11 +1624,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
         }
         this.sessionStore.setPermissionMode(agentId, query.userId, mode);
         // Kill current process so new mode takes effect on next spawn
-        const proc = agent.processes.get(query.userId);
-        if (proc) {
-          proc.destroy();
-          agent.processes.delete(query.userId);
-        }
+        this.disconnectClient(agentId, query.userId, query.chatId);
         await agent.tgBot.answerCallbackQuery(query.callbackQueryId, `Mode: ${mode}`);
         await agent.tgBot.sendText(
           query.chatId,
@@ -1546,15 +1766,18 @@ export class Bridge extends EventEmitter implements CtlHandler {
         repo: this.sessionStore.getUser(id, userId).repo || userConfig.repo,
       });
 
-      // List sessions for this agent
+      // List sessions for this agent from CC's session directory
       const userState = this.sessionStore.getUser(id, userId);
-      for (const sess of userState.sessions.slice(-5).reverse()) {
-        sessions.push({
-          id: sess.id,
-          agentId: id,
-          messageCount: sess.messageCount,
-          totalCostUsd: sess.totalCostUsd,
-        });
+      const sessRepo = userState.repo || userConfig.repo;
+      if (sessRepo) {
+        for (const d of discoverCCSessions(sessRepo, 5)) {
+          sessions.push({
+            id: d.id,
+            agentId: id,
+            messageCount: d.lineCount,
+            totalCostUsd: 0,
+          });
+        }
       }
     }
 
@@ -1604,6 +1827,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
       await this.stopAgent(agentId);
     }
 
+    this.processRegistry.clear();
     this.mcpServer.closeAll();
     this.ctlServer.closeAll();
     this.removeAllListeners();
@@ -1612,6 +1836,20 @@ export class Bridge extends EventEmitter implements CtlHandler {
 }
 
 // ── Helpers ──
+
+function shortModel(m: string): string {
+  if (m.includes('opus')) return 'opus';
+  if (m.includes('sonnet')) return 'sonnet';
+  if (m.includes('haiku')) return 'haiku';
+  return m.length > 15 ? m.slice(0, 15) + '…' : m;
+}
+
+function shortenRepoPath(p: string): string {
+  return p
+    .replace(/^\/home\/[^/]+\/Botverse\//, '')
+    .replace(/^\/home\/[^/]+\/Projects\//, '')
+    .replace(/^\/home\/[^/]+\//, '~/');
+}
 
 function formatDuration(ms: number): string {
   const secs = Math.floor(ms / 1000);

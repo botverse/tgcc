@@ -70,15 +70,13 @@ export {
 export {
   SessionStore,
   getSessionJsonlPath,
-  findMissedSessions,
   computeProjectSlug,
-  summarizeJsonlDelta,
-  formatCatchupMessage,
-  type SessionInfo,
+  discoverCCSessions,
   type UserState,
   type AgentState,
   type StateStore,
-  type JsonlTracking,
+  type DiscoveredSession,
+
 } from './session.js';
 
 // Streaming utilities

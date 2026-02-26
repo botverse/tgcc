@@ -318,7 +318,7 @@ export class StreamAccumulator {
   }
 
   /** Resolve a tool indicator with success/failure status. Edits to a compact summary with input detail. */
-  async resolveToolMessage(blockId: string, isError: boolean, errorMessage?: string, resultContent?: string): Promise<void> {
+  async resolveToolMessage(blockId: string, isError: boolean, errorMessage?: string, resultContent?: string, toolUseResult?: Record<string, unknown>): Promise<void> {
     const entry = this.toolMessages.get(blockId);
     if (!entry) return;
     const { msgId, toolName, startTime } = entry;
@@ -326,7 +326,7 @@ export class StreamAccumulator {
 
     const inputJson = this.toolInputBuffers.get(blockId) ?? '';
     const summary = extractToolInputSummary(toolName, inputJson);
-    const resultStat = resultContent ? extractToolResultStat(toolName, resultContent) : '';
+    const resultStat = extractToolResultStat(toolName, resultContent, toolUseResult);
     const codeLine = summary ? `\n<code>${escapeHtml(summary)}</code>` : '';
     const statLine = resultStat ? `\n${escapeHtml(resultStat)}` : '';
 
@@ -636,33 +636,67 @@ function extractToolInputSummary(toolName: string, inputJson: string, maxLen = 1
 }
 
 /** Extract a compact stat from a tool result for display in the indicator. */
-function extractToolResultStat(toolName: string, content: string): string {
+function extractToolResultStat(toolName: string, content?: string, toolUseResult?: Record<string, unknown>): string {
+  // For Edit/Write: use structured patch data if available
+  if (toolUseResult && (toolName === 'Edit' || toolName === 'MultiEdit')) {
+    const patches = toolUseResult.structuredPatch as Array<{ lines?: string[] }> | undefined;
+    if (patches?.length) {
+      let added = 0, removed = 0;
+      for (const patch of patches) {
+        if (patch.lines) {
+          for (const line of patch.lines) {
+            if (line.startsWith('+') && !line.startsWith('+++')) added++;
+            else if (line.startsWith('-') && !line.startsWith('---')) removed++;
+          }
+        }
+      }
+      if (added || removed) {
+        const parts: string[] = [];
+        if (added) parts.push(`+${added}`);
+        if (removed) parts.push(`-${removed}`);
+        return parts.join(' / ');
+      }
+    }
+  }
+
+  if (toolUseResult && toolName === 'Write') {
+    const c = toolUseResult.content as string | undefined;
+    if (c) {
+      const lines = c.split('\n').length;
+      return `${lines} lines`;
+    }
+  }
+
   if (!content) return '';
   const first = content.split('\n')[0].trim();
 
+  // Skip generic "The file X has been updated/created" messages
+  if (/^(The file |File created|Successfully)/.test(first)) {
+    // Try to extract something useful anyway
+    const lines = content.match(/(\d+)\s*lines?/i);
+    if (lines) return `${lines[1]} lines`;
+    return '';
+  }
+
   switch (toolName) {
     case 'Write': {
-      // "Successfully wrote 42 lines to src/foo.ts" or byte count
       const lines = content.match(/(\d+)\s*lines?/i);
       const bytes = content.match(/(\d[\d,.]*)\s*(bytes?|KB|MB)/i);
       if (lines) return `${lines[1]} lines`;
       if (bytes) return `${bytes[1]} ${bytes[2]}`;
-      return first.length > 60 ? first.slice(0, 60) + '…' : first;
+      return '';
     }
     case 'Edit':
     case 'MultiEdit': {
-      // "Edited src/foo.ts: replaced 3 lines" or snippet
       const replaced = content.match(/replaced\s+(\d+)\s*lines?/i);
       const chars = content.match(/(\d+)\s*characters?/i);
       if (replaced) return `${replaced[1]} lines replaced`;
       if (chars) return `${chars[1]} chars changed`;
-      return first.length > 60 ? first.slice(0, 60) + '…' : first;
+      return '';
     }
     case 'Bash': {
-      // Show exit code or first line of output (truncated)
       const exit = content.match(/exit\s*code\s*[:=]?\s*(\d+)/i);
       if (exit && exit[1] !== '0') return `exit ${exit[1]}`;
-      // Count output lines
       const outputLines = content.split('\n').filter(l => l.trim()).length;
       if (outputLines > 3) return `${outputLines} lines output`;
       return first.length > 60 ? first.slice(0, 60) + '…' : first;
@@ -680,7 +714,7 @@ function extractToolResultStat(toolName: string, content: string): string {
       return `${resultLines} results`;
     }
     default:
-      return first.length > 60 ? first.slice(0, 60) + '…' : first;
+      return '';
   }
 }
 
@@ -713,6 +747,8 @@ function formatTokens(n: number): string {
 
 /** Format usage stats as an HTML italic footer line */
 export function formatUsageFooter(usage: TurnUsage): string {
+  const totalCtx = usage.inputTokens + usage.cacheReadTokens + usage.cacheCreationTokens;
+  const ctxPct = Math.round(totalCtx / 200000 * 100);
   const parts = [
     `↩️ ${formatTokens(usage.inputTokens)} in`,
     `${formatTokens(usage.outputTokens)} out`,
@@ -720,6 +756,7 @@ export function formatUsageFooter(usage: TurnUsage): string {
   if (usage.costUsd != null) {
     parts.push(`$${usage.costUsd.toFixed(4)}`);
   }
+  parts.push(`${ctxPct}%`);
   return `<i>${parts.join(' · ')}</i>`;
 }
 
