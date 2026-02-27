@@ -5,15 +5,24 @@ import type pino from 'pino';
 
 // ── Types ──
 
+/** @deprecated Kept for migration from old per-user format */
 export interface UserState {
   currentSessionId: string | null;
   lastActivity: string;
-  model: string;           // user-level default model
+  model: string;
   repo: string;
-  permissionMode: string;  // session override for permission mode (empty = use agent default)
+  permissionMode: string;
 }
 
 export interface AgentState {
+  repo: string;
+  model: string;
+  permissionMode: string;
+  lastActivity: string;
+}
+
+/** Old format for migration detection */
+interface OldAgentState {
   users: Record<string, UserState>;
 }
 
@@ -37,17 +46,46 @@ export class SessionStore {
   private load(): StateStore {
     try {
       if (existsSync(this.filePath)) {
-        const raw = JSON.parse(readFileSync(this.filePath, 'utf-8')) as StateStore;
-        // Migrate: strip removed fields from persisted state
+        const raw = JSON.parse(readFileSync(this.filePath, 'utf-8'));
+        // Migrate: if old per-user format detected, convert to per-agent
+        const migrated: StateStore = { agents: {} };
         for (const agentId of Object.keys(raw.agents ?? {})) {
-          for (const userId of Object.keys(raw.agents[agentId]?.users ?? {})) {
-            const u = raw.agents[agentId].users[userId] as unknown as Record<string, unknown>;
-            delete u.sessions;
-            delete u.knownSessionIds;
-            delete u.jsonlTracking;
+          const agentData = raw.agents[agentId];
+          if (agentData && 'users' in agentData && typeof agentData.users === 'object') {
+            // Old format — pick first user's values
+            const oldState = agentData as OldAgentState;
+            const firstUserId = Object.keys(oldState.users)[0];
+            if (firstUserId) {
+              const u = oldState.users[firstUserId];
+              migrated.agents[agentId] = {
+                repo: u.repo || '',
+                model: u.model || '',
+                permissionMode: u.permissionMode || '',
+                lastActivity: u.lastActivity || new Date().toISOString(),
+              };
+            } else {
+              migrated.agents[agentId] = {
+                repo: '',
+                model: '',
+                permissionMode: '',
+                lastActivity: new Date().toISOString(),
+              };
+            }
+            this.logger.info({ agentId }, 'Migrated agent state from per-user to per-agent format');
+          } else if (agentData && typeof agentData.repo === 'string') {
+            // Already new format
+            migrated.agents[agentId] = agentData as AgentState;
+          } else {
+            // Unknown format, skip
+            migrated.agents[agentId] = {
+              repo: '',
+              model: '',
+              permissionMode: '',
+              lastActivity: new Date().toISOString(),
+            };
           }
         }
-        return raw;
+        return migrated;
       }
     } catch (err) {
       this.logger.warn({ err }, 'Failed to load state file — starting fresh');
@@ -65,54 +103,48 @@ export class SessionStore {
     }
   }
 
-  private ensureUser(agentId: string, userId: string): UserState {
+  private ensureAgent(agentId: string): AgentState {
     if (!this.state.agents[agentId]) {
-      this.state.agents[agentId] = { users: {} };
-    }
-    if (!this.state.agents[agentId].users[userId]) {
-      this.state.agents[agentId].users[userId] = {
-        currentSessionId: null,
-        lastActivity: new Date().toISOString(),
-        model: '',
+      this.state.agents[agentId] = {
         repo: '',
+        model: '',
         permissionMode: '',
+        lastActivity: new Date().toISOString(),
       };
     }
-    return this.state.agents[agentId].users[userId];
+    return this.state.agents[agentId];
   }
 
-  getUser(agentId: string, userId: string): UserState {
-    return this.ensureUser(agentId, userId);
+  getAgent(agentId: string): AgentState {
+    return this.ensureAgent(agentId);
   }
 
-  setCurrentSession(agentId: string, userId: string, sessionId: string): void {
-    const user = this.ensureUser(agentId, userId);
-    user.currentSessionId = sessionId;
-    user.lastActivity = new Date().toISOString();
+  /** @deprecated Alias for getAgent — eases migration. Returns AgentState (not UserState). */
+  getUser(agentId: string, _userId?: string): AgentState {
+    return this.ensureAgent(agentId);
+  }
+
+  setModel(agentId: string, model: string): void {
+    const agent = this.ensureAgent(agentId);
+    agent.model = model;
     this.save();
   }
 
-  setModel(agentId: string, userId: string, model: string): void {
-    const user = this.ensureUser(agentId, userId);
-    user.model = model;
+  setRepo(agentId: string, repo: string): void {
+    const agent = this.ensureAgent(agentId);
+    agent.repo = repo;
     this.save();
   }
 
-  setRepo(agentId: string, userId: string, repo: string): void {
-    const user = this.ensureUser(agentId, userId);
-    user.repo = repo;
+  setPermissionMode(agentId: string, mode: string): void {
+    const agent = this.ensureAgent(agentId);
+    agent.permissionMode = mode;
     this.save();
   }
 
-  setPermissionMode(agentId: string, userId: string, mode: string): void {
-    const user = this.ensureUser(agentId, userId);
-    user.permissionMode = mode;
-    this.save();
-  }
-
-  clearSession(agentId: string, userId: string): void {
-    const user = this.ensureUser(agentId, userId);
-    user.currentSessionId = null;
+  updateLastActivity(agentId: string): void {
+    const agent = this.ensureAgent(agentId);
+    agent.lastActivity = new Date().toISOString();
     this.save();
   }
 
@@ -236,7 +268,6 @@ function extractSessionMeta(jsonlPath: string, fileSize: number): { title: strin
   } catch {}
 
   // Read in growing chunks to find title (first real user message)
-  // Some lines (file-history-snapshot, user with images) are >1MB, so 16KB buffer isn't enough
   try {
     const fd = openSync(jsonlPath, 'r');
     let offset = 0;
@@ -343,7 +374,6 @@ function countLines(filePath: string): number {
   try {
     const st = statSync(filePath);
     // Estimate: ~500 bytes per line for JSONL
-    // For accuracy would need to read the file, but this is fast
     return Math.max(1, Math.round(st.size / 500));
   } catch {
     return 0;

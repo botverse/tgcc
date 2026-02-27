@@ -259,6 +259,11 @@ export class CCProcess extends EventEmitter {
     const event = parseCCOutputLine(line);
     if (!event) return;
 
+    // Log key lifecycle events (not every stream_event)
+    if (event.type !== 'stream_event') {
+      this.logger.info({ type: event.type, subtype: (event as unknown as Record<string,unknown>).subtype }, 'CC output event');
+    }
+
     // Reset hang timer on any output
     this.resetHangTimer();
 
@@ -451,6 +456,9 @@ export class CCProcess extends EventEmitter {
   }
 
   private flushQueue(): void {
+    if (this.messageQueue.length > 0) {
+      this.logger.info({ queueSize: this.messageQueue.length }, 'Flushing message queue');
+    }
     while (this.messageQueue.length > 0) {
       const msg = this.messageQueue.shift()!;
       this.writeToStdin(msg);

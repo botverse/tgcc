@@ -72,7 +72,6 @@ export {
   getSessionJsonlPath,
   computeProjectSlug,
   discoverCCSessions,
-  type UserState,
   type AgentState,
   type StateStore,
   type DiscoveredSession,

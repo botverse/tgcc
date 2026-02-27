@@ -59,23 +59,23 @@ export function escapeHtml(text: string): string {
 export function formatSystemMessage(type: 'thinking' | 'tool' | 'usage' | 'error' | 'status', content: string, expandable = false): string {
   const styles = {
     thinking: {
-      prefix: '<b><i>💭 THINKING</i></b>',
+      prefix: '<i>💭 Thinking</i>',
       wrapper: expandable ? 'blockquote expandable' : 'blockquote'
     },
     tool: {
-      prefix: '<b><u>⚡ TOOL STATUS</u></b>',
+      prefix: '<i>⚡ Tool Status</i>',
       wrapper: 'blockquote expandable'
     },
     usage: {
-      prefix: '<b>📊 USAGE</b>',
+      prefix: '<i>📊 Usage</i>',
       wrapper: 'blockquote'
     },
     error: {
-      prefix: '<b><s>⚠️ SYSTEM ERROR</s></b>',
+      prefix: '<i>⚠️ System Error</i>',
       wrapper: 'blockquote'
     },
     status: {
-      prefix: '<b>ℹ️ SYSTEM</b>',
+      prefix: '<i>ℹ️ System</i>',
       wrapper: 'blockquote'
     }
   };
@@ -83,7 +83,7 @@ export function formatSystemMessage(type: 'thinking' | 'tool' | 'usage' | 'error
   const style = styles[type];
   const separator = '<code>─────────────────</code>';
 
-  return `${style.prefix}\n${separator}\n<${style.wrapper}><code>${content}</code></${style.wrapper.split(' ')[0]}>`;
+  return `<${style.wrapper}>${style.prefix}\n<code>${content}</code></${style.wrapper.split(' ')[0]}>`;
 }
 
 /**
