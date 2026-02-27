@@ -820,6 +820,19 @@ export class Bridge extends EventEmitter implements CtlHandler {
         agent.tgBot.sendTextWithKeyboard(permChatId, text, keyboard, 'HTML')
           .catch(err => this.logger.error({ err }, 'Failed to send permission request'));
       }
+
+      // Forward to supervisor so it can render approve/deny UI
+      if (this.isSupervisorSubscribed(agentId, proc.sessionId)) {
+        const description = req.decision_reason || `CC wants to use ${req.tool_name}`;
+        this.sendToSupervisor({
+          type: 'event',
+          event: 'permission_request',
+          agentId,
+          toolName: req.tool_name,
+          requestId,
+          description,
+        });
+      }
     });
 
     proc.on('api_error', (event: ApiErrorEvent) => {
@@ -2049,6 +2062,29 @@ export class Bridge extends EventEmitter implements CtlHandler {
           since: params.since as number | undefined,
           type: params.type as string | undefined,
         });
+      }
+
+      case 'permission_response': {
+        const agentId = params.agentId as string;
+        const permissionRequestId = params.permissionRequestId as string;
+        const decision = params.decision as string;
+        if (!agentId || !permissionRequestId || !decision) {
+          throw new Error('Missing agentId, permissionRequestId, or decision');
+        }
+
+        const agent = this.agents.get(agentId);
+        if (!agent) throw new Error(`Unknown agent: ${agentId}`);
+
+        const pending = agent.pendingPermissions.get(permissionRequestId);
+        if (!pending) throw new Error(`No pending permission with id: ${permissionRequestId}`);
+
+        const allow = decision === 'allow';
+        if (agent.ccProcess) {
+          agent.ccProcess.respondToPermission(permissionRequestId, allow);
+        }
+        agent.pendingPermissions.delete(permissionRequestId);
+
+        return { responded: true, decision };
       }
 
       default:
