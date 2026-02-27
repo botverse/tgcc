@@ -126,6 +126,7 @@ export class StreamAccumulator {
   private lastEditTime = 0;
   private editTimer: ReturnType<typeof setTimeout> | null = null;
   private thinkingIndicatorShown = false;
+  private thinkingMessageId: number | null = null;  // preserved separately from tgMessageId
   private messageIds: number[] = []; // all message IDs sent during this turn
   private finished = false;
   private sendQueue: Promise<void> = Promise.resolve();
@@ -218,9 +219,10 @@ export class StreamAccumulator {
       }
     } else if (blockType === 'text') {
       this.currentBlockType = 'text';
-      // Text always gets its own message — don't touch tool indicator messages
-      if (!this.tgMessageId) {
-        // Will create a new message on next sendOrEdit
+      // If thinking indicator was shown, keep it as its own message — start a new one for text
+      if (this.thinkingIndicatorShown && this.tgMessageId) {
+        this.thinkingMessageId = this.tgMessageId;
+        this.tgMessageId = null; // force new message for response text
       }
     } else if (blockType === 'tool_use') {
       this.currentBlockType = 'tool_use';
@@ -494,7 +496,9 @@ export class StreamAccumulator {
    */
   private buildFullText(includeSuffix = false): { text: string; hasHtmlSuffix: boolean } {
     let text = '';
-    if (this.thinkingBuffer) {
+    // Thinking goes in its own message (thinkingMessageId), not prepended to response
+    if (this.thinkingBuffer && !this.thinkingMessageId) {
+      // Only prepend if thinking didn't get its own message (edge case: no indicator was shown)
       const thinkingPreview = this.thinkingBuffer.length > 1024
         ? this.thinkingBuffer.slice(0, 1024) + '…'
         : this.thinkingBuffer;
@@ -576,12 +580,29 @@ export class StreamAccumulator {
       this.editTimer = null;
     }
 
+    // Update thinking message with final content (if it has its own message)
+    if (this.thinkingBuffer && this.thinkingMessageId) {
+      const thinkingPreview = this.thinkingBuffer.length > 1024
+        ? this.thinkingBuffer.slice(0, 1024) + '…'
+        : this.thinkingBuffer;
+      try {
+        await this.sender.editMessage(
+          this.chatId,
+          this.thinkingMessageId,
+          formatSystemMessage('thinking', markdownToTelegramHtml(thinkingPreview), true),
+          'HTML',
+        );
+      } catch {
+        // Thinking message edit failed — not critical
+      }
+    }
+
     if (this.buffer) {
-      // Final edit with complete text including thinking blockquote and usage footer
+      // Final edit with complete text (thinking is in its own message)
       const { text } = this.buildFullText(true);
       await this.sendOrEdit(text, true); // buildFullText already does makeHtmlSafe
-    } else if (this.thinkingBuffer && this.thinkingIndicatorShown) {
-      // Only thinking happened, no text — show thinking as expandable blockquote
+    } else if (this.thinkingBuffer && !this.thinkingMessageId && this.thinkingIndicatorShown) {
+      // Only thinking happened, no text, no separate message — show as expandable blockquote
       const thinkingPreview = this.thinkingBuffer.length > 1024
         ? this.thinkingBuffer.slice(0, 1024) + '…'
         : this.thinkingBuffer;
@@ -609,6 +630,7 @@ export class StreamAccumulator {
     this.currentToolBlockId = null;
     this.lastEditTime = 0;
     this.thinkingIndicatorShown = false;
+    this.thinkingMessageId = null;
     this.finished = false;
     this.turnUsage = null;
     this._lastMsgStartCtx = null;
