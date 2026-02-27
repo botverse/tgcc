@@ -166,6 +166,12 @@ export class Bridge extends EventEmitter implements CtlHandler {
   private sessionStore: SessionStore;
   private logger: pino.Logger;
 
+  // Supervisor protocol
+  private supervisorWrite: ((line: string) => void) | null = null;
+  private supervisorAgentId: string | null = null;
+  private supervisorSubscriptions = new Set<string>(); // "agentId:sessionId" or "agentId:*"
+  private suppressExitForProcess = new Set<string>(); // sessionIds where takeover suppresses exit event
+
   constructor(config: TgccConfig, logger?: pino.Logger) {
     super();
     this.config = config;
@@ -800,6 +806,19 @@ export class Bridge extends EventEmitter implements CtlHandler {
         this.stopTypingIndicator(subAgent, sub.client.userId, sub.client.chatId);
         this.handleResult(sub.client.agentId, sub.client.userId, sub.client.chatId, event);
       }
+
+      // Forward to supervisor
+      if (this.isSupervisorSubscribed(agentId, proc.sessionId)) {
+        const resultText = event.result ? String(event.result) : '';
+        this.sendToSupervisor({
+          type: 'event',
+          event: 'result',
+          agentId,
+          sessionId: proc.sessionId,
+          text: resultText,
+          is_error: event.is_error ?? false,
+        });
+      }
     });
 
     proc.on('compact', (event: CompactBoundaryEvent) => {
@@ -891,6 +910,13 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
     proc.on('takeover', () => {
       this.logger.warn({ agentId, userId }, 'Session takeover detected — keeping session for roaming');
+
+      // Notify supervisor and suppress subsequent exit event
+      if (this.isSupervisorSubscribed(agentId, proc.sessionId)) {
+        this.sendToSupervisor({ type: 'event', event: 'session_takeover', agentId, sessionId: proc.sessionId });
+        this.suppressExitForProcess.add(proc.sessionId ?? '');
+      }
+
       // Notify and clean up all subscribers
       const entry = getEntry();
       if (entry) {
@@ -908,6 +934,13 @@ export class Bridge extends EventEmitter implements CtlHandler {
     });
 
     proc.on('exit', () => {
+      // Forward to supervisor (unless suppressed by takeover)
+      if (this.suppressExitForProcess.has(proc.sessionId ?? '')) {
+        this.suppressExitForProcess.delete(proc.sessionId ?? '');
+      } else if (this.isSupervisorSubscribed(agentId, proc.sessionId)) {
+        this.sendToSupervisor({ type: 'event', event: 'process_exit', agentId, sessionId: proc.sessionId, exitCode: null });
+      }
+
       // Clean up all subscribers
       const entry = getEntry();
       if (entry) {
@@ -1841,6 +1874,187 @@ export class Bridge extends EventEmitter implements CtlHandler {
       }
     } catch (err) {
       return { id: request.id, success: false, error: err instanceof Error ? err.message : 'Unknown error' };
+    }
+  }
+
+  // ── Supervisor protocol ──
+
+  private isSupervisorSubscribed(agentId: string, sessionId: string | null): boolean {
+    return this.supervisorSubscriptions.has(`${agentId}:*`) ||
+      (sessionId !== null && this.supervisorSubscriptions.has(`${agentId}:${sessionId}`));
+  }
+
+  registerSupervisor(agentId: string, capabilities: string[], writeFn: (line: string) => void): void {
+    this.supervisorAgentId = agentId;
+    this.supervisorWrite = writeFn;
+    this.supervisorSubscriptions.clear();
+    this.logger.info({ agentId, capabilities }, 'Supervisor registered');
+  }
+
+  handleSupervisorDetach(): void {
+    this.logger.info({ agentId: this.supervisorAgentId }, 'Supervisor detached');
+    this.supervisorSubscriptions.clear();
+    this.supervisorWrite = null;
+    this.supervisorAgentId = null;
+  }
+
+  handleSupervisorLine(line: string): void {
+    let msg: { type: string; requestId?: string; action?: string; params?: Record<string, unknown> };
+    try {
+      msg = JSON.parse(line);
+    } catch {
+      this.sendToSupervisor({ type: 'error', message: 'Invalid JSON' });
+      return;
+    }
+
+    if (msg.type !== 'command' || !msg.action) {
+      this.sendToSupervisor({ type: 'error', message: 'Expected {type:"command", action:"..."}' });
+      return;
+    }
+
+    const requestId = msg.requestId;
+    const params = msg.params ?? {};
+
+    try {
+      const result = this.handleSupervisorCommand(msg.action, params);
+      this.sendToSupervisor({ type: 'response', requestId, result });
+    } catch (err) {
+      this.sendToSupervisor({ type: 'response', requestId, error: err instanceof Error ? err.message : String(err) });
+    }
+  }
+
+  private handleSupervisorCommand(action: string, params: Record<string, unknown>): unknown {
+    switch (action) {
+      case 'ping':
+        return { pong: true, uptime: process.uptime() };
+
+      case 'send_message': {
+        const agentId = params.agentId as string;
+        const text = params.text as string;
+        if (!agentId || !text) throw new Error('Missing agentId or text');
+
+        const agent = this.agents.get(agentId);
+        if (!agent) throw new Error(`Unknown agent: ${agentId}`);
+
+        // Auto-subscribe supervisor
+        this.supervisorSubscriptions.add(`${agentId}:*`);
+
+        // Use sendToCC with supervisor identity (chatId 0 = synthetic, skipped by TG)
+        this.sendToCC(agentId, 'supervisor', 0, { text });
+
+        const proc = agent.processes.get('supervisor');
+        return {
+          sessionId: proc?.sessionId ?? null,
+          state: proc?.state ?? 'spawning',
+          subscribed: true,
+        };
+      }
+
+      case 'send_to_cc': {
+        const agentId = params.agentId as string;
+        const text = params.text as string;
+        if (!agentId || !text) throw new Error('Missing agentId or text');
+
+        const agent = this.agents.get(agentId);
+        if (!agent) throw new Error(`Unknown agent: ${agentId}`);
+
+        // Find active CC process for this agent
+        let activeProc: CCProcess | null = null;
+        for (const [, proc] of agent.processes) {
+          if (proc.state === 'active') {
+            activeProc = proc;
+            break;
+          }
+        }
+        if (!activeProc) throw new Error(`No active CC process for agent ${agentId}`);
+
+        activeProc.sendMessage(createTextMessage(text));
+        return { sent: true };
+      }
+
+      case 'subscribe': {
+        const agentId = params.agentId as string;
+        const sessionId = params.sessionId as string | undefined;
+        if (!agentId) throw new Error('Missing agentId');
+
+        const key = sessionId ? `${agentId}:${sessionId}` : `${agentId}:*`;
+        this.supervisorSubscriptions.add(key);
+        return { subscribed: true, key };
+      }
+
+      case 'unsubscribe': {
+        const agentId = params.agentId as string;
+        if (!agentId) throw new Error('Missing agentId');
+
+        // Remove all subscriptions for this agent
+        for (const key of [...this.supervisorSubscriptions]) {
+          if (key.startsWith(`${agentId}:`)) {
+            this.supervisorSubscriptions.delete(key);
+          }
+        }
+        return { unsubscribed: true };
+      }
+
+      case 'status': {
+        const filterAgentId = params.agentId as string | undefined;
+        const agents: unknown[] = [];
+        const agentIds = filterAgentId ? [filterAgentId] : [...this.agents.keys()];
+
+        for (const id of agentIds) {
+          const agent = this.agents.get(id);
+          if (!agent) continue;
+
+          let state = 'idle';
+          let sessionId: string | null = null;
+          for (const [, proc] of agent.processes) {
+            if (proc.state === 'active') { state = 'active'; sessionId = proc.sessionId; break; }
+            if (proc.state === 'spawning') { state = 'spawning'; }
+            if (!sessionId && proc.sessionId) sessionId = proc.sessionId;
+          }
+
+          const userId = agent.config.allowedUsers[0];
+          const userConfig = resolveUserConfig(agent.config, userId);
+          const userState = this.sessionStore.getUser(id, userId);
+
+          agents.push({
+            id,
+            type: 'persistent',
+            state,
+            sessionId,
+            repo: userState.repo || userConfig.repo,
+            supervisorSubscribed: this.isSupervisorSubscribed(id, sessionId),
+          });
+        }
+
+        return { agents };
+      }
+
+      case 'kill_cc': {
+        const agentId = params.agentId as string;
+        if (!agentId) throw new Error('Missing agentId');
+
+        const agent = this.agents.get(agentId);
+        if (!agent) throw new Error(`Unknown agent: ${agentId}`);
+
+        let killed = false;
+        for (const [, proc] of agent.processes) {
+          if (proc.state !== 'idle') {
+            proc.destroy();
+            killed = true;
+          }
+        }
+
+        return { killed };
+      }
+
+      default:
+        throw new Error(`Unknown supervisor action: ${action}`);
+    }
+  }
+
+  private sendToSupervisor(msg: Record<string, unknown>): void {
+    if (this.supervisorWrite) {
+      try { this.supervisorWrite(JSON.stringify(msg) + '\n'); } catch {}
     }
   }
 

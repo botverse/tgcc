@@ -57,6 +57,9 @@ export type CtlResponse = CtlAckResponse | CtlStatusResponse | CtlErrorResponse;
 export interface CtlHandler {
   handleCtlMessage(agentId: string, text: string, sessionId?: string): CtlAckResponse;
   handleCtlStatus(agentId?: string): CtlStatusResponse;
+  registerSupervisor(agentId: string, capabilities: string[], writeFn: (line: string) => void): void;
+  handleSupervisorDetach(): void;
+  handleSupervisorLine(line: string): void;
 }
 
 // ── Control Server ──
@@ -64,6 +67,7 @@ export interface CtlHandler {
 export class CtlServer {
   private servers = new Map<string, Server>();
   private activeSockets = new Map<string, Set<Socket>>(); // socketPath → Set<Socket>
+  private supervisorSocket: Socket | null = null;
   private handler: CtlHandler;
   private logger: pino.Logger;
 
@@ -127,25 +131,48 @@ export class CtlServer {
       if (sockets) {
         sockets.delete(socket);
       }
+      // Detach supervisor if this was the supervisor socket
+      if (socket === this.supervisorSocket) {
+        this.supervisorSocket = null;
+        this.handler.handleSupervisorDetach();
+      }
     });
   }
 
   private processLine(line: string, socket: Socket): void {
+    // Route supervisor socket lines directly to bridge
+    if (socket === this.supervisorSocket) {
+      this.handler.handleSupervisorLine(line);
+      return;
+    }
+
     try {
-      const request = JSON.parse(line) as CtlRequest;
+      const request = JSON.parse(line) as Record<string, unknown>;
       let response: CtlResponse;
 
-      switch (request.type) {
-        case 'message':
+      switch (request.type as string) {
+        case 'message': {
+          const msgReq = request as unknown as CtlMessageRequest;
           response = this.handler.handleCtlMessage(
-            request.agent,
-            request.text,
-            request.session,
+            msgReq.agent,
+            msgReq.text,
+            msgReq.session,
           );
           break;
-        case 'status':
-          response = this.handler.handleCtlStatus(request.agent);
+        }
+        case 'status': {
+          const statusReq = request as unknown as CtlStatusRequest;
+          response = this.handler.handleCtlStatus(statusReq.agent);
           break;
+        }
+        case 'register_supervisor': {
+          const regReq = request as unknown as { agentId?: string; capabilities?: string[] };
+          const writeFn = (data: string) => { try { socket.write(data); } catch {} };
+          this.handler.registerSupervisor(regReq.agentId ?? 'openclaw', regReq.capabilities ?? [], writeFn);
+          this.supervisorSocket = socket;
+          socket.write(JSON.stringify({ type: 'registered', agentId: regReq.agentId ?? 'openclaw' }) + '\n');
+          return;
+        }
         default:
           response = { type: 'error', message: `Unknown request type: ${(request as { type: string }).type}` };
       }

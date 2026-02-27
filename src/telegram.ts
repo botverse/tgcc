@@ -408,7 +408,13 @@ export class TelegramBot {
 
   // ── Send methods (used by bridge/streaming) ──
 
+  /** Skip Telegram API calls for synthetic chatId 0 (supervisor-initiated messages). */
+  private isSyntheticChat(chatId: number | string): boolean {
+    return Number(chatId) === 0;
+  }
+
   async sendText(chatId: number | string, text: string, parseMode?: string): Promise<number> {
+    if (this.isSyntheticChat(chatId)) return 0;
     const msg = await this.bot.api.sendMessage(Number(chatId), text, {
       parse_mode: parseMode as 'Markdown' | 'MarkdownV2' | 'HTML' | undefined,
     });
@@ -417,6 +423,7 @@ export class TelegramBot {
   }
 
   async sendTextWithKeyboard(chatId: number | string, text: string, keyboard: InlineKeyboard, parseMode?: string): Promise<number> {
+    if (this.isSyntheticChat(chatId)) return 0;
     const msg = await this.bot.api.sendMessage(Number(chatId), text, {
       parse_mode: parseMode as 'Markdown' | 'MarkdownV2' | 'HTML' | undefined,
       reply_markup: keyboard,
@@ -430,6 +437,7 @@ export class TelegramBot {
   }
 
   async editText(chatId: number | string, messageId: number, text: string, parseMode?: string): Promise<void> {
+    if (this.isSyntheticChat(chatId)) return;
     await this.bot.api.editMessageText(Number(chatId), messageId, text, {
       parse_mode: parseMode as 'Markdown' | 'MarkdownV2' | 'HTML' | undefined,
     });
@@ -452,6 +460,7 @@ export class TelegramBot {
   }
 
   async sendDocumentBuffer(chatId: number | string, buffer: Buffer, filename: string, caption?: string): Promise<number> {
+    if (this.isSyntheticChat(chatId)) return 0;
     const msg = await this.bot.api.sendDocument(Number(chatId), new InputFile(buffer, filename), {
       caption,
     });
@@ -465,6 +474,7 @@ export class TelegramBot {
   }
 
   async sendPhotoBuffer(chatId: number | string, buffer: Buffer, caption?: string): Promise<number> {
+    if (this.isSyntheticChat(chatId)) return 0;
     const msg = await this.bot.api.sendPhoto(Number(chatId), new InputFile(buffer, 'image.png'), {
       caption,
     });
@@ -487,6 +497,7 @@ export class TelegramBot {
   }
 
   async sendTyping(chatId: number | string): Promise<void> {
+    if (this.isSyntheticChat(chatId)) return;
     try {
       await this.bot.api.sendChatAction(Number(chatId), 'typing');
     } catch {}

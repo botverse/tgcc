@@ -1304,7 +1304,7 @@ Agent "sentinella":
 ```
 
 **Key principles:**
-1. **One CC process per agent** (at most). Not per-user. Everyone shares it.
+1. **One CC process per agent** (at most). One TG user per agent. Supervisor and CLI are additional subscribers, not separate users.
 2. **Repo is agent-level.** Changing repo affects everyone talking to the agent.
 3. **No CC spawn without a repo.** Hard requirement — reject if no repo configured.
 4. **Repo/session changes broadcast to all parties:**
