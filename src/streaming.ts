@@ -57,33 +57,9 @@ export function escapeHtml(text: string): string {
 
 /** Create visually distinct system message with enhanced styling */
 export function formatSystemMessage(type: 'thinking' | 'tool' | 'usage' | 'error' | 'status', content: string, expandable = false): string {
-  const styles = {
-    thinking: {
-      prefix: '<i>💭 Thinking</i>',
-      wrapper: expandable ? 'blockquote expandable' : 'blockquote'
-    },
-    tool: {
-      prefix: '<i>⚡ Tool Status</i>',
-      wrapper: 'blockquote expandable'
-    },
-    usage: {
-      prefix: '<i>📊 Usage</i>',
-      wrapper: 'blockquote'
-    },
-    error: {
-      prefix: '<i>⚠️ System Error</i>',
-      wrapper: 'blockquote'
-    },
-    status: {
-      prefix: '<i>ℹ️ System</i>',
-      wrapper: 'blockquote'
-    }
-  };
-
-  const style = styles[type];
-  const separator = '<code>─────────────────</code>';
-
-  return `<${style.wrapper}>${style.prefix}\n<code>${content}</code></${style.wrapper.split(' ')[0]}>`;
+  const emoji = { thinking: '💭', tool: '⚡', usage: '📊', error: '⚠️', status: 'ℹ️' }[type];
+  const wrapper = expandable ? 'blockquote expandable' : 'blockquote';
+  return `<${wrapper}>${emoji} ${content}</${wrapper.split(' ')[0]}>`;
 }
 
 /**
