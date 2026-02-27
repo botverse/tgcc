@@ -484,7 +484,7 @@ export class StreamAccumulator {
     text += makeHtmlSafe(this.buffer);
     if (includeSuffix && this.turnUsage) {
       const usageContent = formatUsageFooter(this.turnUsage, this.turnUsage.model).replace(/<\/?i>/g, '');
-      text += '\n' + formatSystemMessage('usage', usageContent);
+      text += '\n<blockquote>' + usageContent + '</blockquote>';
     }
     return { text, hasHtmlSuffix: includeSuffix && !!this.turnUsage };
   }
