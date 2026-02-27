@@ -8,19 +8,19 @@ import type pino from 'pino';
 
 export interface McpToolRequest {
   id: string;
-  tool: 'send_file' | 'send_image' | 'send_voice';
+  tool: string;
   agentId: string;
   userId: string;
-  params: {
-    path: string;
-    caption?: string;
-  };
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  params: Record<string, any>;
 }
 
 export interface McpToolResponse {
   id: string;
   success: boolean;
   error?: string;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  result?: any;
 }
 
 export type McpToolHandler = (request: McpToolRequest) => Promise<McpToolResponse>;

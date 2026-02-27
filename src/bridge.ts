@@ -36,6 +36,8 @@ import {
   type CtlStatusResponse,
 } from './ctl-server.js';
 import { ProcessRegistry, type ClientRef, type ProcessEntry } from './process-registry.js';
+import { EventBuffer } from './event-buffer.js';
+import { randomUUID } from 'node:crypto';
 
 // ── Types ──
 
@@ -49,7 +51,8 @@ interface PendingPermission {
 interface AgentInstance {
   id: string;
   config: AgentConfig;
-  tgBot: TelegramBot;
+  tgBot: TelegramBot | null;              // null for ephemeral agents
+  ephemeral: boolean;
   repo: string;                            // resolved repo path (from config or /repo command)
   model: string;                           // resolved model (from config or /model command)
   ccProcess: CCProcess | null;             // single CC process per agent
@@ -60,6 +63,14 @@ interface AgentInstance {
   typingInterval: ReturnType<typeof setInterval> | null; // single typing interval
   typingChatId: number | null;             // chat currently showing typing indicator
   pendingSessionId: string | null;         // for /resume: sessionId to use on next spawn
+  destroyTimer: ReturnType<typeof setTimeout> | null; // auto-destroy for ephemeral
+  eventBuffer: EventBuffer;               // ring buffer for observability
+}
+
+interface SupervisorPendingRequest {
+  resolve: (result: unknown) => void;
+  reject: (err: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
 }
 
 // ── Message Batcher ──
@@ -173,6 +184,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
   private supervisorAgentId: string | null = null;
   private supervisorSubscriptions = new Set<string>(); // "agentId:sessionId" or "agentId:*"
   private suppressExitForProcess = new Set<string>(); // sessionIds where takeover suppresses exit event
+  private supervisorPendingRequests = new Map<string, SupervisorPendingRequest>();
 
   constructor(config: TgccConfig, logger?: pino.Logger) {
     super();
@@ -219,6 +231,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
       id: agentId,
       config: agentConfig,
       tgBot,
+      ephemeral: false,
       repo: agentState.repo || configDefaults.repo,
       model: agentState.model || configDefaults.model,
       ccProcess: null,
@@ -229,6 +242,8 @@ export class Bridge extends EventEmitter implements CtlHandler {
       typingInterval: null,
       typingChatId: null,
       pendingSessionId: null,
+      destroyTimer: null,
+      eventBuffer: new EventBuffer(),
     };
 
     this.agents.set(agentId, instance);
@@ -278,10 +293,16 @@ export class Bridge extends EventEmitter implements CtlHandler {
     const agent = this.agents.get(agentId);
     if (!agent) return;
 
-    this.logger.info({ agentId }, 'Stopping agent');
+    this.logger.info({ agentId, ephemeral: agent.ephemeral }, 'Stopping agent');
 
-    // Stop bot
-    await agent.tgBot.stop();
+    // Stop bot (persistent agents only)
+    if (agent.tgBot) await agent.tgBot.stop();
+
+    // Clear auto-destroy timer (ephemeral agents)
+    if (agent.destroyTimer) {
+      clearTimeout(agent.destroyTimer);
+      agent.destroyTimer = null;
+    }
 
     // Kill CC process if active
     if (agent.ccProcess) {
@@ -411,7 +432,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
       // Warn if no repo is configured
       if (agent.repo === homedir()) {
         const chatId = source?.chatId;
-        if (chatId) {
+        if (chatId && agent.tgBot) {
           agent.tgBot.sendText(
             chatId,
             formatSystemMessage('status', 'No project selected. Use /repo to pick one, or CC will run in your home directory.'),
@@ -428,6 +449,9 @@ export class Bridge extends EventEmitter implements CtlHandler {
     if (source?.chatId) {
       this.startTypingIndicator(agent, source.chatId);
     }
+
+    // Log user message in event buffer
+    agent.eventBuffer.push({ ts: Date.now(), type: 'user', text: data.text });
 
     proc.sendMessage(ccMsg);
   }
@@ -478,11 +502,12 @@ export class Bridge extends EventEmitter implements CtlHandler {
   private startTypingIndicator(agent: AgentInstance, chatId: number): void {
     // Don't create duplicate intervals
     if (agent.typingInterval) return;
+    if (!agent.tgBot) return;
     agent.typingChatId = chatId;
     // Send immediately, then repeat every 4s (TG typing badge lasts ~5s)
     agent.tgBot.sendTyping(chatId);
     const interval = setInterval(() => {
-      if (agent.typingChatId) agent.tgBot.sendTyping(agent.typingChatId);
+      if (agent.typingChatId) agent.tgBot?.sendTyping(agent.typingChatId);
     }, 4_000);
     agent.typingInterval = interval;
   }
@@ -553,6 +578,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
     proc.on('init', (event: InitEvent) => {
       this.sessionStore.updateLastActivity(agentId);
+      agent.eventBuffer.push({ ts: Date.now(), type: 'system', text: `Session initialized: ${event.session_id}` });
 
       // Update registry key if session ID changed from tentative
       if (event.session_id !== tentativeSessionId) {
@@ -569,6 +595,13 @@ export class Bridge extends EventEmitter implements CtlHandler {
     });
 
     proc.on('tool_result', (event: ToolResultEvent) => {
+      // Log to event buffer
+      const toolName = event.tool_use_result?.name ?? 'unknown';
+      const isToolErr = event.is_error === true;
+      const toolContent = typeof event.content === 'string' ? event.content : JSON.stringify(event.content);
+      const toolSummary = toolContent.length > 200 ? toolContent.slice(0, 200) + '…' : toolContent;
+      agent.eventBuffer.push({ ts: Date.now(), type: 'tool', text: `${isToolErr ? '❌' : '✅'} ${toolName}: ${toolSummary}` });
+
       // Resolve tool indicator message with success/failure status
       const acc = agent.accumulator;
       if (acc && event.tool_use_id) {
@@ -650,7 +683,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
     proc.on('media', (media: { kind: string; media_type: string; data: string }) => {
       const buf = Buffer.from(media.data, 'base64');
       const chatId = this.getAgentChatId(agent);
-      if (!chatId) return;
+      if (!chatId || !agent.tgBot) return;
       if (media.kind === 'image') {
         agent.tgBot.sendPhotoBuffer(chatId, buf).catch(err => {
           this.logger.error({ err, agentId }, 'Failed to send tool_result image');
@@ -664,12 +697,22 @@ export class Bridge extends EventEmitter implements CtlHandler {
     });
 
     proc.on('assistant', (event: AssistantMessage) => {
-      // Non-streaming fallback — only used if stream_events don't fire
-      // In practice, stream_events handle the display
+      // Log text and thinking blocks to event buffer
+      if (event.message?.content) {
+        for (const block of event.message.content) {
+          if (block.type === 'thinking' && block.thinking) {
+            const truncated = block.thinking.length > 300 ? block.thinking.slice(0, 300) + '…' : block.thinking;
+            agent.eventBuffer.push({ ts: Date.now(), type: 'thinking', text: truncated });
+          } else if (block.type === 'text' && block.text) {
+            agent.eventBuffer.push({ ts: Date.now(), type: 'text', text: block.text });
+          }
+        }
+      }
     });
 
     proc.on('result', (event: ResultEvent) => {
       this.stopTypingIndicator(agent);
+      agent.eventBuffer.push({ ts: Date.now(), type: 'system', text: `Turn complete${event.is_error ? ' (error)' : ''}${event.total_cost_usd ? ` · $${event.total_cost_usd.toFixed(4)}` : ''}` });
       this.handleResult(agentId, event);
 
       // Forward to supervisor
@@ -691,12 +734,14 @@ export class Bridge extends EventEmitter implements CtlHandler {
       const preTokens = event.compact_metadata?.pre_tokens;
       const tokenInfo = preTokens ? ` (was ${Math.round(preTokens / 1000)}k tokens)` : '';
       const label = trigger === 'auto' ? '🗜️ Auto-compacted' : '🗜️ Compacted';
+      agent.eventBuffer.push({ ts: Date.now(), type: 'system', text: label + tokenInfo });
       const chatId = this.getAgentChatId(agent);
-      if (chatId) {
+      if (chatId && agent.tgBot) {
         agent.tgBot.sendText(
           chatId,
           `<blockquote>${escapeHtml(label + tokenInfo)}</blockquote>`,
-          'HTML'
+          'HTML',
+          true, // silent
         ).catch((err: Error) => this.logger.error({ err }, 'Failed to send compact notification'));
       }
     });
@@ -727,7 +772,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
         .text('✅ Allow All', `perm_allow_all:${agentId}`);
 
       const permChatId = this.getAgentChatId(agent);
-      if (permChatId) {
+      if (permChatId && agent.tgBot) {
         agent.tgBot.sendTextWithKeyboard(permChatId, text, keyboard, 'HTML')
           .catch(err => this.logger.error({ err }, 'Failed to send permission request'));
       }
@@ -741,12 +786,14 @@ export class Bridge extends EventEmitter implements CtlHandler {
         ? ` (retry ${event.retryAttempt}/${event.maxRetries})`
         : '';
 
+      agent.eventBuffer.push({ ts: Date.now(), type: 'error', text: `${errMsg}${retryInfo}` });
+
       const text = isOverloaded
         ? formatSystemMessage('error', `API overloaded, retrying...${retryInfo}`)
         : formatSystemMessage('error', `${escapeHtml(errMsg)}${retryInfo}`);
 
       const errChatId = this.getAgentChatId(agent);
-      if (errChatId) {
+      if (errChatId && agent.tgBot) {
         agent.tgBot.sendText(errChatId, text, 'HTML')
           .catch(err => this.logger.error({ err }, 'Failed to send API error notification'));
       }
@@ -755,7 +802,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
     proc.on('hang', () => {
       this.stopTypingIndicator(agent);
       const hangChatId = this.getAgentChatId(agent);
-      if (hangChatId) {
+      if (hangChatId && agent.tgBot) {
         agent.tgBot.sendText(hangChatId, '<blockquote>⏸ Session paused. Send a message to continue.</blockquote>', 'HTML')
           .catch(err => this.logger.error({ err }, 'Failed to send hang notification'));
       }
@@ -763,6 +810,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
     proc.on('takeover', () => {
       this.logger.warn({ agentId }, 'Session takeover detected — keeping session for roaming');
+      agent.eventBuffer.push({ ts: Date.now(), type: 'system', text: 'Session takeover detected' });
 
       // Notify supervisor and suppress subsequent exit event
       if (this.isSupervisorSubscribed(agentId, proc.sessionId)) {
@@ -780,6 +828,8 @@ export class Bridge extends EventEmitter implements CtlHandler {
     });
 
     proc.on('exit', () => {
+      agent.eventBuffer.push({ ts: Date.now(), type: 'system', text: 'Process exited' });
+
       // Forward to supervisor (unless suppressed by takeover)
       if (this.suppressExitForProcess.has(proc.sessionId ?? '')) {
         this.suppressExitForProcess.delete(proc.sessionId ?? '');
@@ -806,9 +856,10 @@ export class Bridge extends EventEmitter implements CtlHandler {
     });
 
     proc.on('error', (err: Error) => {
+      agent.eventBuffer.push({ ts: Date.now(), type: 'error', text: err.message });
       this.stopTypingIndicator(agent);
       const errChatId = this.getAgentChatId(agent);
-      if (errChatId) {
+      if (errChatId && agent.tgBot) {
         agent.tgBot.sendText(errChatId, formatSystemMessage('error', escapeHtml(String(err.message))), 'HTML')
           .catch(err2 => this.logger.error({ err: err2 }, 'Failed to send process error notification'));
       }
@@ -826,35 +877,37 @@ export class Bridge extends EventEmitter implements CtlHandler {
     const chatId = this.getAgentChatId(agent);
     if (!chatId) return;
 
-    if (!agent.accumulator) {
+    if (!agent.accumulator && agent.tgBot) {
+      const tgBot = agent.tgBot; // capture for closures (non-null here)
       const sender: TelegramSender = {
         sendMessage: (cid, text, parseMode) => {
           this.logger.info({ agentId, chatId: cid, textLen: text.length }, 'TG accumulator sendMessage');
-          return agent.tgBot.sendText(cid, text, parseMode);
+          return tgBot.sendText(cid, text, parseMode, true); // silent — no push notification
         },
         editMessage: (cid, msgId, text, parseMode) => {
           this.logger.info({ agentId, chatId: cid, msgId, textLen: text.length }, 'TG accumulator editMessage');
-          return agent.tgBot.editText(cid, msgId, text, parseMode);
+          return tgBot.editText(cid, msgId, text, parseMode);
         },
-        deleteMessage: (cid, msgId) => agent.tgBot.deleteMessage(cid, msgId),
-        setReaction: (cid, msgId, emoji) => agent.tgBot.setReaction(cid, msgId, emoji),
-        sendPhoto: (cid, buffer, caption) => agent.tgBot.sendPhotoBuffer(cid, buffer, caption),
+        deleteMessage: (cid, msgId) => tgBot.deleteMessage(cid, msgId),
+        setReaction: (cid, msgId, emoji) => tgBot.setReaction(cid, msgId, emoji),
+        sendPhoto: (cid, buffer, caption) => tgBot.sendPhotoBuffer(cid, buffer, caption),
       };
       const onError = (err: unknown, context: string) => {
         this.logger.error({ err, context, agentId }, 'Stream accumulator error');
-        agent.tgBot.sendText(chatId, formatSystemMessage('error', escapeHtml(context)), 'HTML').catch(() => {});
+        tgBot.sendText(chatId, formatSystemMessage('error', escapeHtml(context)), 'HTML').catch(() => {});
       };
       agent.accumulator = new StreamAccumulator({ chatId, sender, logger: this.logger, onError });
     }
 
-    if (!agent.subAgentTracker) {
+    if (!agent.subAgentTracker && agent.tgBot) {
+      const tgBot = agent.tgBot; // capture for closures (non-null here)
       const subAgentSender: SubAgentSender = {
         sendMessage: (cid, text, parseMode) =>
-          agent.tgBot.sendText(cid, text, parseMode),
+          tgBot.sendText(cid, text, parseMode),
         editMessage: (cid, msgId, text, parseMode) =>
-          agent.tgBot.editText(cid, msgId, text, parseMode),
+          tgBot.editText(cid, msgId, text, parseMode),
         setReaction: (cid, msgId, emoji) =>
-          agent.tgBot.setReaction(cid, msgId, emoji),
+          tgBot.setReaction(cid, msgId, emoji),
       };
       agent.subAgentTracker = new SubAgentTracker({
         chatId,
@@ -864,14 +917,14 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
     // On message_start: new CC turn — full reset for text accumulator.
     if (event.type === 'message_start') {
-      agent.accumulator.reset();
-      if (!agent.subAgentTracker.hasDispatchedAgents) {
+      agent.accumulator?.reset();
+      if (agent.subAgentTracker && !agent.subAgentTracker.hasDispatchedAgents) {
         agent.subAgentTracker.reset();
       }
     }
 
-    agent.accumulator.handleEvent(event);
-    agent.subAgentTracker.handleEvent(event);
+    agent.accumulator?.handleEvent(event);
+    agent.subAgentTracker?.handleEvent(event);
   }
 
   private handleResult(agentId: string, event: ResultEvent): void {
@@ -898,9 +951,9 @@ export class Bridge extends EventEmitter implements CtlHandler {
       acc.finalize();
     }
 
-    // Handle errors
-    if (event.is_error && event.result && chatId) {
-      agent.tgBot.sendText(chatId, formatSystemMessage('error', escapeHtml(String(event.result))), 'HTML')
+    // Handle errors (only send to TG if bot available)
+    if (event.is_error && event.result && chatId && agent.tgBot) {
+      agent.tgBot!.sendText(chatId, formatSystemMessage('error', escapeHtml(String(event.result))), 'HTML')
         .catch(err => this.logger.error({ err }, 'Failed to send result error notification'));
     }
 
@@ -937,6 +990,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
   private async handleSlashCommand(agentId: string, cmd: SlashCommand): Promise<void> {
     const agent = this.agents.get(agentId);
     if (!agent) return;
+    if (!agent.tgBot) return; // ephemeral agents don't have TG bots
 
     this.logger.debug({ agentId, command: cmd.command, args: cmd.args }, 'Slash command');
 
@@ -1363,6 +1417,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
   private async handleCallbackQuery(agentId: string, query: CallbackQuery): Promise<void> {
     const agent = this.agents.get(agentId);
     if (!agent) return;
+    if (!agent.tgBot) return; // ephemeral agents don't have TG bots
 
     this.logger.debug({ agentId, action: query.action, data: query.data }, 'Callback query');
 
@@ -1580,13 +1635,63 @@ export class Bridge extends EventEmitter implements CtlHandler {
       return { id: request.id, success: false, error: `Unknown agent: ${request.agentId}` };
     }
 
-    // Use the agent's primary chat for MCP tool output
-    const chatId = this.getAgentChatId(agent);
-    if (!chatId) {
-      return { id: request.id, success: false, error: `No chat ID for agent: ${request.agentId}` };
-    }
-
     try {
+      // Supervisor-routed tools (don't need TG chatId)
+      switch (request.tool) {
+        case 'notify_parent': {
+          if (!this.supervisorWrite) {
+            return { id: request.id, success: false, error: 'No supervisor connected' };
+          }
+          this.sendToSupervisor({
+            type: 'event',
+            event: 'cc_message',
+            agentId: request.agentId,
+            text: request.params.message,
+            priority: request.params.priority || 'info',
+          });
+          return { id: request.id, success: true };
+        }
+
+        case 'supervisor_exec': {
+          if (!this.supervisorWrite) {
+            return { id: request.id, success: false, error: 'No supervisor connected' };
+          }
+          const timeoutMs = (request.params.timeoutMs as number) || 60000;
+          const result = await this.sendSupervisorRequest({
+            type: 'command',
+            requestId: randomUUID(),
+            action: 'exec',
+            params: {
+              command: request.params.command,
+              agentId: request.agentId,
+              timeoutMs,
+            },
+          }, timeoutMs);
+          return { id: request.id, success: true, result };
+        }
+
+        case 'supervisor_notify': {
+          if (!this.supervisorWrite) {
+            return { id: request.id, success: false, error: 'No supervisor connected' };
+          }
+          this.sendToSupervisor({
+            type: 'event',
+            event: 'notification',
+            agentId: request.agentId,
+            title: request.params.title,
+            body: request.params.body,
+            priority: request.params.priority || 'active',
+          });
+          return { id: request.id, success: true };
+        }
+      }
+
+      // TG tools (need chatId and tgBot)
+      const chatId = this.getAgentChatId(agent);
+      if (!chatId || !agent.tgBot) {
+        return { id: request.id, success: false, error: `No chat ID for agent: ${request.agentId}` };
+      }
+
       switch (request.tool) {
         case 'send_file':
           await agent.tgBot.sendFile(chatId, request.params.path, request.params.caption);
@@ -1630,11 +1735,26 @@ export class Bridge extends EventEmitter implements CtlHandler {
   }
 
   handleSupervisorLine(line: string): void {
-    let msg: { type: string; requestId?: string; action?: string; params?: Record<string, unknown> };
+    let msg: { type: string; requestId?: string; action?: string; params?: Record<string, unknown>; result?: unknown; error?: string };
     try {
       msg = JSON.parse(line);
     } catch {
       this.sendToSupervisor({ type: 'error', message: 'Invalid JSON' });
+      return;
+    }
+
+    // Handle responses to commands we sent to the supervisor (e.g. exec results)
+    if (msg.type === 'response' && msg.requestId) {
+      const pending = this.supervisorPendingRequests.get(msg.requestId);
+      if (pending) {
+        clearTimeout(pending.timer);
+        this.supervisorPendingRequests.delete(msg.requestId);
+        if (msg.error) {
+          pending.reject(new Error(msg.error));
+        } else {
+          pending.resolve(msg.result);
+        }
+      }
       return;
     }
 
@@ -1659,6 +1779,88 @@ export class Bridge extends EventEmitter implements CtlHandler {
       case 'ping':
         return { pong: true, uptime: process.uptime() };
 
+      // ── Phase 2: Ephemeral agents ──
+
+      case 'create_agent': {
+        const agentId = (params.agentId as string) || `oc-spawn-${randomUUID().slice(0, 8)}`;
+        const repo = params.repo as string;
+        if (!repo) throw new Error('Missing required param: repo');
+
+        if (this.agents.has(agentId)) {
+          throw new Error(`Agent already exists: ${agentId}`);
+        }
+
+        // Map supervisor permissionMode to CC permissionMode
+        let permMode: 'dangerously-skip' | 'acceptEdits' | 'default' | 'plan' = 'default';
+        const reqPerm = params.permissionMode as string | undefined;
+        if (reqPerm === 'bypassPermissions' || reqPerm === 'dangerously-skip') permMode = 'dangerously-skip';
+        else if (reqPerm === 'acceptEdits') permMode = 'acceptEdits';
+        else if (reqPerm === 'plan') permMode = 'plan';
+
+        const ephemeralConfig: AgentConfig = {
+          botToken: '',
+          allowedUsers: [],
+          defaults: {
+            model: (params.model as string) || 'sonnet',
+            repo,
+            maxTurns: 200,
+            idleTimeoutMs: 300_000,
+            hangTimeoutMs: 300_000,
+            permissionMode: permMode,
+          },
+        };
+
+        const instance: AgentInstance = {
+          id: agentId,
+          config: ephemeralConfig,
+          tgBot: null,
+          ephemeral: true,
+          repo,
+          model: ephemeralConfig.defaults.model,
+          ccProcess: null,
+          accumulator: null,
+          subAgentTracker: null,
+          batcher: null,
+          pendingPermissions: new Map(),
+          typingInterval: null,
+          typingChatId: null,
+          pendingSessionId: null,
+          destroyTimer: null,
+          eventBuffer: new EventBuffer(),
+        };
+
+        // Auto-destroy timer
+        const timeoutMs = params.timeoutMs as number | undefined;
+        if (timeoutMs && timeoutMs > 0) {
+          instance.destroyTimer = setTimeout(() => {
+            this.logger.info({ agentId, timeoutMs }, 'Ephemeral agent timeout — auto-destroying');
+            this.destroyEphemeralAgent(agentId);
+          }, timeoutMs);
+        }
+
+        this.agents.set(agentId, instance);
+        this.logger.info({ agentId, repo, model: instance.model, ephemeral: true }, 'Ephemeral agent created');
+
+        // Emit agent_created event (always sent, not subscription-gated)
+        this.sendToSupervisor({ type: 'event', event: 'agent_created', agentId, agentType: 'ephemeral', repo });
+
+        return { agentId, state: 'idle' };
+      }
+
+      case 'destroy_agent': {
+        const agentId = params.agentId as string;
+        if (!agentId) throw new Error('Missing agentId');
+
+        const agent = this.agents.get(agentId);
+        if (!agent) throw new Error(`Unknown agent: ${agentId}`);
+        if (!agent.ephemeral) throw new Error(`Cannot destroy persistent agent: ${agentId}`);
+
+        this.destroyEphemeralAgent(agentId);
+        return { destroyed: true };
+      }
+
+      // ── Phase 1: Send + Subscribe ──
+
       case 'send_message': {
         const agentId = params.agentId as string;
         const text = params.text as string;
@@ -1672,9 +1874,9 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
         // For persistent agents: send TG system message BEFORE spawning CC
         const tgChatId = this.getAgentChatId(agent);
-        if (tgChatId) {
+        if (tgChatId && agent.tgBot) {
           const preview = text.length > 500 ? text.slice(0, 500) + '…' : text;
-          agent.tgBot.sendText(tgChatId, `<blockquote>🦞 <b>OpenClaw:</b> ${escapeHtml(preview)}</blockquote>`, 'HTML')
+          agent.tgBot.sendText(tgChatId, `<blockquote>🦞 <b>OpenClaw:</b> ${escapeHtml(preview)}</blockquote>`, 'HTML', true)
             .catch(err => this.logger.error({ err, agentId }, 'Failed to send supervisor TG notification'));
         }
 
@@ -1741,10 +1943,10 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
           agents.push({
             id,
-            type: 'persistent',
+            type: agent.ephemeral ? 'ephemeral' : 'persistent',
             state,
-            sessionId,
             repo: agent.repo,
+            process: agent.ccProcess ? { sessionId, model: agent.model } : null,
             supervisorSubscribed: this.isSupervisorSubscribed(id, sessionId),
           });
         }
@@ -1767,6 +1969,24 @@ export class Bridge extends EventEmitter implements CtlHandler {
         return { killed };
       }
 
+      // ── Phase A: Observability ──
+
+      case 'get_log': {
+        const agentId = params.agentId as string;
+        if (!agentId) throw new Error('Missing agentId');
+
+        const agent = this.agents.get(agentId);
+        if (!agent) throw new Error(`Unknown agent: ${agentId}`);
+
+        return agent.eventBuffer.query({
+          offset: params.offset as number | undefined,
+          limit: params.limit as number | undefined,
+          grep: params.grep as string | undefined,
+          since: params.since as number | undefined,
+          type: params.type as string | undefined,
+        });
+      }
+
       default:
         throw new Error(`Unknown supervisor action: ${action}`);
     }
@@ -1776,6 +1996,27 @@ export class Bridge extends EventEmitter implements CtlHandler {
     if (this.supervisorWrite) {
       try { this.supervisorWrite(JSON.stringify(msg) + '\n'); } catch {}
     }
+  }
+
+  private sendSupervisorRequest(msg: Record<string, unknown>, timeoutMs: number): Promise<unknown> {
+    return new Promise((resolve, reject) => {
+      const requestId = (msg as { requestId?: string }).requestId ?? '';
+      const timer = setTimeout(() => {
+        this.supervisorPendingRequests.delete(requestId);
+        reject(new Error('Supervisor request timed out'));
+      }, timeoutMs);
+      this.supervisorPendingRequests.set(requestId, { resolve, reject, timer });
+      this.sendToSupervisor(msg);
+    });
+  }
+
+  private destroyEphemeralAgent(agentId: string): void {
+    const agent = this.agents.get(agentId);
+    if (!agent || !agent.ephemeral) return;
+    this.killAgentProcess(agentId);
+    this.agents.delete(agentId);
+    this.logger.info({ agentId }, 'Ephemeral agent destroyed');
+    this.sendToSupervisor({ type: 'event', event: 'agent_destroyed', agentId });
   }
 
   // ── Shutdown ──
