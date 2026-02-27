@@ -1304,7 +1304,7 @@ Agent "sentinella":
 ```
 
 **Key principles:**
-1. **One CC process per agent** (at most). `allowedUsers` is an ACL (who can talk to the bot), but all users share the same agent state — same repo, same session, same process. Supervisor and CLI are additional subscribers, not separate users.
+1. **One CC process per agent** (at most). Agents don't know about users — they have repo, session, process. `allowedUsers` is a system-level gate (which TG users can interact with TGCC bots), not an agent concept. Supervisor and CLI are additional message sources, same as TG.
 2. **Repo is agent-level.** Changing repo affects everyone talking to the agent.
 3. **No CC spawn without a repo.** Hard requirement — reject if no repo configured.
 4. **Repo/session changes broadcast to all parties:**
@@ -1318,8 +1318,8 @@ Agent "sentinella":
 | Component | Current | Target |
 |-----------|---------|--------|
 | `AgentInstance.processes` | `Map<userId, CCProcess>` | Single `ccProcess: CCProcess \| null` |
-| `SessionStore` | Per-user state (`users[userId].repo`) | Per-agent state (`agent.repo`, `agent.sessionId`) |
-| `sendToCC()` | Takes `userId` to find/spawn process | No userId needed — uses agent's single process |
+| `SessionStore` | Per-user state (`users[userId].repo`) | Per-agent state (`agent.repo`, `agent.sessionId`) — agents don't track users |
+| `sendToCC()` | Takes `userId` to find/spawn process | Takes `agentId` only — agents have one process |
 | `ProcessRegistry` | Still useful for `repo:sessionId` keying | Entry point changes: lookup by agentId first |
 | `/repo` command | Sets repo for `userId` | Sets repo for agent (all clients) |
 | `/new`, `/resume` | Changes session for `userId` | Changes session for agent (all clients, with notification) |
