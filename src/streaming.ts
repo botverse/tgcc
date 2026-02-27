@@ -484,7 +484,7 @@ export class StreamAccumulator {
     text += makeHtmlSafe(this.buffer);
     if (includeSuffix && this.turnUsage) {
       const usageContent = formatUsageFooter(this.turnUsage, this.turnUsage.model).replace(/<\/?i>/g, '');
-      text += '\n<blockquote>' + usageContent + '</blockquote>';
+      text += '\n' + formatSystemMessage('usage', usageContent);
     }
     return { text, hasHtmlSuffix: includeSuffix && !!this.turnUsage };
   }
@@ -840,7 +840,7 @@ export function formatUsageFooter(usage: TurnUsage, _model?: string): string {
   const ctxPct = Math.round(totalCtx / CONTEXT_WINDOW * 100);
   const overLimit = ctxPct > 90;
   const parts = [
-    `↩️ ${formatTokens(usage.inputTokens)} in`,
+    `${formatTokens(usage.inputTokens)} in`,
     `${formatTokens(usage.outputTokens)} out`,
   ];
   if (usage.costUsd != null) {
