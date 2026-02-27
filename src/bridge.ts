@@ -1669,15 +1669,15 @@ export class Bridge extends EventEmitter implements CtlHandler {
         // Auto-subscribe supervisor
         this.supervisorSubscriptions.add(`${agentId}:*`);
 
-        // Send to agent's single CC process
-        this.sendToCC(agentId, { text });
-
-        // For persistent agents: also send TG system message
+        // For persistent agents: send TG system message BEFORE spawning CC
         const tgChatId = this.getAgentChatId(agent);
         if (tgChatId) {
           agent.tgBot.sendText(tgChatId, `🦞 <b>OpenClaw:</b> ${escapeHtml(text)}`, 'HTML')
             .catch(err => this.logger.error({ err }, 'Failed to send supervisor TG notification'));
         }
+
+        // Send to agent's single CC process
+        this.sendToCC(agentId, { text });
 
         return {
           sessionId: agent.ccProcess?.sessionId ?? null,
