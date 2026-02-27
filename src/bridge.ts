@@ -21,7 +21,7 @@ import {
   type ResultEvent,
   type StreamInnerEvent,
 } from './cc-protocol.js';
-import { StreamAccumulator, SubAgentTracker, splitText, escapeHtml, type TelegramSender, type SubAgentSender, type MailboxMessage } from './streaming.js';
+import { StreamAccumulator, SubAgentTracker, splitText, escapeHtml, formatSystemMessage, type TelegramSender, type SubAgentSender, type MailboxMessage } from './streaming.js';
 import { TelegramBot, type TelegramMessage, type SlashCommand, type CallbackQuery } from './telegram.js';
 import { InlineKeyboard } from 'grammy';
 import { McpBridgeServer, type McpToolRequest, type McpToolResponse } from './mcp-bridge.js';
@@ -445,7 +445,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
       if (resolvedRepo === homedir()) {
         agent.tgBot.sendText(
           chatId,
-          '<blockquote>⚠️ No project selected. Use /repo to pick one, or CC will run in your home directory.</blockquote>',
+          formatSystemMessage('status', 'No project selected. Use /repo to pick one, or CC will run in your home directory.'),
           'HTML',
         ).catch(err => this.logger.error({ err }, 'Failed to send no-repo warning'));
       }
@@ -463,7 +463,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
           // Notify the user they've attached
           agent.tgBot.sendText(
             chatId,
-            '<blockquote>📎 Attached to existing session process.</blockquote>',
+            formatSystemMessage('status', 'Attached to existing session process.'),
             'HTML',
           ).catch(err => this.logger.error({ err }, 'Failed to send attach notification'));
 
@@ -881,8 +881,8 @@ export class Bridge extends EventEmitter implements CtlHandler {
         : '';
 
       const text = isOverloaded
-        ? `<blockquote>⚠️ API overloaded, retrying...${retryInfo}</blockquote>`
-        : `<blockquote>⚠️ ${escapeHtml(errMsg)}${retryInfo}</blockquote>`;
+        ? formatSystemMessage('error', `API overloaded, retrying...${retryInfo}`)
+        : formatSystemMessage('error', `${escapeHtml(errMsg)}${retryInfo}`);
 
       // Broadcast API error to all subscribers
       const entry = getEntry();
@@ -988,7 +988,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
         const subAgent = this.agents.get(sub.client.agentId);
         if (!subAgent) continue;
         this.stopTypingIndicator(subAgent, sub.client.userId, sub.client.chatId);
-        subAgent.tgBot.sendText(sub.client.chatId, `<blockquote>⚠️ ${escapeHtml(String(err.message))}</blockquote>`, 'HTML')
+        subAgent.tgBot.sendText(sub.client.chatId, formatSystemMessage('error', escapeHtml(String(err.message))), 'HTML')
           .catch(err2 => this.logger.error({ err: err2 }, 'Failed to send process error notification'));
       }
     });
@@ -1014,7 +1014,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
       };
       const onError = (err: unknown, context: string) => {
         this.logger.error({ err, context, agentId, userId }, 'Stream accumulator error');
-        agent.tgBot.sendText(chatId, `<blockquote>⚠️ ${escapeHtml(context)}</blockquote>`, 'HTML').catch(() => {});
+        agent.tgBot.sendText(chatId, formatSystemMessage('error', escapeHtml(context)), 'HTML').catch(() => {});
       };
       acc = new StreamAccumulator({ chatId, sender, logger: this.logger, onError });
       agent.accumulators.set(accKey, acc);
@@ -1085,7 +1085,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
     // Handle errors
     if (event.is_error && event.result) {
-      agent.tgBot.sendText(chatId, `<blockquote>⚠️ ${escapeHtml(String(event.result))}</blockquote>`, 'HTML')
+      agent.tgBot.sendText(chatId, formatSystemMessage('error', escapeHtml(String(event.result))), 'HTML')
         .catch(err => this.logger.error({ err }, 'Failed to send result error notification'));
     }
 
@@ -1557,7 +1557,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
         const compactMsg = cmd.args?.trim()
           ? `/compact ${cmd.args.trim()}`
           : '/compact';
-        await agent.tgBot.sendText(cmd.chatId, '<blockquote>🗜️ Compacting…</blockquote>', 'HTML');
+        await agent.tgBot.sendText(cmd.chatId, formatSystemMessage('status', 'Compacting…'), 'HTML');
         proc.sendMessage(createTextMessage(compactMsg));
         break;
       }

@@ -83,7 +83,7 @@ export function formatSystemMessage(type: 'thinking' | 'tool' | 'usage' | 'error
   const style = styles[type];
   const separator = '<code>─────────────────</code>';
 
-  return `${style.prefix}\n${separator}\n<${style.wrapper}><i>${content}</i></${style.wrapper.split(' ')[0]}>`;
+  return `${style.prefix}\n${separator}\n<${style.wrapper}><code>${content}</code></${style.wrapper.split(' ')[0]}>`;
 }
 
 /**
@@ -334,7 +334,7 @@ export class StreamAccumulator {
     const startTime = Date.now();
     this.sendQueue = this.sendQueue.then(async () => {
       try {
-        const html = `<blockquote expandable>⚡ ${escapeHtml(toolName)}…</blockquote>`;
+        const html = formatSystemMessage('tool', `${escapeHtml(toolName)}…`, true);
         const msgId = await this.sender.sendMessage(this.chatId, html, 'HTML');
         this.toolMessages.set(blockId, { msgId, toolName, startTime });
       } catch (err) {
@@ -364,7 +364,7 @@ export class StreamAccumulator {
     this.toolIndicatorLastSummary.set(blockId, summary);
 
     const codeLine = `\n<code>${escapeHtml(summary)}</code>`;
-    const html = `<blockquote expandable>⚡ ${escapeHtml(entry.toolName)}…${codeLine}</blockquote>`;
+    const html = formatSystemMessage('tool', `${escapeHtml(entry.toolName)}…${codeLine}`, true);
 
     this.sendQueue = this.sendQueue.then(async () => {
       try {
@@ -393,7 +393,7 @@ export class StreamAccumulator {
     const statLine = resultStat ? `\n${escapeHtml(resultStat)}` : '';
 
     const icon = isError ? '❌' : '✅';
-    const html = `<blockquote expandable>${icon} ${escapeHtml(toolName)} (${elapsed}s)${codeLine}${statLine}</blockquote>`;
+    const html = formatSystemMessage('tool', `${icon} ${escapeHtml(toolName)} (${elapsed}s)${codeLine}${statLine}`, true);
 
     // Clean up input buffer
     this.toolInputBuffers.delete(blockId);
@@ -498,12 +498,13 @@ export class StreamAccumulator {
       const thinkingPreview = this.thinkingBuffer.length > 1024
         ? this.thinkingBuffer.slice(0, 1024) + '…'
         : this.thinkingBuffer;
-      text += `<blockquote expandable>💭 Thinking\n${markdownToTelegramHtml(thinkingPreview)}</blockquote>\n`;
+      text += formatSystemMessage('thinking', markdownToTelegramHtml(thinkingPreview), true) + '\n';
     }
     // Convert markdown buffer to HTML-safe text
     text += makeHtmlSafe(this.buffer);
     if (includeSuffix && this.turnUsage) {
-      text += '\n' + formatUsageFooter(this.turnUsage, this.turnUsage.model);
+      const usageContent = formatUsageFooter(this.turnUsage, this.turnUsage.model).replace(/<\/?i>/g, '');
+      text += '\n' + formatSystemMessage('usage', usageContent);
     }
     return { text, hasHtmlSuffix: includeSuffix && !!this.turnUsage };
   }
@@ -585,7 +586,7 @@ export class StreamAccumulator {
         ? this.thinkingBuffer.slice(0, 1024) + '…'
         : this.thinkingBuffer;
       await this.sendOrEdit(
-        `<blockquote expandable>💭 Thinking\n${markdownToTelegramHtml(thinkingPreview)}</blockquote>`,
+        formatSystemMessage('thinking', markdownToTelegramHtml(thinkingPreview), true),
         true,
       );
     }

@@ -821,54 +821,15 @@ sequenceDiagram
 
 ### 9.1 Configuration
 
-**Actual config (as implemented):**
-
 ```yaml
-# openclaw.json (gateway config)
+# openclaw.json
 agents:
   defaults:
     subagents:
       claudeCode:
         tgccSupervisor:
           socket: /tmp/tgcc/ctl/tgcc.sock
-          # No static agent map — agents discovered dynamically from TGCC `status`
-          # with 60s TTL cache. Eliminates config drift.
-```
-
-> **Note:** The original spec proposed static agent mappings, reconnect params, heartbeat intervals, ephemeral settings, safety gating, and service restart configs. These were simplified during implementation:
-> - **Agent list**: Comes from TGCC `status` response, cached 60s. No static config.
-> - **Reconnect/heartbeat**: Hardcoded defaults in `TgccSupervisorClient` (1s→30s backoff, 30s heartbeat)
-> - **Ephemeral/exec/services**: Not yet implemented (Phase 2/3)
-
-**Planned config (Phase 2/3):**
-
-```yaml
-# Future additions when Phase 2/3 are built
-agents:
-  defaults:
-    subagents:
-      claudeCode:
-        tgccSupervisor:
-          socket: /tmp/tgcc/ctl/tgcc.sock
-          # Ephemeral spawn settings (Phase 2)
-          ephemeral:
-            idPrefix: "oc-spawn-"
-            defaultTimeoutMs: 300000
-            defaultPermissionMode: bypassPermissions
-          # Safety gating for reverse commands (Phase 3)
-          exec:
-            allowPatterns:
-              - "^cd ~/Botverse/tgcc && npm run build$"
-              - "^npm (run |install)"
-              - "^git (status|pull|log)"
-            denyPatterns:
-              - "rm -rf"
-              - "sudo"
-            requireApproval: false
-            timeoutMs: 60000
-          services:
-            tgcc:
-              restart: "tmux send-keys -t tgcc C-c C-c; sleep 2; tmux send-keys -t tgcc 'cd ~/Botverse/tgcc && node dist/cli.js run' Enter"
+          # Agents discovered from TGCC status (60s TTL cache), no static config
 ```
 
 ### 9.2 Tool Routing Changes
@@ -965,274 +926,27 @@ graph TD
 
 ## 11. Domain Boundaries
 
-> **This section defines what each system owns.** When implementing, stay in your domain. The socket protocol is the contract between domains.
+The Unix socket + NDJSON protocol is the **only** interface between TGCC and OpenClaw.
 
-### 11.1 TGCC Domain (🟠 existing + 🔴 new)
+| Domain | Owns | Does NOT own |
+|--------|------|-------------|
+| **TGCC** | CC process lifecycle, agent state (repo, process), TG bots, MCP bridge, ctl socket server, session JSONL | Subagent tracking, user-facing delivery, tool routing, safety gating |
+| **OpenClaw** | Tool routing (`sessions_send`, `subagents`), subagent registry, announce flow, safety gate for reverse commands | CC processes, TG bots, ctl socket server, session persistence |
 
-**TGCC owns everything about CC process management and the server side of the supervisor socket.**
-
-OpenClaw is a **client** that connects to TGCC. TGCC never connects to OpenClaw — it only responds to connections on its ctl socket.
-
-#### What TGCC already owns (🟠)
-- CC process lifecycle: spawn, stdin/stdout, kill, exit handling
-- ProcessRegistry: shared process access, subscriber model (`process-registry.ts`)
-- Ctl socket server: connection handling, NDJSON protocol (`ctl-server.ts`)
-- Supervisor registration: `register_supervisor` handler (`bridge.ts`)
-- Existing supervisor commands: `status`, `kill_cc`, `restart_cc` (`bridge.ts`)
-- Existing supervisor events: `compact`, `api_error`, `process_exit` (`bridge.ts`)
-- Telegram bot management: message routing, typing indicators, slash commands
-- MCP bridge: provides tools to CC processes (`mcp-bridge.ts`)
-- Session store: JSONL persistence, session discovery (`session.ts`)
-- Config: `~/.tgcc/config.json` management, hot-reload
-
-#### What TGCC must build (🔴)
-
-**Phase 1 — Agent-level state refactor + supervisor commands:**
-
-The prerequisite for all supervisor commands is the agent-level state refactor (see section 13). Once agents have a single `ccProcess` instead of per-user processes, the supervisor commands become straightforward:
-
-| Command | What TGCC does | Implementation |
-|---------|---------------|----------------|
-| `send_message` | Send to agent's `ccProcess` (spawn if needed via agent's repo). Auto-subscribe supervisor. For persistent agents, emit TG system message (`🦞 OpenClaw: ...`). | `agent.ccProcess ? agent.ccProcess.sendMessage() : spawnAndSend()` |
-| `send_to_cc` | Write to agent's active `ccProcess` stdin. Error if no active process. | `agent.ccProcess?.sendMessage()` or error |
-| `subscribe` | Register supervisor as listener on agent's events | Add to `supervisorSubscriptions` set |
-| `unsubscribe` | Remove supervisor from agent's listener list | Remove from set |
-| `ping` | Return `{pong: true, uptime: ...}` | Trivial |
-
-**Phase 1 — Event forwarding to supervisor:**
-
-Forward these events to the supervisor when it's subscribed to an agent:
-
-| Event | When | Notes |
-|-------|------|-------|
-| `result` | CC returns a result | Include `agentId`, `sessionId`, `text`, `cost_usd`, `duration_ms`, `is_error` |
-| `session_takeover` | Another client steals the session | Fires **instead of** `process_exit` — OpenClaw knows the session is alive elsewhere |
-| `process_exit` | CC process exits normally | NOT fired after a takeover |
-| `state_changed` | Agent's repo changes (from TG `/repo` or supervisor) | Include `agentId`, `repo`, old/new values |
-
-**Phase 2 — Ephemeral agents (new concept in `bridge.ts`):**
-
-| Command | What TGCC does | Implementation hint |
-|---------|---------------|---------------------|
-| `create_agent` | Create an in-memory `AgentInstance` with no TG bot. Store in `this.agents` map with a flag `ephemeral: true`. | Similar to `startAgent()` but skip `new TelegramBot()`. Accept repo, model, permissionMode from params. |
-| `destroy_agent` | Kill CC process if running, remove agent from map. Reject if agent is persistent (has TG bot). | Check `ephemeral` flag. Call `disconnectClient()` then delete from `this.agents`. |
-| `agent_created` event | Emit to supervisor when ephemeral agent is created | `this.sendToSupervisor({type:'event', event:'agent_created', agentId, type:'ephemeral', repo})` |
-| `agent_destroyed` event | Emit to supervisor when ephemeral agent is torn down | Same pattern |
-
-Ephemeral agent rules:
-- No entry in `~/.tgcc/config.json` — purely in memory
-- `allowedUsers` is empty — only supervisor can interact
-- Auto-destroy after `timeoutMs` if specified in `create_agent` params
-- Cleaned up on TGCC restart (they don't persist)
-
-**Phase 3 — MCP tools for reverse commands (new tools in `mcp-bridge.ts`):**
-
-| MCP Tool | What TGCC does |
-|----------|---------------|
-| `supervisor_exec` | Receive tool call from CC → forward as `{type:'command', action:'exec', params:{command, agentId}}` to supervisor → wait for response → return as tool result |
-| `supervisor_notify` | Same pattern → forward as `notify` command |
-| `supervisor_restart` | Same pattern → forward as `restart_service` command |
-
-The bridge already has `supervisorPendingRequests` (a Map of requestId → Promise resolve/reject). Use this to correlate:
-```typescript
-// In MCP tool handler:
-const requestId = crypto.randomUUID();
-const resultPromise = new Promise((resolve, reject) => {
-  this.supervisorPendingRequests.set(requestId, { resolve, reject });
-});
-this.sendToSupervisor({ type: 'command', requestId, action: 'exec', params: { command, agentId } });
-const result = await resultPromise;  // resolves when supervisor sends response
-return result;  // returned as MCP tool result to CC
-```
-
-**Phase 3 — Additional events to supervisor:**
-
-| Event | Where to add | What to emit |
-|-------|-------------|-------------|
-| `task_started` | `proc.on('task_started')` in `bridge.ts:753` | `{event:'task_started', agentId, sessionId, toolName}` |
-| `task_completed` | `proc.on('task_completed')` in `bridge.ts:781` | `{event:'task_completed', agentId, sessionId, toolName, duration_ms}` |
-| `assistant_message` | `proc.on('assistant')` in `bridge.ts:816` | `{event:'assistant_message', agentId, sessionId, text}` |
-
-#### What TGCC does NOT own
-
-- ❌ Connecting to OpenClaw (OpenClaw connects to TGCC, not the reverse)
-- ❌ Deciding whether an `exec` command is safe (that's OpenClaw's safety gate)
-- ❌ Tracking subagent runs or announcing results to users (that's OpenClaw's registry)
-- ❌ Routing `sessions_send` or `subagents steer` (those are OpenClaw tool internals)
-- ❌ OpenClaw config schema or agent resolution logic
-
----
-
-### 11.2 OpenClaw Domain (🔵 existing + 🟢 new)
-
-**OpenClaw owns the orchestration layer: tool routing, subagent tracking, user-facing delivery, and safety gating for reverse commands.**
-
-OpenClaw is a **client** that connects to TGCC's ctl socket. TGCC is a black box to OpenClaw — it only interacts via the supervisor protocol.
-
-#### What OpenClaw already owns (🔵)
-- Agent tool layer: `sessions_spawn`, `sessions_send`, `subagents`, `sessions_history`, `session_status`, `agents_list`
-- Subagent registry: tracks spawned runs, announces results to requester sessions
-- CC spawn via `@fonz/tgcc` library import (to be replaced)
-- Gateway lifecycle: startup, shutdown, config loading
-- Channel delivery: Telegram, Discord, etc.
-
-#### What OpenClaw must build (🟢)
-
-**Phase 1 — `TgccSupervisorClient` (new file, e.g. `src/agents/tgcc-supervisor/client.ts`):**
-
-Responsibilities:
-- Connect to TGCC ctl socket (Unix domain socket)
-- Send `register_supervisor` on connect
-- Reconnect with exponential backoff on drop (1s → 2s → 4s → ... → 30s max)
-- Heartbeat: send `ping` every 30s, reconnect if no `pong` within 5s
-- Expose methods: `sendMessage(agentId, text)`, `sendToCC(agentId, text)`, `getStatus()`, `killCC(agentId)`, `subscribe(agentId)`, `unsubscribe(agentId)`
-- Parse incoming events and dispatch to registered handlers
-
-**Phase 1 — Config schema (extend `agents.defaults.subagents.claudeCode`):**
-
-```typescript
-// New fields in config schema
-tgccSupervisor?: {
-  socket: string;              // e.g. /tmp/tgcc/ctl/tgcc.sock
-  reconnectInitialMs?: number; // default 1000
-  reconnectMaxMs?: number;     // default 30000
-  heartbeatMs?: number;        // default 30000
-  agents?: Record<string, {    // persistent TGCC agent mappings
-    description?: string;
-    repo: string;
-  }>;
-}
-```
-
-**Phase 1 — Tool routing changes:**
-
-| Tool | Change |
-|------|--------|
-| `sessions_send` | Before session key resolution, check if `target` matches a TGCC agent name from config. If yes → route to `TgccSupervisorClient.sendMessage()` or `.sendToCC()`. Register a subagent run for tracking. |
-| `subagents list` | After listing local runs, call `TgccSupervisorClient.getStatus()` and merge TGCC agents into the list (with a `[tgcc]` tag or similar). |
-| `subagents steer` | If target resolves to a TGCC-backed run (by `transport: "tgcc-supervisor"` in registry), route to `.sendToCC()` instead of local CC stdin. |
-| `subagents kill` | If target resolves to TGCC-backed run, route to `.killCC()`. |
-| `agents_list` | Append TGCC agent IDs to the list so the LLM knows they exist as targets. |
-
-**Phase 1 — Event handling:**
-
-When `TgccSupervisorClient` receives events:
-- `result` → find the subagent run by `tgcc:{agentId}` key → call `markExternalSubagentRunComplete()` → triggers announce flow to deliver result to the requester session
-- `process_exit` → same, mark run as ended
-- `session_takeover` → mark run as **suspended** (not ended) — the session is alive in another client (VS Code, CLI). Don't announce completion. Optionally notify the requester: "sentinella session was taken over by another client"
-- `api_error` → inject as system message into the requester session
-- `compact` → log, optionally surface
-
-**Phase 2 — Ephemeral agent lifecycle:**
-
-| Tool | Change |
-|------|--------|
-| `sessions_spawn(mode="claude-code")` | Instead of importing `CCProcess` and spawning directly, call `TgccSupervisorClient.createAgent()` → `.sendMessage()`. Register subagent run with `transport: "tgcc-supervisor"`, `ephemeral: true`. |
-| On result/exit | Call `.destroyAgent()` to clean up the ephemeral agent in TGCC. |
-| On timeout | Same — destroy the ephemeral agent. |
-
-Eventually: remove `@fonz/tgcc` as a library dependency from OpenClaw entirely.
-
-**Phase 3 — Reverse command handlers (new file, e.g. `src/agents/tgcc-supervisor/exec-handler.ts`):**
-
-When `TgccSupervisorClient` receives a `command` from TGCC:
-- `exec` → validate against `allowPatterns`/`denyPatterns` → execute via `child_process.exec` with timeout → send `response` back
-- `restart_service` → look up service in config `services` map → execute restart command → send `response`
-- `notify` → inject message into target agent session → send `response`
-
-All reverse commands are logged to an audit file.
-
-#### What OpenClaw does NOT own
-
-- ❌ CC process management (spawn, stdin/stdout, kill — that's TGCC)
-- ❌ Telegram bot management for TGCC agents
-- ❌ The ctl socket server (TGCC listens, OpenClaw connects)
-- ❌ MCP tools provided to CC processes
-- ❌ Session JSONL persistence for TGCC sessions
-- ❌ TGCC config file management
-
----
-
-### 11.3 The Contract Between Domains
-
-The Unix socket + NDJSON protocol is the **only** interface between TGCC and OpenClaw. Neither system imports code from the other (after Phase 2 removes the `@fonz/tgcc` library dep from OpenClaw).
-
-```mermaid
-graph LR
-    classDef ocDomain fill:#27AE60,stroke:#1E8449,color:#fff
-    classDef tgDomain fill:#E74C3C,stroke:#C0392B,color:#fff
-    classDef contract fill:#F39C12,stroke:#E67E22,color:#fff
-
-    subgraph "OpenClaw Domain 🟢"
-        OC_TOOLS["Tool Layer<br/>sessions_send, subagents, etc."]:::ocDomain
-        OC_CLIENT["TgccSupervisorClient"]:::ocDomain
-        OC_REGISTRY["Subagent Registry"]:::ocDomain
-        OC_EXEC["Exec Handler + Safety Gate"]:::ocDomain
-    end
-
-    subgraph "Contract"
-        SOCKET["Unix Socket<br/>/tmp/tgcc/ctl/tgcc.sock<br/>NDJSON Protocol"]:::contract
-    end
-
-    subgraph "TGCC Domain 🔴"
-        TG_CTL["Ctl Server"]:::tgDomain
-        TG_BRIDGE["Bridge"]:::tgDomain
-        TG_PROC["ProcessRegistry + CC Processes"]:::tgDomain
-        TG_MCP["MCP Bridge + Supervisor Tools"]:::tgDomain
-        TG_TG["Telegram Bots"]:::tgDomain
-    end
-
-    OC_TOOLS --> OC_CLIENT
-    OC_CLIENT <-->|"commands<br/>responses<br/>events"| SOCKET
-    SOCKET <--> TG_CTL
-    TG_CTL --> TG_BRIDGE
-    TG_BRIDGE --> TG_PROC
-    TG_BRIDGE --> TG_MCP
-    TG_BRIDGE --> TG_TG
-    OC_CLIENT --> OC_REGISTRY
-    OC_CLIENT --> OC_EXEC
-```
-
-**TGCC implements the server side** of every command and event defined in sections 5, 6, and 7.
-**OpenClaw implements the client side** — sending commands, handling events, routing tools.
-
-Neither side needs to know the other's internals. The protocol is the API.
+OpenClaw connects to TGCC. TGCC never connects to OpenClaw.
 
 ## 12. Implementation Plan
 
-### Phase 1: Send + Subscribe ✅ (mostly complete)
+### Phase 1: Send + Subscribe (in progress)
 
-**TGCC scope 🔴 — all built:**
-1. ✅ `send_message` command handler in `bridge.ts` (⚠️ shared process bug — see section 13)
-2. ✅ `send_to_cc` command handler in `bridge.ts`
-3. ✅ `subscribe` / `unsubscribe` command handlers
-4. ✅ Forward `result` event to supervisor in `proc.on('result')` handler
-5. ✅ Forward `session_takeover` event to supervisor in `proc.on('takeover')` handler (suppress `process_exit` for takeovers)
-6. ✅ `ping` command handler
-7. ✅ Enhanced `status` response with `type: persistent|ephemeral` and `supervisorSubscribed`
-8. ✅ chatId 0 synthetic guard in `telegram.ts`
+**TGCC:**
+1. 🔧 **Agent-level state refactor** — the blocker. Collapse per-userId model to per-agent. See section 13.
+2. ✅ Supervisor commands: `send_message`, `send_to_cc`, `subscribe`, `unsubscribe`, `ping` (built, need updating after refactor)
+3. ✅ Event forwarding: `result`, `session_takeover`, `process_exit` (built)
+4. ❌ `state_changed` event on repo/session changes
+5. ❌ TG system messages when supervisor acts (`🦞 OpenClaw: ...`)
 
-**OpenClaw scope 🟢 — all built:**
-1. ✅ `TgccSupervisorClient` class — connect, register, reconnect, heartbeat
-2. ✅ Config schema for `tgccSupervisor` (socket path only, no static agent map)
-3. ✅ Route `sessions_send` through supervisor for TGCC agents
-4. ✅ Handle `result` events → complete subagent runs → announce to requester (`runSubagentAnnounceFlow`)
-5. ✅ Merge TGCC status into `subagents list` and `agents_list`
-6. ✅ Live agent cache from TGCC `status` with 60s TTL
-7. ✅ Auto-start TGCC via `systemctl --user start tgcc.service`
-8. ✅ `openclaw status` shows TGCC connection state
-
-**Remaining Phase 1 work:**
-- 🔧 **Refactor TGCC to agent-level state model** (see section 13 — "Architecture Issue"). This is the blocker. Currently processes are per-userId, so supervisor gets a separate process from TG user. Need to make it one process per agent, shared by all clients.
-  - Collapse `AgentInstance.processes: Map<userId, CCProcess>` → single `ccProcess`
-  - Move `SessionStore` from per-user to per-agent state (repo, model) — sessionId lives on the process
-  - Remove userId from `sendToCC()` — agent-level lookup
-  - Broadcast repo/session changes to all subscribers (TG + supervisor)
-  - System messages in TG when supervisor acts, events to supervisor when TG user acts
-  - Hard-reject CC spawn without a repo
-- 🔧 `sessions_send` routing on OpenClaw side: check for active CC process first → use `send_to_cc`; fall back to `send_message` only when no active process
-
-**Result:** End-to-end pipeline verified. OpenClaw sends tasks to TGCC agents, gets results back, announces to requester. But supervisor tasks are invisible to the Telegram user (separate process) until the agent-level state refactor is done.
+**OpenClaw:** ✅ All Phase 1 done — `TgccSupervisorClient`, tool routing, event handlers, agent cache, auto-start, status display. Needs minor updates after TGCC refactor.
 
 ### Phase 2: Ephemeral Agents
 
@@ -1266,202 +980,59 @@ Neither side needs to know the other's internals. The protocol is the API.
 
 ## 13. Current State (2026-02-27)
 
-### What Works End-to-End
+### What Works
+- Supervisor registration, ping/heartbeat, reconnect with backoff
+- `sessions_send` → TGCC agent → CC → result → announce back to requester
+- Agent list from TGCC `status` (60s TTL cache, no static config)
+- `subagents list/steer/kill` routed through supervisor
+- Auto-start TGCC via systemd on first connection failure
 
-1. **Supervisor registration**: OpenClaw connects to TGCC socket, sends `register_supervisor`, gets `registered` back
-2. **`sessions_send` → TGCC agent**: `sessions_send(label="sentinella")` routes through supervisor → TGCC spawns CC → result event fires → OpenClaw announce flow delivers to requester
-3. **Auto-start**: If TGCC isn't running when OpenClaw tries to connect, it runs `systemctl --user start tgcc.service`
-4. **Agent list from TGCC**: OpenClaw queries `status` on connect, caches agent list with 60s TTL. No static agent config needed.
-5. **`openclaw status`** and **`session_status`** show TGCC supervisor connection state and agent count
-6. **Subagent tracking**: TGCC-routed tasks appear in `subagents list` with `[tgcc]` tag, keyed as `tgcc:{agentId}`
+### Blocker: Agent-Level State Refactor
 
-### 🚨 Architecture Issue: Agent-Level State Model
+TGCC currently tracks state per-userId (processes, repo, session). The supervisor gets a separate process from the TG user. **The fix** (in progress): refactor to per-agent state as described in section 2.2. See section 12 Phase 1.
 
-**The current TGCC model is user-scoped. It should be agent-scoped.**
-
-#### Current model (broken for multi-client)
-
-State is tracked per `userId` within each agent:
-- `SessionStore.agents[agentId].users[userId] = {repo, sessionId, model}`
-- `AgentInstance.processes = Map<userId, CCProcess>`
-- `sendToCC(agentId, userId, chatId, data)` — process lookup is by userId
-
-This means when the supervisor sends with `userId: "supervisor"`, it gets a completely separate process from the TG user's `userId: "7016073156"`. Two independent processes, two sessions, no shared visibility.
-
-#### Target model: one agent, one state
-
-```
-Agent "sentinella":
-  repo: /home/fonz/Botverse/sentinella
-  ccProcess: <CCProcess | null>
-    └─ sessionId: abc-123          # lives on the process, not the agent
-    └─ spawned with: --continue    # or --resume <id>
-  subscribers: [TG user, supervisor, CLI attach, ...]
-```
-
-**Key principles:**
-1. **One CC process per agent** (at most). Agents don't know about users — they have repo, session, process. `allowedUsers` is a system-level gate (which TG users can interact with TGCC bots), not an agent concept. Supervisor and CLI are additional message sources, same as TG.
-2. **Repo is agent-level.** Changing repo affects everyone talking to the agent.
-3. **No CC spawn without a repo.** Hard requirement — reject if no repo configured.
-4. **Repo/session changes broadcast to all parties:**
-   - TG user changes repo → supervisor gets notified: `{event: "repo_changed", agentId, repo, sessionId}`
-   - Supervisor changes repo → TG user sees system message: `🦞 OpenClaw switched repo to ~/Botverse/KYO`
-   - Same for session changes (`/new`, `/resume`, etc.)
-5. **Subscribers see everything:** CC output, user-sent messages (with source tag), system events.
-
-#### What changes in TGCC
-
-| Component | Current | Target |
-|-----------|---------|--------|
-| `AgentInstance.processes` | `Map<userId, CCProcess>` | Single `ccProcess: CCProcess \| null` |
-| `SessionStore` | Per-user state (`users[userId].repo`) | Per-agent state (`agent.repo`) — `sessionId` lives on the process, not the agent |
-| `sendToCC()` | Takes `userId` to find/spawn process | Takes `agentId` only — agents have one process |
-| `ProcessRegistry` | Still useful for `repo:sessionId` keying | Entry point changes: lookup by agentId first |
-| `/repo` command | Sets repo for `userId` | Sets repo for agent (all clients) |
-| `/new`, `/resume` | Changes session for `userId` | Changes session for agent (all clients, with notification) |
-
-#### Flows with the new model
-
-**1a. No active CC process, OpenClaw sends message:**
-```
-supervisor send_message(agentId: "sentinella", text: "Check tiles")
-  → agent has repo /home/fonz/Botverse/sentinella, no active process
-  → spawn CC in that repo
-  → register supervisor as subscriber
-  → notify TG user: "🦞 OpenClaw: Check tiles" (system message in their chat)
-  → TG user can reply in same session (shared process)
-  → result goes to both supervisor AND TG user
-```
-
-**1b. TG user sends message, OpenClaw is monitoring:**
-```
-TG user sends "Check coverage" to sentinella bot
-  → agent has repo, no active process
-  → spawn CC
-  → if supervisor is subscribed to this agent: forward all events
-  → user messages are forwarded too (with source: "telegram")
-  → supervisor sees full conversation
-```
-
-**2. Active CC process, OpenClaw sends follow-up:**
-```
-supervisor send_to_cc(agentId: "sentinella", text: "Also check Ibiza")
-  → agent has active CC process
-  → write to stdin
-  → emit TG system message: "🦞 OpenClaw: Also check Ibiza"
-  → CC responds, both TG user and supervisor see it
-```
-
-**3. Repo change from TG:**
-```
-TG user sends /repo sentinella
-  → kills active CC process (if any)
-  → sets agent.repo = /home/fonz/Botverse/sentinella
-  → clears sessionId
-  → emits event to supervisor: {event: "state_changed", agentId, repo, sessionId: null}
-```
-
-**4. Repo/session change from supervisor:**
-```
-supervisor send_message(agentId: "sentinella", repo: "/new/path", ...)
-  → or a new `set_agent_state` command
-  → changes agent.repo
-  → TG system message: "🦞 OpenClaw switched to ~/new/path"
-  → emits state_changed event
-```
-
-### Implementation Differences from Original Spec
-
-#### Config Schema (actual vs spec)
-
-The spec proposed a `tgccSupervisor` block with static agent mappings. What was actually built:
+### OpenClaw Config
 
 ```yaml
-# Actual config (openclaw.json)
 agents:
   defaults:
     subagents:
       claudeCode:
         tgccSupervisor:
           socket: /tmp/tgcc/ctl/tgcc.sock
-          # No static agent map — agents come from TGCC `status` with 60s TTL cache
+          # Agents discovered from TGCC status, no static config
 ```
 
-Static `agents` map was removed. OpenClaw queries TGCC `status` on connect and caches the agent list. This is simpler and avoids config drift.
-
-#### Subagent Keying
-
-Spec proposed: `tgcc:{agentId}:{sessionId}`
-Actual: `tgcc:{agentId}` (no session ID — simpler correlation, one run per agent)
-
-#### chatId 0 as Synthetic Marker
-
-Added a guard in `telegram.ts` — `TelegramBot.isSyntheticChat(0)` silently skips all Telegram API calls when `chatId === 0`. This prevents errors from supervisor-initiated processes that have no real Telegram chat.
+### OpenClaw Subagent Keying
+Runs keyed as `tgcc:{agentId}` (no sessionId — one run per agent, TGCC manages sessions internally).
 
 ## 14. Inventory
 
-### TGCC Inventory
+### Phase 1 — TGCC
+| What | Status |
+|------|--------|
+| Agent-level state refactor (`bridge.ts`, `session.ts`) | 🔧 In progress |
+| Supervisor commands (`send_message`, `send_to_cc`, `subscribe`, `unsubscribe`, `ping`) | ✅ Built (updating for refactor) |
+| Event forwarding (`result`, `session_takeover`, `process_exit`) | ✅ Built |
+| `state_changed` event on repo/session changes | ❌ |
+| TG system messages when supervisor acts | ❌ |
 
-| Component | Status | Location | Phase |
-|-----------|--------|----------|-------|
-| Ctl socket server | ✅ Exists | `ctl-server.ts` | — |
-| ProcessRegistry | ✅ Exists | `process-registry.ts` | — |
-| Supervisor registration | ✅ Exists | `ctl-server.ts` + `bridge.ts` | — |
-| `status` command | ✅ Exists (enhanced) | `bridge.ts` | — |
-| `kill_cc` command | ✅ Exists | `bridge.ts` | — |
-| `restart_cc` command | ✅ Exists | `bridge.ts` | — |
-| Events: `compact`, `api_error`, `process_exit` | ✅ Exists | `bridge.ts` | — |
-| MCP bridge | ✅ Exists | `mcp-bridge.ts` | — |
-| `result` event to supervisor | ✅ Built | `bridge.ts` | 1 |
-| `session_takeover` event to supervisor | ✅ Built | `bridge.ts` | 1 |
-| `send_message` command | ⚠️ Built (needs agent-level state refactor) | `bridge.ts` | 1 |
-| **Agent-level state refactor** | ❌ Build (blocker) | `bridge.ts`, `session.ts` | 1 |
-| `send_to_cc` command | ✅ Built | `bridge.ts` | 1 |
-| `subscribe` / `unsubscribe` | ✅ Built | `bridge.ts` | 1 |
-| `ping` command | ✅ Built | `bridge.ts` | 1 |
-| Enhance `status` response | ✅ Built (includes `type`, `supervisorSubscribed`) | `bridge.ts` | 1 |
-| Suppress `process_exit` after `session_takeover` | ✅ Built | `bridge.ts` | 1 |
-| chatId 0 synthetic guard | ✅ Built | `telegram.ts` | 1 |
-| `create_agent` command | ❌ Build | `bridge.ts` | 2 |
-| `destroy_agent` command | ❌ Build | `bridge.ts` | 2 |
-| `agent_created/destroyed` events | ❌ Build | `bridge.ts` | 2 |
-| Ephemeral agent timeout | ❌ Build | `bridge.ts` | 2 |
-| MCP `supervisor_exec` tool | ❌ Build | `mcp-bridge.ts` | 3 |
-| MCP `supervisor_notify` tool | ❌ Build | `mcp-bridge.ts` | 3 |
-| MCP `supervisor_restart` tool | ❌ Build | `mcp-bridge.ts` | 3 |
-| Events: `task_started`, `task_completed` | ❌ Build | `bridge.ts` | 3 |
-| Event: `assistant_message` | ❌ Build | `bridge.ts` | 3 |
-| `get_session_history` command | ❌ Build | `bridge.ts` | 3 |
+### Phase 1 — OpenClaw
+| What | Status |
+|------|--------|
+| `TgccSupervisorClient` (connect, register, reconnect, heartbeat) | ✅ |
+| Tool routing (`sessions_send`, `subagents`, `agents_list`) | ✅ |
+| Event handlers (result → announce, exit, takeover) | ✅ |
+| Agent cache from `status` (60s TTL) | ✅ |
 
-### OpenClaw Inventory
+### Phase 2 — Ephemeral Agents
+| What | Status |
+|------|--------|
+| `create_agent` / `destroy_agent` commands (TGCC) | ❌ |
+| Replace `@fonz/tgcc` library import with supervisor (OpenClaw) | ❌ |
 
-| Component | Status | Location | Phase |
-|-----------|--------|----------|-------|
-| `sessions_spawn` tool | ✅ Exists | `sessions-spawn-tool.ts` | — |
-| `sessions_send` tool | ✅ Exists | `sessions-send-tool.ts` | — |
-| `subagents` tool | ✅ Exists | `subagents-tool.ts` | — |
-| `sessions_history` tool | ✅ Exists | `sessions-history-tool.ts` | — |
-| `session_status` tool | ✅ Exists | `session-status-tool.ts` | — |
-| `agents_list` tool | ✅ Exists | `agents-list-tool.ts` | — |
-| Subagent registry | ✅ Exists | `subagent-registry.ts` | — |
-| CC spawn via `@fonz/tgcc` lib | ✅ Exists (to be replaced in Phase 2) | `claude-code/runner.ts` | — |
-| `TgccSupervisorClient` | ✅ Built | `tgcc-supervisor/client.ts` | 1 |
-| Supervisor event handlers | ✅ Built | `tgcc-supervisor/index.ts` | 1 |
-| Config schema for supervisor | ✅ Built | config schema | 1 |
-| `sessions_send` → TGCC routing | ✅ Built | `sessions-send-tool.ts` | 1 |
-| `subagents list` merge (TGCC agents) | ✅ Built | `subagents-tool.ts` | 1 |
-| `subagents steer` → TGCC `send_to_cc` | ✅ Built | `subagents-tool.ts` | 1 |
-| `subagents kill` → TGCC `kill_cc` | ✅ Built | `subagents-tool.ts` | 1 |
-| `agents_list` includes TGCC agents | ✅ Built | `agents-list-tool.ts` | 1 |
-| Result event → announce flow | ✅ Built | `tgcc-supervisor/index.ts` | 1 |
-| Live agent cache (60s TTL from `status`) | ✅ Built | `tgcc-supervisor/client.ts` | 1 |
-| Auto-start TGCC via systemd | ✅ Built | `tgcc-supervisor/client.ts` | 1 |
-| `openclaw status` shows TGCC state | ✅ Built | `session-status-tool.ts` | 1 |
-| `send_to_cc` routing (active process check) | 🔧 In progress | `sessions-send-tool.ts` | 1 |
-| Ephemeral agent lifecycle | ❌ Build | `sessions-spawn-tool.ts` | 2 |
-| Replace CC lib with supervisor | ❌ Build | `sessions-spawn-tool.ts` | 2 |
-| Remove `@fonz/tgcc` dependency | ❌ Build | `package.json` | 2 |
-| Exec handler + safety gate | ❌ Build | new: `tgcc-supervisor/exec-handler.ts` | 3 |
-| `restart_service` handler | ❌ Build | `tgcc-supervisor/exec-handler.ts` | 3 |
-| `notify` handler | ❌ Build | `tgcc-supervisor/exec-handler.ts` | 3 |
-| Audit logging | ❌ Build | `tgcc-supervisor/audit.ts` | 3 |
+### Phase 3 — Reverse Commands
+| What | Status |
+|------|--------|
+| MCP tools: `supervisor_exec`, `supervisor_notify`, `supervisor_restart` (TGCC) | ❌ |
+| Exec handler + safety gate (OpenClaw) | ❌ |
