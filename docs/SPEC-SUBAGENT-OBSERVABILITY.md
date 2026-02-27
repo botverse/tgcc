@@ -23,6 +23,12 @@ Only inject into the caller's context when something needs attention:
 | ❌ Error | API error, crash, permission block | ~50-100 tokens |
 | ⚠️ Stuck | No progress for N minutes (configurable) | ~30 tokens |
 | 💰 Budget | Cost exceeded threshold | ~30 tokens |
+| 📋 Task milestone | CC creates/completes a todo item or subtask | ~30-50 tokens |
+| 🔨 Build/test result | Build or test pass/fail (highest signal for "is it done?") | ~30-50 tokens |
+| 📝 Git commit | CC committed — message is a natural progress summary | ~30-50 tokens |
+| 🧠 Context pressure | Context window at 50%, 75%, 90% — quality may degrade | ~20 tokens |
+| 🔄 Sub-agent spawn | CC used Task tool to spawn sub-agents (task is bigger than expected) | ~30 tokens |
+| 🔁 Failure loop | 3+ consecutive tool failures (CC is stuck) | ~50 tokens |
 | 💬 CC message | CC used `notify_parent` MCP tool | Variable |
 
 **Format:** Short, actionable, one message per event:
@@ -30,6 +36,14 @@ Only inject into the caller's context when something needs attention:
 [subagent:sentinella] ❌ API error: rate limited (retry 2/5)
 [subagent:sentinella] ⚠️ No progress for 5 minutes (last: editing bridge.ts)
 [subagent:sentinella] 💰 $0.50 spent (budget: $1.00)
+[subagent:sentinella] 📋 [2/5] Read specs and source files ✅
+[subagent:sentinella] 📋 [3/5] Implement ring buffer + get_log
+[subagent:sentinella] 🔨 Build passed ✅ (0 errors)
+[subagent:sentinella] 🔨 Build failed: 12 errors in bridge.ts
+[subagent:sentinella] 📝 Committed: "feat: add event ring buffer and get_log command"
+[subagent:sentinella] 🧠 Context at 75% — may compact soon
+[subagent:sentinella] 🔄 Spawned 3 sub-agents (team: refactor-squad)
+[subagent:sentinella] 🔁 3 consecutive Bash failures — possibly stuck
 [subagent:sentinella] 💬 "Build fails — missing dep X. Install it?"
 ```
 
@@ -41,7 +55,26 @@ TGCC tracks these conditions per-process and emits supervisor events:
 // Error event (already exists, extend with detail)
 {"type":"event", "event":"api_error", "agentId":"sentinella", "message":"rate limited", "retry":"2/5"}
 
-// Stuck event (new)
+// Task milestone (from TodoWrite tool use)
+{"type":"event", "event":"task_milestone", "agentId":"sentinella", "task":"Read specs and source files", "status":"completed", "progress":"2/5"}
+
+// Build/test result (detect from Bash tool output: exit code + "error"/"passed"/"failed" keywords)
+{"type":"event", "event":"build_result", "agentId":"sentinella", "command":"npm run build", "passed":true, "errors":0, "summary":"Build passed"}
+{"type":"event", "event":"build_result", "agentId":"sentinella", "command":"npm run build", "passed":false, "errors":12, "summary":"12 errors in bridge.ts"}
+
+// Git commit (detect from Bash tool: `git commit` command with exit 0)
+{"type":"event", "event":"git_commit", "agentId":"sentinella", "message":"feat: add event ring buffer"}
+
+// Context pressure (from stream_event usage stats — track cumulative)
+{"type":"event", "event":"context_pressure", "agentId":"sentinella", "percent":75, "tokens":150000}
+
+// Sub-agent spawn (detect from Task/dispatch_agent tool use)
+{"type":"event", "event":"subagent_spawn", "agentId":"sentinella", "count":3, "teamName":"refactor-squad"}
+
+// Failure loop (track consecutive tool failures — 3+ triggers alert)
+{"type":"event", "event":"failure_loop", "agentId":"sentinella", "consecutiveFailures":3, "lastTool":"Bash", "lastError":"exit code 1"}
+
+// Stuck (no output for N minutes)
 {"type":"event", "event":"stuck", "agentId":"sentinella", "silentMs":300000, "lastActivity":"editing bridge.ts"}
 
 // Budget event (new)  
@@ -230,6 +263,12 @@ CC uses notify_parent("Build fails, should I install dep X?", priority="question
 | Stuck detection (configurable silence threshold) | B |
 | Budget tracking per-process | B |
 | `stuck` and `budget_alert` supervisor events | B |
+| Build/test result detection (Bash exit code + keyword parsing) | B |
+| Git commit detection (git commit tool use) | B |
+| Context pressure tracking (from usage stats) | B |
+| Sub-agent spawn detection (Task/dispatch_agent tool use) | B |
+| Failure loop detection (3+ consecutive tool failures) | B |
+| Task milestone detection (TodoWrite tool use) | B |
 | `notify_parent` MCP tool | C |
 | `cc_message` supervisor event | C |
 
