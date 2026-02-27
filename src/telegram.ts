@@ -413,10 +413,11 @@ export class TelegramBot {
     return Number(chatId) === 0;
   }
 
-  async sendText(chatId: number | string, text: string, parseMode?: string): Promise<number> {
+  async sendText(chatId: number | string, text: string, parseMode?: string, silent = false): Promise<number> {
     if (this.isSyntheticChat(chatId)) return 0;
     const msg = await this.bot.api.sendMessage(Number(chatId), text, {
       parse_mode: parseMode as 'Markdown' | 'MarkdownV2' | 'HTML' | undefined,
+      disable_notification: silent || undefined,
     });
     this.trackBotMessage(Number(chatId), msg.message_id, text);
     return msg.message_id;
