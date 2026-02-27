@@ -1228,10 +1228,16 @@ Neither side needs to know the other's internals. The protocol is the API.
 8. ✅ `openclaw status` shows TGCC connection state
 
 **Remaining Phase 1 work:**
-- 🔧 Fix `send_message` shared process problem (see section 13 — supervisor creates separate `userId: "supervisor"` process instead of sharing TG user's active process)
-- 🔧 `sessions_send` routing: check for active CC process first → use `send_to_cc`; fall back to `send_message` only when no active process
+- 🔧 **Refactor TGCC to agent-level state model** (see section 13 — "Architecture Issue"). This is the blocker. Currently processes are per-userId, so supervisor gets a separate process from TG user. Need to make it one process per agent, shared by all clients.
+  - Collapse `AgentInstance.processes: Map<userId, CCProcess>` → single `ccProcess`
+  - Move `SessionStore` from per-user to per-agent state (repo, sessionId, model)
+  - Remove userId from `sendToCC()` — agent-level lookup
+  - Broadcast repo/session changes to all subscribers (TG + supervisor)
+  - System messages in TG when supervisor acts, events to supervisor when TG user acts
+  - Hard-reject CC spawn without a repo
+- 🔧 `sessions_send` routing on OpenClaw side: check for active CC process first → use `send_to_cc`; fall back to `send_message` only when no active process
 
-**Result:** End-to-end pipeline verified. OpenClaw sends tasks to TGCC agents, gets results back, announces to requester. But supervisor tasks are invisible to the Telegram user (separate process).
+**Result:** End-to-end pipeline verified. OpenClaw sends tasks to TGCC agents, gets results back, announces to requester. But supervisor tasks are invisible to the Telegram user (separate process) until the agent-level state refactor is done.
 
 ### Phase 2: Ephemeral Agents
 
@@ -1274,31 +1280,99 @@ Neither side needs to know the other's internals. The protocol is the API.
 5. **`openclaw status`** and **`session_status`** show TGCC supervisor connection state and agent count
 6. **Subagent tracking**: TGCC-routed tasks appear in `subagents list` with `[tgcc]` tag, keyed as `tgcc:{agentId}`
 
-### 🚨 Known Issue: Shared Process Problem
+### 🚨 Architecture Issue: Agent-Level State Model
 
-**The core unsolved problem.** When OpenClaw sends a message via `send_message`, TGCC spawns a **separate CC process** under `userId: "supervisor"` instead of attaching to the Telegram user's existing process (or sharing one).
+**The current TGCC model is user-scoped. It should be agent-scoped.**
 
-**What happens:**
+#### Current model (broken for multi-client)
+
+State is tracked per `userId` within each agent:
+- `SessionStore.agents[agentId].users[userId] = {repo, sessionId, model}`
+- `AgentInstance.processes = Map<userId, CCProcess>`
+- `sendToCC(agentId, userId, chatId, data)` — process lookup is by userId
+
+This means when the supervisor sends with `userId: "supervisor"`, it gets a completely separate process from the TG user's `userId: "7016073156"`. Two independent processes, two sessions, no shared visibility.
+
+#### Target model: one agent, one state
+
 ```
-Fnz messages sentinella on Telegram → CC process spawned as userId: "7016073156"
-OpenClaw sends via supervisor → CC process spawned as userId: "supervisor", chatId: 0
+Agent "sentinella":
+  repo: /home/fonz/Botverse/sentinella
+  sessionId: abc-123 (or null)
+  ccProcess: <CCProcess | null>
+  subscribers: [TG user, supervisor, CLI attach, ...]
 ```
 
-These are two independent processes. The Telegram subscriber model broadcasts only to subscribers of THAT specific process. So:
-- Fnz on Telegram sees nothing from the supervisor-initiated task
-- OpenClaw gets the result back (via `result` event), but it's invisible on Telegram
-- Two CC processes are running for the same agent simultaneously
+**Key principles:**
+1. **One CC process per agent** (at most). Not per-user. Everyone shares it.
+2. **Repo is agent-level.** Changing repo affects everyone talking to the agent.
+3. **No CC spawn without a repo.** Hard requirement — reject if no repo configured.
+4. **Repo/session changes broadcast to all parties:**
+   - TG user changes repo → supervisor gets notified: `{event: "repo_changed", agentId, repo, sessionId}`
+   - Supervisor changes repo → TG user sees system message: `🦞 OpenClaw switched repo to ~/Botverse/KYO`
+   - Same for session changes (`/new`, `/resume`, etc.)
+5. **Subscribers see everything:** CC output, user-sent messages (with source tag), system events.
 
-**What should happen (spec section 2.2):** Both Telegram and supervisor should share a single `ProcessEntry`. When the supervisor sends to an agent that already has an active TG-user process, it should write to that process's stdin and subscribe to its events — not create a new one.
+#### What changes in TGCC
 
-**Root cause:** `send_message` in `bridge.ts` calls `sendToCC()` which uses `userId: "supervisor"` as the client identity. The `ProcessRegistry` keys by `repo:sessionId`, but since the supervisor doesn't specify a `sessionId`, it creates a new session/process instead of finding the existing one.
+| Component | Current | Target |
+|-----------|---------|--------|
+| `AgentInstance.processes` | `Map<userId, CCProcess>` | Single `ccProcess: CCProcess \| null` |
+| `SessionStore` | Per-user state (`users[userId].repo`) | Per-agent state (`agent.repo`, `agent.sessionId`) |
+| `sendToCC()` | Takes `userId` to find/spawn process | No userId needed — uses agent's single process |
+| `ProcessRegistry` | Still useful for `repo:sessionId` keying | Entry point changes: lookup by agentId first |
+| `/repo` command | Sets repo for `userId` | Sets repo for agent (all clients) |
+| `/new`, `/resume` | Changes session for `userId` | Changes session for agent (all clients, with notification) |
 
-**Fix options:**
-1. **Route through existing user process**: When `send_message` targets a persistent agent with an active TG-user process, write to that process's stdin instead of spawning a new one
-2. **Cross-process subscription**: Keep separate processes but add supervisor as subscriber to the TG user's process too
-3. **Shared userId**: Use the TG user's `userId` for supervisor-initiated processes (messy, conflates identity)
+#### Flows with the new model
 
-**Recommended: Option 1** — check for active process first, route through it.
+**1a. No active CC process, OpenClaw sends message:**
+```
+supervisor send_message(agentId: "sentinella", text: "Check tiles")
+  → agent has repo /home/fonz/Botverse/sentinella, no active process
+  → spawn CC in that repo
+  → register supervisor as subscriber
+  → notify TG user: "🦞 OpenClaw: Check tiles" (system message in their chat)
+  → TG user can reply in same session (shared process)
+  → result goes to both supervisor AND TG user
+```
+
+**1b. TG user sends message, OpenClaw is monitoring:**
+```
+TG user sends "Check coverage" to sentinella bot
+  → agent has repo, no active process
+  → spawn CC
+  → if supervisor is subscribed to this agent: forward all events
+  → user messages are forwarded too (with source: "telegram")
+  → supervisor sees full conversation
+```
+
+**2. Active CC process, OpenClaw sends follow-up:**
+```
+supervisor send_to_cc(agentId: "sentinella", text: "Also check Ibiza")
+  → agent has active CC process
+  → write to stdin
+  → emit TG system message: "🦞 OpenClaw: Also check Ibiza"
+  → CC responds, both TG user and supervisor see it
+```
+
+**3. Repo change from TG:**
+```
+TG user sends /repo sentinella
+  → kills active CC process (if any)
+  → sets agent.repo = /home/fonz/Botverse/sentinella
+  → clears sessionId
+  → emits event to supervisor: {event: "state_changed", agentId, repo, sessionId: null}
+```
+
+**4. Repo/session change from supervisor:**
+```
+supervisor send_message(agentId: "sentinella", repo: "/new/path", ...)
+  → or a new `set_agent_state` command
+  → changes agent.repo
+  → TG system message: "🦞 OpenClaw switched to ~/new/path"
+  → emits state_changed event
+```
 
 ### Implementation Differences from Original Spec
 
@@ -1344,7 +1418,8 @@ Added a guard in `telegram.ts` — `TelegramBot.isSyntheticChat(0)` silently ski
 | MCP bridge | ✅ Exists | `mcp-bridge.ts` | — |
 | `result` event to supervisor | ✅ Built | `bridge.ts` | 1 |
 | `session_takeover` event to supervisor | ✅ Built | `bridge.ts` | 1 |
-| `send_message` command | ⚠️ Built (shared process bug) | `bridge.ts` | 1 |
+| `send_message` command | ⚠️ Built (needs agent-level state refactor) | `bridge.ts` | 1 |
+| **Agent-level state refactor** | ❌ Build (blocker) | `bridge.ts`, `session.ts` | 1 |
 | `send_to_cc` command | ✅ Built | `bridge.ts` | 1 |
 | `subscribe` / `unsubscribe` | ✅ Built | `bridge.ts` | 1 |
 | `ping` command | ✅ Built | `bridge.ts` | 1 |
