@@ -40,7 +40,7 @@ export interface StreamAccumulatorOptions {
   chatId: number | string;
   sender: TelegramSender;
   editIntervalMs?: number;      // min ms between TG edits (default 1000)
-  splitThreshold?: number;       // char count to trigger message split (default 4000)
+  splitThreshold?: number;       // char count to trigger message split (default 3500)
   logger?: { error?: (...args: unknown[]) => void; warn?: (...args: unknown[]) => void; debug?: (...args: unknown[]) => void };
   /** Callback for critical errors that should be surfaced to the user */
   onError?: (err: unknown, context: string) => void;
@@ -111,16 +111,17 @@ export class StreamAccumulator {
   /** Usage from the most recent message_start event — represents a single API call's context (not cumulative). */
   private _lastMsgStartCtx: { input: number; cacheRead: number; cacheCreation: number } | null = null;
 
-  // Per-tool-use independent indicator messages (persists across resets)
-  private toolMessages: Map<string, { msgId: number; toolName: string; startTime: number }> = new Map();
+  // Per-tool-use consolidated indicator message (persists across resets)
+  private toolMessages: Map<string, { msgId: number; toolName: string; startTime: number; resolved: boolean; isError: boolean; elapsed: string | null }> = new Map();
   private toolInputBuffers: Map<string, string> = new Map(); // tool block ID → accumulated input JSON
   private currentToolBlockId: string | null = null;
+  private consolidatedToolMsgId: number | null = null; // shared TG message for all tool indicators
 
   constructor(options: StreamAccumulatorOptions) {
     this.chatId = options.chatId;
     this.sender = options.sender;
     this.editIntervalMs = options.editIntervalMs ?? 1000;
-    this.splitThreshold = options.splitThreshold ?? 4000;
+    this.splitThreshold = options.splitThreshold ?? 3500;
     this.logger = options.logger;
     this.onError = options.onError;
   }
@@ -196,10 +197,27 @@ export class StreamAccumulator {
       }
     } else if (blockType === 'text') {
       this.currentBlockType = 'text';
-      // If thinking indicator was shown, keep it as its own message — start a new one for text
+      // If thinking indicator was shown, update it with actual thinking content NOW
+      // (before text starts streaming below) — don't wait for finalize()
       if (this.thinkingIndicatorShown && this.tgMessageId) {
         this.thinkingMessageId = this.tgMessageId;
         this.tgMessageId = null; // force new message for response text
+        // Flush "Processing..." → actual thinking content immediately
+        if (this.thinkingBuffer && this.thinkingMessageId) {
+          const thinkingPreview = this.thinkingBuffer.length > 1024
+            ? this.thinkingBuffer.slice(0, 1024) + '…'
+            : this.thinkingBuffer;
+          const html = formatSystemMessage('thinking', markdownToTelegramHtml(thinkingPreview), true);
+          this.sendQueue = this.sendQueue.then(async () => {
+            try {
+              await this.sender.editMessage(this.chatId, this.thinkingMessageId!, html, 'HTML');
+            } catch {
+              // Non-critical — thinking message update
+            }
+          }).catch(err => {
+            this.logger?.error?.({ err }, 'Failed to flush thinking indicator');
+          });
+        }
       }
     } else if (blockType === 'tool_use') {
       this.currentBlockType = 'tool_use';
@@ -310,22 +328,72 @@ export class StreamAccumulator {
     this.imageBase64Buffer = '';
   }
 
-  /** Send an independent tool indicator message (not through the accumulator's sendOrEdit). */
+  /** Send or update the consolidated tool indicator message. */
   private async sendToolIndicator(blockId: string, toolName: string): Promise<void> {
     const startTime = Date.now();
+
+    if (this.consolidatedToolMsgId) {
+      // Reuse existing consolidated message
+      this.toolMessages.set(blockId, { msgId: this.consolidatedToolMsgId, toolName, startTime, resolved: false, isError: false, elapsed: null });
+      this.updateConsolidatedToolMessage();
+    } else {
+      // Create the first consolidated tool message
+      this.sendQueue = this.sendQueue.then(async () => {
+        try {
+          const html = this.buildConsolidatedToolHtml(blockId, toolName);
+          const msgId = await this.sender.sendMessage(this.chatId, html, 'HTML');
+          this.consolidatedToolMsgId = msgId;
+          this.toolMessages.set(blockId, { msgId, toolName, startTime, resolved: false, isError: false, elapsed: null });
+        } catch (err) {
+          this.logger?.debug?.({ err, toolName }, 'Failed to send tool indicator');
+        }
+      }).catch(err => {
+        this.logger?.error?.({ err }, 'sendToolIndicator queue error');
+      });
+      return this.sendQueue;
+    }
+  }
+
+  /** Build HTML for the consolidated tool indicator message. */
+  private buildConsolidatedToolHtml(pendingBlockId?: string, pendingToolName?: string): string {
+    const lines: string[] = [];
+    for (const [blockId, entry] of this.toolMessages) {
+      const summary = this.toolIndicatorLastSummary.get(blockId);
+      const codePart = summary ? ` · <code>${escapeHtml(summary)}</code>` : '';
+      if (entry.resolved) {
+        const statLine = this.toolResolvedStats.get(blockId);
+        const statPart = statLine ? ` · ${escapeHtml(statLine)}` : '';
+        const icon = entry.isError ? '❌' : '✅';
+        lines.push(`${icon} ${escapeHtml(entry.toolName)} (${entry.elapsed})${codePart}${statPart}`);
+      } else {
+        lines.push(`⚡ ${escapeHtml(entry.toolName)}…${codePart}`);
+      }
+    }
+    // Include pending tool that hasn't been added to toolMessages yet
+    if (pendingBlockId && pendingToolName && !this.toolMessages.has(pendingBlockId)) {
+      lines.push(`⚡ ${escapeHtml(pendingToolName)}…`);
+    }
+    return `<blockquote expandable>${lines.join('\n')}</blockquote>`;
+  }
+
+  /** Resolved tool result stats, keyed by blockId */
+  private toolResolvedStats = new Map<string, string>();
+
+  /** Edit the consolidated tool message with current state of all tools. */
+  private updateConsolidatedToolMessage(): void {
+    if (!this.consolidatedToolMsgId) return;
+    const msgId = this.consolidatedToolMsgId;
+    const html = this.buildConsolidatedToolHtml();
     this.sendQueue = this.sendQueue.then(async () => {
       try {
-        const html = formatSystemMessage('tool', `${escapeHtml(toolName)}…`, true);
-        const msgId = await this.sender.sendMessage(this.chatId, html, 'HTML');
-        this.toolMessages.set(blockId, { msgId, toolName, startTime });
+        await this.sender.editMessage(this.chatId, msgId, html, 'HTML');
       } catch (err) {
-        // Tool indicator is non-critical — log and continue
-        this.logger?.debug?.({ err, toolName }, 'Failed to send tool indicator');
+        if (err instanceof Error && err.message.includes('message is not modified')) return;
+        this.logger?.debug?.({ err }, 'Failed to update consolidated tool message');
       }
     }).catch(err => {
-      this.logger?.error?.({ err }, 'sendToolIndicator queue error');
+      this.logger?.error?.({ err }, 'updateConsolidatedToolMessage queue error');
     });
-    return this.sendQueue;
   }
 
   /** Update a tool indicator message with input preview once the JSON value is complete. */
@@ -344,129 +412,118 @@ export class StreamAccumulator {
     if (this.toolIndicatorLastSummary.get(blockId) === summary) return;
     this.toolIndicatorLastSummary.set(blockId, summary);
 
-    const codeLine = `\n<code>${escapeHtml(summary)}</code>`;
-    const html = formatSystemMessage('tool', `${escapeHtml(entry.toolName)}…${codeLine}`, true);
-
-    this.sendQueue = this.sendQueue.then(async () => {
-      try {
-        await this.sender.editMessage(this.chatId, entry.msgId, html, 'HTML');
-      } catch (err) {
-        // "message is not modified" or other edit failure — non-critical
-        this.logger?.debug?.({ err }, 'Failed to update tool indicator with input');
-      }
-    }).catch(err => {
-      this.logger?.error?.({ err }, 'updateToolIndicatorWithInput queue error');
-    });
-    return this.sendQueue;
+    // Update the consolidated tool message
+    this.updateConsolidatedToolMessage();
   }
 
   /** MCP media tools — on success, delete indicator (the media was sent directly). On failure, keep + react ❌. */
   private static MCP_MEDIA_TOOLS = new Set(['mcp__tgcc__send_image', 'mcp__tgcc__send_file', 'mcp__tgcc__send_voice']);
 
-  /** Resolve a tool indicator with success/failure status. Uses TG reaction instead of text icon. */
+  /** Resolve a tool indicator with success/failure status. Updates the consolidated message. */
   async resolveToolMessage(blockId: string, isError: boolean, errorMessage?: string, resultContent?: string, toolUseResult?: Record<string, unknown>): Promise<void> {
     const entry = this.toolMessages.get(blockId);
     if (!entry) return;
-    const { msgId, toolName, startTime } = entry;
+    const { toolName, startTime } = entry;
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
 
-    // MCP media tools: delete indicator on success (the media itself is the result)
+    // MCP media tools: remove from consolidated on success (the media itself is the result)
     if (StreamAccumulator.MCP_MEDIA_TOOLS.has(toolName) && !isError) {
       this.toolInputBuffers.delete(blockId);
       this.toolIndicatorLastSummary.delete(blockId);
+      this.toolResolvedStats.delete(blockId);
       this.toolMessages.delete(blockId);
+      // If that was the only tool, delete the consolidated message
+      if (this.toolMessages.size === 0 && this.consolidatedToolMsgId) {
+        const msgId = this.consolidatedToolMsgId;
+        this.consolidatedToolMsgId = null;
+        this.sendQueue = this.sendQueue.then(async () => {
+          try {
+            if (this.sender.deleteMessage) await this.sender.deleteMessage(this.chatId, msgId);
+          } catch (err) {
+            this.logger?.debug?.({ err, toolName }, 'Failed to delete consolidated tool message');
+          }
+        }).catch(err => {
+          this.logger?.error?.({ err }, 'resolveToolMessage queue error');
+        });
+      } else {
+        this.updateConsolidatedToolMessage();
+      }
+      return;
+    }
+
+    // Compute final input summary if we don't have one yet
+    const inputJson = this.toolInputBuffers.get(blockId) ?? '';
+    if (!this.toolIndicatorLastSummary.has(blockId)) {
+      const summary = extractToolInputSummary(toolName, inputJson);
+      if (summary) this.toolIndicatorLastSummary.set(blockId, summary);
+    }
+
+    // Store result stat for display
+    const resultStat = extractToolResultStat(toolName, resultContent, toolUseResult);
+    if (resultStat) this.toolResolvedStats.set(blockId, resultStat);
+
+    // Mark as resolved
+    entry.resolved = true;
+    entry.isError = isError;
+    entry.elapsed = elapsed + 's';
+
+    // Clean up input buffer
+    this.toolInputBuffers.delete(blockId);
+
+    // Update the consolidated message
+    this.updateConsolidatedToolMessage();
+  }
+
+  /** Edit a specific tool indicator message by block ID (updates the consolidated message). */
+  async editToolMessage(blockId: string, _html: string): Promise<void> {
+    if (!this.toolMessages.has(blockId)) return;
+    // With consolidation, just rebuild the consolidated message
+    this.updateConsolidatedToolMessage();
+  }
+
+  /** Delete a specific tool from the consolidated indicator. */
+  async deleteToolMessage(blockId: string): Promise<void> {
+    if (!this.toolMessages.has(blockId)) return;
+    this.toolMessages.delete(blockId);
+    this.toolInputBuffers.delete(blockId);
+    this.toolIndicatorLastSummary.delete(blockId);
+    this.toolResolvedStats.delete(blockId);
+
+    if (this.toolMessages.size === 0 && this.consolidatedToolMsgId) {
+      // Last tool removed — delete the consolidated message
+      const msgId = this.consolidatedToolMsgId;
+      this.consolidatedToolMsgId = null;
       this.sendQueue = this.sendQueue.then(async () => {
         try {
           if (this.sender.deleteMessage) await this.sender.deleteMessage(this.chatId, msgId);
         } catch (err) {
-          this.logger?.debug?.({ err, toolName }, 'Failed to delete MCP media tool indicator');
+          this.logger?.debug?.({ err }, 'Failed to delete consolidated tool message');
         }
       }).catch(err => {
-        this.logger?.error?.({ err }, 'resolveToolMessage queue error');
+        this.logger?.error?.({ err }, 'deleteToolMessage queue error');
       });
-      return this.sendQueue;
+    } else {
+      this.updateConsolidatedToolMessage();
     }
-
-    const inputJson = this.toolInputBuffers.get(blockId) ?? '';
-    const summary = extractToolInputSummary(toolName, inputJson);
-    const resultStat = extractToolResultStat(toolName, resultContent, toolUseResult);
-    const codeLine = summary ? `\n<code>${escapeHtml(summary)}</code>` : '';
-    const statLine = resultStat ? `\n${escapeHtml(resultStat)}` : '';
-
-    const html = formatSystemMessage('tool', `${escapeHtml(toolName)} (${elapsed}s)${codeLine}${statLine}`, true);
-
-    // Clean up input buffer
-    this.toolInputBuffers.delete(blockId);
-    this.toolIndicatorLastSummary.delete(blockId);
-
-    this.sendQueue = this.sendQueue.then(async () => {
-      try {
-        await this.sender.editMessage(this.chatId, msgId, html, 'HTML');
-        // Set reaction instead of text icon
-        if (this.sender.setReaction) {
-          const emoji = isError ? '👎' : '👍';
-          await this.sender.setReaction(this.chatId, msgId, emoji);
-        }
-      } catch (err) {
-        // Edit failure on resolve — non-critical
-        this.logger?.debug?.({ err, toolName }, 'Failed to resolve tool indicator');
-      }
-    }).catch(err => {
-      this.logger?.error?.({ err }, 'resolveToolMessage queue error');
-    });
-    return this.sendQueue;
   }
 
-  /** Edit a specific tool indicator message by block ID. */
-  async editToolMessage(blockId: string, html: string): Promise<void> {
-    const entry = this.toolMessages.get(blockId);
-    if (!entry) return;
-    this.sendQueue = this.sendQueue.then(async () => {
-      try {
-        await this.sender.editMessage(this.chatId, entry.msgId, html, 'HTML');
-      } catch (err) {
-        // Edit failure — non-critical
-        this.logger?.debug?.({ err }, 'Failed to edit tool message');
-      }
-    }).catch(err => {
-      this.logger?.error?.({ err }, 'editToolMessage queue error');
-    });
-    return this.sendQueue;
-  }
-
-  /** Delete a specific tool indicator message by block ID. */
-  async deleteToolMessage(blockId: string): Promise<void> {
-    const entry = this.toolMessages.get(blockId);
-    if (!entry) return;
-    this.toolMessages.delete(blockId);
-    this.sendQueue = this.sendQueue.then(async () => {
-      try {
-        if (this.sender.deleteMessage) {
-          await this.sender.deleteMessage(this.chatId, entry.msgId);
-        }
-      } catch (err) {
-        // Delete failure — non-critical
-        this.logger?.debug?.({ err }, 'Failed to delete tool message');
-      }
-    }).catch(err => {
-      this.logger?.error?.({ err }, 'deleteToolMessage queue error');
-    });
-    return this.sendQueue;
-  }
-
-  /** Delete all tool indicator messages. */
+  /** Delete the consolidated tool indicator message. */
   async deleteAllToolMessages(): Promise<void> {
-    const ids = [...this.toolMessages.values()];
     this.toolMessages.clear();
-    if (!this.sender.deleteMessage) return;
+    this.toolInputBuffers.clear();
+    this.toolIndicatorLastSummary.clear();
+    this.toolResolvedStats.clear();
+    if (!this.consolidatedToolMsgId || !this.sender.deleteMessage) {
+      this.consolidatedToolMsgId = null;
+      return;
+    }
+    const msgId = this.consolidatedToolMsgId;
+    this.consolidatedToolMsgId = null;
     this.sendQueue = this.sendQueue.then(async () => {
-      for (const { msgId } of ids) {
-        try {
-          await this.sender.deleteMessage!(this.chatId, msgId);
-        } catch (err) {
-          // Delete failure — non-critical
-          this.logger?.debug?.({ err }, 'Failed to delete tool message in batch');
-        }
+      try {
+        await this.sender.deleteMessage!(this.chatId, msgId);
+      } catch (err) {
+        this.logger?.debug?.({ err }, 'Failed to delete consolidated tool message');
       }
     }).catch(err => {
       this.logger?.error?.({ err }, 'deleteAllToolMessages queue error');
@@ -642,12 +699,18 @@ export class StreamAccumulator {
 
   /** Full reset: also clears tgMessageId (next send creates a new message).
    *  Chains on the existing sendQueue so any pending finalize() edits complete first.
-   *  toolMessages persists — they are independent fire-and-forget messages. */
+   *  Consolidated tool message resets so next turn starts a fresh batch. */
   reset(): void {
     const prevQueue = this.sendQueue;
     this.softReset();
     this.tgMessageId = null;
     this.messageIds = [];
+    // Reset tool consolidation for next turn
+    this.consolidatedToolMsgId = null;
+    this.toolMessages.clear();
+    this.toolInputBuffers.clear();
+    this.toolIndicatorLastSummary.clear();
+    this.toolResolvedStats.clear();
     this.sendQueue = prevQueue.catch(() => {});  // swallow errors from prev turn
   }
 }
@@ -1064,7 +1127,7 @@ export class SubAgentTracker {
       if (info.status !== 'dispatched' || !info.tgMessageId) continue;
       info.status = 'completed';
       const label = info.label || info.toolName;
-      const text = `🤖 ${escapeHtml(label)} — see main message`;
+      const text = `<blockquote>🤖 ${escapeHtml(label)} — see main message</blockquote>`;
       const agentMsgId = info.tgMessageId!;
       this.sendQueue = this.sendQueue.then(async () => {
         try {
@@ -1154,8 +1217,8 @@ export class SubAgentTracker {
     const maxResultLen = 3500;
     const resultText = result.length > maxResultLen ? result.slice(0, maxResultLen) + '…' : result;
 
-    // Plain text (no blockquote) — react with ✅ instead
-    const text = `🤖 ${escapeHtml(label)}\n<blockquote expandable>${escapeHtml(resultText)}</blockquote>`;
+    // Blockquote header + expandable result (not nested — TG doesn't support nested blockquotes)
+    const text = `<blockquote>🤖 ${escapeHtml(label)}</blockquote>\n<blockquote expandable>${escapeHtml(resultText)}</blockquote>`;
 
     const msgId = info.tgMessageId!;
     this.sendQueue = this.sendQueue.then(async () => {
@@ -1208,7 +1271,7 @@ export class SubAgentTracker {
         try {
           const msgId = await this.sender.sendMessage(
             this.chatId,
-            '🤖 Starting sub-agent…',
+            '<blockquote>🤖 Starting sub-agent…</blockquote>',
             'HTML',
           );
           info.tgMessageId = msgId;
@@ -1233,7 +1296,7 @@ export class SubAgentTracker {
         : 'Working…';
       lines.push(`🤖 ${escapeHtml(label)} — ${status}`);
     }
-    const text = lines.join('\n');
+    const text = `<blockquote>${lines.join('\n')}</blockquote>`;
     this.sendQueue = this.sendQueue.then(async () => {
       try {
         await this.sender.editMessage(this.chatId, msgId, text, 'HTML');
@@ -1497,7 +1560,7 @@ export class SubAgentTracker {
         lines.push(`🤖 ${escapeHtml(label)} — ${status}`);
       }
     }
-    const text = lines.join('\n');
+    const text = `<blockquote>${lines.join('\n')}</blockquote>`;
     this.sendQueue = this.sendQueue.then(async () => {
       try {
         await this.sender.editMessage(this.chatId, msgId, text, 'HTML');
@@ -1532,7 +1595,7 @@ export class SubAgentTracker {
 
 // ── Utility: split a completed text into TG-sized chunks ──
 
-export function splitText(text: string, maxLength: number = 4000): string[] {
+export function splitText(text: string, maxLength: number = 3500): string[] {
   if (text.length <= maxLength) return [text];
 
   const chunks: string[] = [];

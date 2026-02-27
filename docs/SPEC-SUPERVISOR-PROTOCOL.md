@@ -646,6 +646,18 @@ Pushed to the supervisor when it's subscribed to a process. No response expected
 | `task_completed` | ✨ NEW | `{agentId, sessionId, toolName, duration_ms}` | CC finished a tool use |
 | `agent_created` | ✨ NEW | `{agentId, type, repo}` | Ephemeral agent was created |
 | `agent_destroyed` | ✨ NEW | `{agentId}` | Ephemeral agent was torn down |
+| `bridge_started` | ✨ NEW | `{agents: string[], uptime: 0}` | TGCC bridge (re)started — supervisor should re-sync state |
+| `cc_spawned` | ✨ NEW | `{agentId, sessionId, source}` | CC process spawned (source: "telegram", "supervisor", "cli") |
+| `cc_message` | ✨ NEW | `{agentId, text, priority}` | CC used `notify_parent` MCP tool to message parent |
+| `state_changed` | ✨ NEW | `{agentId, field, oldValue, newValue, source}` | Agent repo/session/model changed (from TG command or supervisor) |
+| `build_result` | ✨ NEW | `{agentId, command, passed, errors, summary}` | Build/test command completed (from HighSignalDetector) |
+| `git_commit` | ✨ NEW | `{agentId, message}` | CC committed code (from HighSignalDetector) |
+| `context_pressure` | ✨ NEW | `{agentId, percent, tokens}` | Context window at 50%/75%/90% threshold |
+| `subagent_spawn` | ✨ NEW | `{agentId, count}` | CC spawned sub-agents via Task tool |
+| `failure_loop` | ✨ NEW | `{agentId, consecutiveFailures, lastTool, lastError}` | 3+ consecutive tool failures |
+| `stuck` | ✨ NEW | `{agentId, silentMs, lastActivity}` | No CC output for 5+ minutes |
+| `budget_alert` | ✨ NEW | `{agentId, costUsd, budgetUsd}` | Cost exceeded configured threshold |
+| `task_milestone` | ✨ NEW | `{agentId, task, status, progress}` | CC created/completed a todo item |
 
 ### Subscription Model
 

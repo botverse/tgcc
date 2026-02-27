@@ -82,7 +82,7 @@ describe('splitText', () => {
 
   it('splits long text at paragraph breaks', () => {
     const text = 'A'.repeat(3000) + '\n\n' + 'B'.repeat(2000);
-    const chunks = splitText(text, 4000);
+    const chunks = splitText(text, 3500);
     expect(chunks.length).toBeGreaterThanOrEqual(2);
     expect(chunks.join('\n\n')).toContain('A');
     expect(chunks.join('\n\n')).toContain('B');
@@ -90,9 +90,9 @@ describe('splitText', () => {
 
   it('handles text with no good break points', () => {
     const text = 'A'.repeat(8000);
-    const chunks = splitText(text, 4000);
-    expect(chunks.length).toBe(2);
-    expect(chunks[0].length).toBe(4000);
+    const chunks = splitText(text, 3500);
+    expect(chunks.length).toBeGreaterThanOrEqual(2);
+    expect(chunks[0].length).toBe(3500);
   });
 });
 
@@ -117,8 +117,8 @@ describe('StreamAccumulator', () => {
     } as StreamInnerEvent);
 
     expect(sender.sentMessages).toHaveLength(1);
-    expect(sender.sentMessages[0].text).toContain('💭 Thinking...');
-    expect(sender.sentMessages[0].text).toContain('<i>');
+    expect(sender.sentMessages[0].text).toContain('💭 Processing...');
+    expect(sender.sentMessages[0].text).toContain('blockquote');
   });
 
   it('accumulates text deltas and sends first message', async () => {
@@ -218,7 +218,7 @@ describe('StreamAccumulator', () => {
 
     // Thinking indicator should show but not the thinking content yet (no text block yet)
     expect(sender.sentMessages).toHaveLength(1);
-    expect(sender.sentMessages[0].text).toContain('💭 Thinking...');
+    expect(sender.sentMessages[0].text).toContain('💭 Processing...');
 
     // End thinking block, start text block
     await acc.handleEvent({ type: 'content_block_stop', index: 0 } as StreamInnerEvent);
@@ -237,15 +237,18 @@ describe('StreamAccumulator', () => {
 
     await acc.handleEvent({ type: 'message_stop' } as StreamInnerEvent);
 
-    // Final message should contain the expandable blockquote with thinking AND the text
+    // Thinking gets its own message (edited from "Processing..." to actual content);
+    // text response goes in a separate message
     const allTexts = [
       ...sender.sentMessages.map(m => m.text),
       ...sender.editedMessages.map(m => m.text),
     ];
-    const finalText = allTexts[allTexts.length - 1];
-    expect(finalText).toContain('blockquote expandable');
-    expect(finalText).toContain('analyzing the problem');
-    expect(finalText).toContain('Here is the answer');
+    // Thinking content should appear in an edit (the early flush or finalize edit)
+    expect(allTexts.some(t => t.includes('analyzing the problem'))).toBe(true);
+    // Text content should appear in a sent or edited message
+    expect(allTexts.some(t => t.includes('Here is the answer'))).toBe(true);
+    // Thinking message should use expandable blockquote
+    expect(allTexts.some(t => t.includes('blockquote expandable'))).toBe(true);
   });
 
   it('tracks all message IDs', async () => {

@@ -37,6 +37,7 @@ import {
 } from './ctl-server.js';
 import { ProcessRegistry, type ClientRef, type ProcessEntry } from './process-registry.js';
 import { EventBuffer } from './event-buffer.js';
+import { HighSignalDetector } from './high-signal.js';
 import { randomUUID } from 'node:crypto';
 
 // ── Types ──
@@ -179,6 +180,9 @@ export class Bridge extends EventEmitter implements CtlHandler {
   private sessionStore: SessionStore;
   private logger: pino.Logger;
 
+  // High-signal event detection
+  private highSignalDetector: HighSignalDetector;
+
   // Supervisor protocol
   private supervisorWrite: ((line: string) => void) | null = null;
   private supervisorAgentId: string | null = null;
@@ -196,6 +200,17 @@ export class Bridge extends EventEmitter implements CtlHandler {
       this.logger,
     );
     this.ctlServer = new CtlServer(this, this.logger);
+    this.highSignalDetector = new HighSignalDetector({
+      emitSupervisorEvent: (event) => {
+        if (this.isSupervisorSubscribed(event.agentId, this.agents.get(event.agentId)?.ccProcess?.sessionId ?? null)) {
+          this.sendToSupervisor(event);
+        }
+      },
+      pushEventBuffer: (agentId, line) => {
+        const agent = this.agents.get(agentId);
+        if (agent) agent.eventBuffer.push(line);
+      },
+    });
   }
 
   // ── Startup ──
@@ -208,6 +223,14 @@ export class Bridge extends EventEmitter implements CtlHandler {
     }
 
     this.logger.info({ agents: Object.keys(this.config.agents) }, 'Bridge started');
+
+    // Emit bridge_started event to supervisor
+    this.sendToSupervisor({
+      type: 'event',
+      event: 'bridge_started',
+      agents: Object.keys(this.config.agents),
+      uptime: 0,
+    });
   }
 
   private async startAgent(agentId: string, agentConfig: AgentConfig): Promise<void> {
@@ -377,7 +400,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
     // Ensure batcher exists (one per agent, not per user)
     if (!agent.batcher) {
       agent.batcher = new MessageBatcher(2000, (combined) => {
-        this.sendToCC(agentId, combined, { chatId: msg.chatId });
+        this.sendToCC(agentId, combined, { chatId: msg.chatId, spawnSource: 'telegram' });
       });
     }
 
@@ -399,7 +422,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
   private sendToCC(
     agentId: string,
     data: { text: string; imageBase64?: string; imageMediaType?: string; filePath?: string; fileName?: string },
-    source?: { chatId?: number }
+    source?: { chatId?: number; spawnSource?: 'telegram' | 'supervisor' | 'cli' }
   ): void {
     const agent = this.agents.get(agentId);
     if (!agent) return;
@@ -437,12 +460,26 @@ export class Bridge extends EventEmitter implements CtlHandler {
             chatId,
             formatSystemMessage('status', 'No project selected. Use /repo to pick one, or CC will run in your home directory.'),
             'HTML',
+            true, // silent
           ).catch(err => this.logger.error({ err }, 'Failed to send no-repo warning'));
         }
       }
 
       proc = this.spawnCCProcess(agentId);
       agent.ccProcess = proc;
+
+      // Emit cc_spawned event to supervisor
+      const spawnSource = source?.spawnSource ?? 'telegram';
+      this.logger.info({ agentId, sessionId: proc.sessionId, source: spawnSource }, 'CC process spawned');
+      if (this.isSupervisorSubscribed(agentId, proc.sessionId)) {
+        this.sendToSupervisor({
+          type: 'event',
+          event: 'cc_spawned',
+          agentId,
+          sessionId: proc.sessionId,
+          source: spawnSource,
+        });
+      }
     }
 
     // Show typing indicator
@@ -591,6 +628,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
     });
 
     proc.on('stream_event', (event: StreamInnerEvent) => {
+      this.highSignalDetector.handleStreamEvent(agentId, event);
       this.handleStreamEvent(agentId, event);
     });
 
@@ -601,6 +639,9 @@ export class Bridge extends EventEmitter implements CtlHandler {
       const toolContent = typeof event.content === 'string' ? event.content : JSON.stringify(event.content);
       const toolSummary = toolContent.length > 200 ? toolContent.slice(0, 200) + '…' : toolContent;
       agent.eventBuffer.push({ ts: Date.now(), type: 'tool', text: `${isToolErr ? '❌' : '✅'} ${toolName}: ${toolSummary}` });
+
+      // High-signal detection
+      this.highSignalDetector.handleToolResult(agentId, event.tool_use_id, toolContent, isToolErr, toolName !== 'unknown' ? toolName : undefined);
 
       // Resolve tool indicator message with success/failure status
       const acc = agent.accumulator;
@@ -705,6 +746,9 @@ export class Bridge extends EventEmitter implements CtlHandler {
             agent.eventBuffer.push({ ts: Date.now(), type: 'thinking', text: truncated });
           } else if (block.type === 'text' && block.text) {
             agent.eventBuffer.push({ ts: Date.now(), type: 'text', text: block.text });
+          } else if (block.type === 'tool_use') {
+            const toolBlock = block as { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> };
+            this.highSignalDetector.handleAssistantToolUse(agentId, toolBlock.name, toolBlock.id, toolBlock.input);
           }
         }
       }
@@ -794,7 +838,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
       const errChatId = this.getAgentChatId(agent);
       if (errChatId && agent.tgBot) {
-        agent.tgBot.sendText(errChatId, text, 'HTML')
+        agent.tgBot.sendText(errChatId, text, 'HTML', true) // silent
           .catch(err => this.logger.error({ err }, 'Failed to send API error notification'));
       }
     });
@@ -803,7 +847,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
       this.stopTypingIndicator(agent);
       const hangChatId = this.getAgentChatId(agent);
       if (hangChatId && agent.tgBot) {
-        agent.tgBot.sendText(hangChatId, '<blockquote>⏸ Session paused. Send a message to continue.</blockquote>', 'HTML')
+        agent.tgBot.sendText(hangChatId, '<blockquote>⏸ Session paused. Send a message to continue.</blockquote>', 'HTML', true) // silent
           .catch(err => this.logger.error({ err }, 'Failed to send hang notification'));
       }
     });
@@ -811,6 +855,13 @@ export class Bridge extends EventEmitter implements CtlHandler {
     proc.on('takeover', () => {
       this.logger.warn({ agentId }, 'Session takeover detected — keeping session for roaming');
       agent.eventBuffer.push({ ts: Date.now(), type: 'system', text: 'Session takeover detected' });
+
+      // Send TG system message for takeover
+      const takeoverChatId = this.getAgentChatId(agent);
+      if (takeoverChatId && agent.tgBot) {
+        agent.tgBot.sendText(takeoverChatId, '<blockquote>⚠️ Session taken over by another client</blockquote>', 'HTML', true)
+          .catch(err => this.logger.error({ err, agentId }, 'Failed to send takeover notification'));
+      }
 
       // Notify supervisor and suppress subsequent exit event
       if (this.isSupervisorSubscribed(agentId, proc.sessionId)) {
@@ -829,6 +880,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
     proc.on('exit', () => {
       agent.eventBuffer.push({ ts: Date.now(), type: 'system', text: 'Process exited' });
+      this.highSignalDetector.cleanup(agentId);
 
       // Forward to supervisor (unless suppressed by takeover)
       if (this.suppressExitForProcess.has(proc.sessionId ?? '')) {
@@ -860,7 +912,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
       this.stopTypingIndicator(agent);
       const errChatId = this.getAgentChatId(agent);
       if (errChatId && agent.tgBot) {
-        agent.tgBot.sendText(errChatId, formatSystemMessage('error', escapeHtml(String(err.message))), 'HTML')
+        agent.tgBot.sendText(errChatId, formatSystemMessage('error', escapeHtml(String(err.message))), 'HTML', true) // silent
           .catch(err2 => this.logger.error({ err: err2 }, 'Failed to send process error notification'));
       }
     });
@@ -894,7 +946,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
       };
       const onError = (err: unknown, context: string) => {
         this.logger.error({ err, context, agentId }, 'Stream accumulator error');
-        tgBot.sendText(chatId, formatSystemMessage('error', escapeHtml(context)), 'HTML').catch(() => {});
+        tgBot.sendText(chatId, formatSystemMessage('error', escapeHtml(context)), 'HTML', true).catch(() => {}); // silent
       };
       agent.accumulator = new StreamAccumulator({ chatId, sender, logger: this.logger, onError });
     }
@@ -903,7 +955,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
       const tgBot = agent.tgBot; // capture for closures (non-null here)
       const subAgentSender: SubAgentSender = {
         sendMessage: (cid, text, parseMode) =>
-          tgBot.sendText(cid, text, parseMode),
+          tgBot.sendText(cid, text, parseMode, true), // silent
         editMessage: (cid, msgId, text, parseMode) =>
           tgBot.editText(cid, msgId, text, parseMode),
         setReaction: (cid, msgId, emoji) =>
@@ -953,7 +1005,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
     // Handle errors (only send to TG if bot available)
     if (event.is_error && event.result && chatId && agent.tgBot) {
-      agent.tgBot!.sendText(chatId, formatSystemMessage('error', escapeHtml(String(event.result))), 'HTML')
+      agent.tgBot!.sendText(chatId, formatSystemMessage('error', escapeHtml(String(event.result))), 'HTML', true) // silent
         .catch(err => this.logger.error({ err }, 'Failed to send result error notification'));
     }
 
@@ -1185,10 +1237,13 @@ export class Bridge extends EventEmitter implements CtlHandler {
           break;
         }
         const newModel = cmd.args.trim();
+        const oldModel = agent.model;
         agent.model = newModel;
         this.sessionStore.setModel(agentId, newModel);
         this.killAgentProcess(agentId);
         await agent.tgBot.sendText(cmd.chatId, `<blockquote>Model set to <code>${escapeHtml(newModel)}</code>. Process respawned.</blockquote>`, 'HTML');
+        // Emit state_changed event
+        this.emitStateChanged(agentId, 'model', oldModel, newModel, 'telegram');
         break;
       }
 
@@ -1342,11 +1397,14 @@ export class Bridge extends EventEmitter implements CtlHandler {
           break;
         }
         // Kill current process (different CWD needs new process)
+        const oldRepo = agent.repo;
         this.killAgentProcess(agentId);
         agent.repo = repoPath;
         agent.pendingSessionId = null; // clear session when repo changes
         this.sessionStore.setRepo(agentId, repoPath);
         await agent.tgBot.sendText(cmd.chatId, `<blockquote>Repo set to <code>${escapeHtml(shortenRepoPath(repoPath))}</code>. Session cleared.</blockquote>`, 'HTML');
+        // Emit state_changed event
+        this.emitStateChanged(agentId, 'repo', oldRepo, repoPath, 'telegram');
         break;
       }
 
@@ -1453,12 +1511,15 @@ export class Bridge extends EventEmitter implements CtlHandler {
           await agent.tgBot.answerCallbackQuery(query.callbackQueryId, 'Path not found');
           break;
         }
+        const oldRepoCb = agent.repo;
         this.killAgentProcess(agentId);
         agent.repo = repoPath;
         agent.pendingSessionId = null;
         this.sessionStore.setRepo(agentId, repoPath);
         await agent.tgBot.answerCallbackQuery(query.callbackQueryId, `Repo: ${repoName}`);
         await agent.tgBot.sendText(query.chatId, `<blockquote>Repo set to <code>${escapeHtml(shortenRepoPath(repoPath))}</code>. Session cleared.</blockquote>`, 'HTML');
+        // Emit state_changed event
+        this.emitStateChanged(agentId, 'repo', oldRepoCb, repoPath, 'telegram');
         break;
       }
 
@@ -1475,11 +1536,14 @@ export class Bridge extends EventEmitter implements CtlHandler {
           await agent.tgBot.sendText(query.chatId, 'Send: <code>/model &lt;model-name&gt;</code>', 'HTML');
           break;
         }
+        const oldModelCb = agent.model;
         agent.model = model;
         this.sessionStore.setModel(agentId, model);
         this.killAgentProcess(agentId);
         await agent.tgBot.answerCallbackQuery(query.callbackQueryId, `Model: ${model}`);
         await agent.tgBot.sendText(query.chatId, `<blockquote>Model set to <code>${escapeHtml(model)}</code>. Process respawned.</blockquote>`, 'HTML');
+        // Emit state_changed event
+        this.emitStateChanged(agentId, 'model', oldModelCb, model, 'telegram');
         break;
       }
 
@@ -1583,7 +1647,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
     }
 
     // Route through the same sendToCC path as Telegram
-    this.sendToCC(agentId, { text });
+    this.sendToCC(agentId, { text }, { spawnSource: 'cli' });
 
     return {
       type: 'ack',
@@ -1876,12 +1940,12 @@ export class Bridge extends EventEmitter implements CtlHandler {
         const tgChatId = this.getAgentChatId(agent);
         if (tgChatId && agent.tgBot) {
           const preview = text.length > 500 ? text.slice(0, 500) + '…' : text;
-          agent.tgBot.sendText(tgChatId, `<blockquote>🦞 <b>OpenClaw:</b> ${escapeHtml(preview)}</blockquote>`, 'HTML', true)
+          agent.tgBot.sendText(tgChatId, `<blockquote>🦞 <b>OpenClaw:</b> ${escapeHtml(preview)}</blockquote>`, 'HTML', true) // silent
             .catch(err => this.logger.error({ err, agentId }, 'Failed to send supervisor TG notification'));
         }
 
         // Send to agent's single CC process
-        this.sendToCC(agentId, { text });
+        this.sendToCC(agentId, { text }, { spawnSource: 'supervisor' });
 
         return {
           sessionId: agent.ccProcess?.sessionId ?? null,
@@ -1992,6 +2056,25 @@ export class Bridge extends EventEmitter implements CtlHandler {
     }
   }
 
+  private emitStateChanged(agentId: string, field: string, oldValue: string, newValue: string, source: string): void {
+    this.logger.info({ agentId, field, oldValue, newValue, source }, 'Agent state changed');
+    const agent = this.agents.get(agentId);
+    if (agent) {
+      agent.eventBuffer.push({ ts: Date.now(), type: 'system', text: `State changed: ${field} → ${newValue}` });
+    }
+    if (this.isSupervisorSubscribed(agentId, agent?.ccProcess?.sessionId ?? null)) {
+      this.sendToSupervisor({
+        type: 'event',
+        event: 'state_changed',
+        agentId,
+        field,
+        oldValue,
+        newValue,
+        source,
+      });
+    }
+  }
+
   private sendToSupervisor(msg: Record<string, unknown>): void {
     if (this.supervisorWrite) {
       try { this.supervisorWrite(JSON.stringify(msg) + '\n'); } catch {}
@@ -2029,6 +2112,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
     }
 
     this.processRegistry.clear();
+    this.highSignalDetector.destroy();
     this.mcpServer.closeAll();
     this.ctlServer.closeAll();
     this.removeAllListeners();

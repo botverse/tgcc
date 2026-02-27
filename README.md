@@ -58,11 +58,43 @@ External systems connect to TGCC's control socket (`/tmp/tgcc/ctl/tgcc.sock`) an
 - **`status`** — list all agents, their state, and active processes
 - **`kill_cc`** — terminate an agent's CC process
 
-Events forwarded to subscribers: `result`, `session_takeover`, `process_exit`.
+Events forwarded to subscribers: `result`, `session_takeover`, `process_exit`, `cc_spawned`, `state_changed`, `bridge_started`, plus all observability events.
 
 When a supervisor sends a message to a persistent agent, a system notification (`🦞 OpenClaw: ...`) appears in the Telegram chat.
 
+### Ephemeral Agents
+
+Supervisors can create temporary agents for one-off tasks — no Telegram bot needed:
+
+- **`create_agent`** — create an in-memory agent with a repo and model
+- **`destroy_agent`** — tear down when the task is done
+
+Ephemeral agents auto-destroy on timeout. Only the supervisor can interact with them.
+
+### Observability
+
+TGCC detects high-signal events from CC processes and forwards them to subscribers:
+
+- **Build/test results** — pass/fail with error counts
+- **Git commits** — commit messages as natural progress summaries
+- **Context pressure** — alerts at 50%, 75%, 90% of context window
+- **Failure loops** — 3+ consecutive tool failures
+- **Stuck detection** — no CC output for 5+ minutes
+- **Task milestones** — TodoWrite progress tracking
+- **Sub-agent spawns** — CC using Task tool for parallel work
+
+Each agent's events are stored in a ring buffer, queryable via `get_log` with offset/limit/grep/since/type filters.
+
+### MCP Tools for CC → Supervisor
+
+CC processes can communicate back to the orchestrator via built-in MCP tools:
+
+- **`notify_parent`** — send a message to the parent (questions, blockers, progress)
+- **`supervisor_exec`** — request command execution on the host
+- **`supervisor_notify`** — send a notification to any agent
+
 See [`docs/SPEC-SUPERVISOR-PROTOCOL.md`](docs/SPEC-SUPERVISOR-PROTOCOL.md) for the full protocol spec.
+See [`docs/SPEC-SUBAGENT-OBSERVABILITY.md`](docs/SPEC-SUBAGENT-OBSERVABILITY.md) for the observability spec.
 
 ## Service Management
 
