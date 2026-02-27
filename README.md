@@ -20,11 +20,49 @@ TGCC bridges the [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-cod
 
 - **Streaming** — responses stream into a single message that updates in place
 - **Sessions** — resume, switch, and list sessions. Roam between Telegram and the CC CLI on the same session
-- **Multi-project** — switch repos on the fly with `/repo`, or run dedicated bots per project
+- **Multi-agent** — run dedicated bots per project, each with its own repo and model
 - **Permission relay** — CC permission prompts appear as inline buttons
 - **MCP tools** — CC can send files, images, and voice back via built-in MCP server
 - **Markdown → Telegram HTML** — code blocks, bold, italic, links, tables, all rendered properly
 - **Usage stats** — per-turn token counts and cost
+- **Supervisor protocol** — external orchestrators (e.g. OpenClaw) can send messages, subscribe to events, and share the same CC process via Unix socket
+
+## Architecture
+
+```
+Telegram ──► TGCC Bridge ──► Claude Code CLI (stream-json)
+                 │
+CLI (ctl) ───────┤
+                 │
+Supervisor ──────┘ (Unix socket, NDJSON)
+```
+
+### Agent Model
+
+Each agent has:
+- **One repo** — the project directory CC runs in
+- **One CC process** (at most) — shared by all message sources (Telegram, supervisor, CLI)
+- **One model** — the Claude model to use
+
+Agents don't know about users. `allowedUsers` is a system-level ACL that gates which Telegram users can interact with the bot. All allowed users share the same agent state.
+
+`sessionId` lives on the CC process, not the agent. When a process spawns, it either continues the last session (`--continue`) or resumes a specific one (`--resume <id>`).
+
+### Supervisor Protocol
+
+External systems connect to TGCC's control socket (`/tmp/tgcc/ctl/tgcc.sock`) and register as a supervisor. They can then:
+
+- **`send_message`** — send a message to any agent's CC process (spawns if needed)
+- **`send_to_cc`** — write directly to an active CC process's stdin
+- **`subscribe`** / **`unsubscribe`** — observe an agent's events
+- **`status`** — list all agents, their state, and active processes
+- **`kill_cc`** — terminate an agent's CC process
+
+Events forwarded to subscribers: `result`, `session_takeover`, `process_exit`.
+
+When a supervisor sends a message to a persistent agent, a system notification (`🦞 OpenClaw: ...`) appears in the Telegram chat.
+
+See [`docs/SPEC-SUPERVISOR-PROTOCOL.md`](docs/SPEC-SUPERVISOR-PROTOCOL.md) for the full protocol spec.
 
 ## Service Management
 
@@ -61,7 +99,7 @@ tgcc repo list
 
 # Messaging (while service is running)
 tgcc message "fix the login bug"
-tgcc message "deploy" --agent=mybot --session=abc123
+tgcc message "deploy" --agent=mybot
 tgcc status
 tgcc status --agent=mybot
 
@@ -82,40 +120,6 @@ tgcc permissions set mybot dangerously-skip
 | `/permissions` | Set permission mode |
 | `/status` | Process state, model, repo, cost |
 | `/cancel` | Abort current CC turn |
-| `/catchup` | Summarize external CC activity |
-
-## Project Setup
-
-TGCC supports two approaches — use one or both:
-
-### Single bot, multiple repos (recommended)
-
-One bot switches between projects on the fly:
-
-```bash
-tgcc repo add ~/code/frontend --name=frontend
-tgcc repo add ~/code/backend --name=backend
-tgcc repo assign --agent=mybot --name=frontend   # set default
-```
-
-In Telegram, use `/repo` to switch. If no repo is selected, TGCC warns that CC will run in `~`.
-
-### Dedicated bot per project
-
-Create a separate Telegram bot (via [@BotFather](https://t.me/BotFather)) for each project:
-
-```bash
-tgcc agent add frontend-bot --bot-token <token1>
-tgcc agent add backend-bot --bot-token <token2>
-
-tgcc repo add ~/code/frontend --name=frontend
-tgcc repo add ~/code/backend --name=backend
-
-tgcc repo assign --agent=frontend-bot --name=frontend
-tgcc repo assign --agent=backend-bot --name=backend
-```
-
-Each bot starts CC in its assigned repo by default. Users can still `/repo` switch if needed.
 
 ## Configuration
 
@@ -133,9 +137,10 @@ Config lives at `~/.tgcc/config.json` (created by `tgcc init`).
   "agents": {
     "mybot": {
       "botToken": "123456:ABC-DEF...",
-      "allowedUsers": [],
+      "allowedUsers": ["your-telegram-id"],
       "defaults": {
         "repo": "myproject",
+        "model": "claude-sonnet-4-20250514",
         "permissionMode": "bypassPermissions"
       }
     }
@@ -151,19 +156,6 @@ Config lives at `~/.tgcc/config.json` (created by `tgcc init`).
 | `acceptEdits` | Auto-accept edits, prompt for commands |
 | `default` | Full permission flow via inline buttons |
 | `plan` | Plan-only, no tool execution |
-
-## Architecture
-
-```
-User ──► Telegram ──► TGCC ──► Claude Code CLI (stream-json)
-                        │
-                  config.json ─── agents, repos, permissions
-                  state.json ─── sessions, per-user overrides
-```
-
-TGCC runs as a persistent service. When a user sends a message, it spawns (or resumes) a Claude Code process using the `stream-json` protocol, streams the response back with edit-in-place updates.
-
-Sessions are fully interoperable with the VS Code Claude Code extension — same `~/.claude/projects/` JSONL files.
 
 ## License
 
