@@ -1672,7 +1672,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
         // For persistent agents: send TG system message BEFORE spawning CC
         const tgChatId = this.getAgentChatId(agent);
         if (tgChatId) {
-          agent.tgBot.sendText(tgChatId, formatSystemMessage('status', `🦞 OpenClaw: ${escapeHtml(text)}`), 'HTML')
+          agent.tgBot.sendText(tgChatId, `<blockquote>🦞 <b>OpenClaw:</b> ${escapeHtml(text)}</blockquote>`, 'HTML')
             .catch(err => this.logger.error({ err }, 'Failed to send supervisor TG notification'));
         }
 
