@@ -55,6 +55,37 @@ export function escapeHtml(text: string): string {
     .replace(/>/g, '&gt;');
 }
 
+/** Create visually distinct system message with enhanced styling */
+export function formatSystemMessage(type: 'thinking' | 'tool' | 'usage' | 'error' | 'status', content: string, expandable = false): string {
+  const styles = {
+    thinking: {
+      prefix: '<b><i>💭 THINKING</i></b>',
+      wrapper: expandable ? 'blockquote expandable' : 'blockquote'
+    },
+    tool: {
+      prefix: '<b><u>⚡ TOOL STATUS</u></b>',
+      wrapper: 'blockquote expandable'
+    },
+    usage: {
+      prefix: '<b>📊 USAGE</b>',
+      wrapper: 'blockquote'
+    },
+    error: {
+      prefix: '<b><s>⚠️ SYSTEM ERROR</s></b>',
+      wrapper: 'blockquote'
+    },
+    status: {
+      prefix: '<b>ℹ️ SYSTEM</b>',
+      wrapper: 'blockquote'
+    }
+  };
+
+  const style = styles[type];
+  const separator = '<code>─────────────────</code>';
+
+  return `${style.prefix}\n${separator}\n<${style.wrapper}><i>${content}</i></${style.wrapper.split(' ')[0]}>`;
+}
+
 /**
  * Convert markdown text to Telegram-safe HTML using the marked library.
  * Replaces the old hand-rolled implementation with a proper markdown parser.
@@ -182,7 +213,7 @@ export class StreamAccumulator {
     if (blockType === 'thinking') {
       this.currentBlockType = 'thinking';
       if (!this.thinkingIndicatorShown && !this.buffer) {
-        await this.sendOrEdit('<blockquote>💭 Thinking...</blockquote>', true);
+        await this.sendOrEdit(formatSystemMessage('thinking', 'Processing...'), true);
         this.thinkingIndicatorShown = true;
       }
     } else if (blockType === 'text') {

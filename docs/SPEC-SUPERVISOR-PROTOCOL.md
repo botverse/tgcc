@@ -75,9 +75,20 @@ graph TB
 
 A Claude Code process is bound to one session at spawn time (`--resume <id>` or `--continue`). You cannot switch sessions within a running process. To work on a different session, you need a different process.
 
-### 2.2 ProcessRegistry — Shared Access
+### 2.2 Agent State Model
 
-TGCC's `ProcessRegistry` keys processes by `repo:sessionId`. Multiple clients can subscribe to the same process:
+Each agent has exactly **one state**: a repo and (optionally) a running CC process. Agents don't know about users — `allowedUsers` is a system-level ACL that gates who can talk to the TG bot, not an agent concept.
+
+```
+Agent "sentinella":
+  repo: /home/fonz/Botverse/sentinella   # agent-level, required
+  model: claude-sonnet-4-20250514              # agent-level default
+  ccProcess: <CCProcess | null>
+    └─ sessionId: abc-123                 # lives on the process
+    └─ spawned with: --continue or --resume <id>
+```
+
+Multiple message sources can interact with the same agent:
 
 ```mermaid
 graph LR
@@ -85,22 +96,22 @@ graph LR
     classDef tgNew fill:#E74C3C,stroke:#C0392B,color:#fff
     classDef ocNew fill:#27AE60,stroke:#1E8449,color:#fff
 
-    subgraph "ProcessEntry (sentinella:sess-001)"
+    subgraph "Agent: sentinella"
         CC["CC Process<br/>stdin / stdout"]:::tgExist
-        Sub1["Subscriber: sentinella:Fnz<br/>(Telegram)"]:::tgExist
-        Sub2["Subscriber: supervisor:openclaw<br/>(OpenClaw) 🔴🟢"]:::tgNew
-        Sub3["Ctl Subscriber: ctl-12345<br/>(CLI attach)"]:::tgExist
+        TG["Telegram<br/>(Fnz via bot)"]:::tgExist
+        SUP["Supervisor<br/>(OpenClaw) 🟢"]:::ocNew
+        CTL["CLI attach"]:::tgExist
     end
 
-    CC -->|"result, stream, events"| Sub1
-    CC -->|"result, stream, events"| Sub2
-    CC -->|"result, stream, events"| Sub3
-    Sub1 -->|"stdin"| CC
-    Sub2 -->|"stdin"| CC
-    Sub3 -->|"stdin"| CC
+    TG -->|"stdin"| CC
+    SUP -->|"stdin"| CC
+    CTL -->|"stdin"| CC
+    CC -->|"result, stream, events"| TG
+    CC -->|"result, stream, events"| SUP
+    CC -->|"result, stream, events"| CTL
 ```
 
-All subscribers receive all output. Any subscriber can write to stdin. This is how OpenClaw steers an existing sentinella session while Fnz also uses it via Telegram — both see the same conversation.
+All sources share the same process. When the supervisor sends a message, TG sees a system notification (`🦞 OpenClaw: ...`). When TG sends a message and the supervisor is subscribed, it receives the message event. **No CC spawn without a repo** — hard requirement.
 
 ### 2.3 Two Agent Types
 
@@ -109,7 +120,7 @@ All subscribers receive all output. Any subscriber can write to stdin. This is h
 | **Created by** | Config file (`~/.tgcc/config.json`) | Supervisor `create_agent` command |
 | **Telegram bot** | Yes | No |
 | **Lifetime** | Until TGCC restarts or config changes | Until task completes, killed, or timeout |
-| **Users** | Telegram users (allowedUsers) + supervisor | Supervisor only |
+| **Message sources** | Telegram + supervisor + CLI | Supervisor only |
 | **Example** | sentinella, kyobot, saemem | oc-spawn-a7f |
 | **In config** | Always | Never persisted |
 
@@ -268,11 +279,10 @@ sequenceDiagram
   "action": "create_agent",
   "params": {
     "agentId": "oc-spawn-a7f3",     // optional: OC picks ID, or TGCC generates
-    "repo": "/home/fonz/Botverse/KYO",
-    "model": "opus",                 // optional
+    "repo": "/home/fonz/Botverse/KYO",     // required — no CC spawn without a repo
+    "model": "opus",                        // optional
     "permissionMode": "bypassPermissions",
-    "sessionId": "existing-sess-id", // optional: resume specific session
-    "timeoutMs": 300000              // optional: auto-kill after 5 min
+    "timeoutMs": 300000                     // optional: auto-kill after 5 min
   }
 }
 
@@ -287,7 +297,7 @@ sequenceDiagram
 }
 ```
 
-**Implementation:** TGCC creates an `AgentInstance` in memory (no TG bot, no config write). The agent's `allowedUsers` is empty — only the supervisor can interact with it.
+**Implementation:** TGCC creates an `AgentInstance` in memory (no TG bot, no config write). Ephemeral agents have no TG bot — only the supervisor can send messages.
 
 ### 5.2 `destroy_agent` ✨ NEW
 
@@ -306,7 +316,9 @@ Only works on ephemeral agents. Persistent agents (with TG bots) cannot be destr
 
 ### 5.3 `send_message` ✨ NEW
 
-Send a message to any agent (persistent or ephemeral). If no CC process is active, spawns one.
+Send a message to any agent (persistent or ephemeral). If no CC process is active, spawns one using the agent's repo (`--continue` by default, or `--resume <id>` if specified). The message goes to the agent's single shared process — all subscribers (TG, supervisor, CLI) see the output.
+
+For persistent agents with a TG bot, a system message (`🦞 OpenClaw: <text>`) is sent to the TG chat so the user knows the supervisor injected something.
 
 ```jsonc
 // Request
@@ -317,7 +329,7 @@ Send a message to any agent (persistent or ephemeral). If no CC process is activ
   "params": {
     "agentId": "sentinella",         // any agent ID
     "text": "Check tile coverage",
-    "sessionId": "sess-001",         // optional: resume specific session
+    "sessionId": "sess-001",         // optional: --resume this session instead of --continue
     "subscribe": true                // optional, default true: get result events back
   }
 }
@@ -327,16 +339,16 @@ Send a message to any agent (persistent or ephemeral). If no CC process is activ
   "type": "response",
   "requestId": "def-456",
   "result": {
-    "sessionId": "sess-001",
+    "sessionId": "sess-001",        // from the process (may differ if --continue picked a different one)
     "state": "active",
     "subscribed": true
   }
 }
 ```
 
-**What `subscribe: true` does:** Registers the supervisor as a virtual subscriber on this process entry. All `result`, `stream_event`, `assistant`, `compact`, `api_error`, `process_exit` events for this session get forwarded to the supervisor. This is how OpenClaw "sees" what CC says.
+**What `subscribe: true` does:** Registers the supervisor as a subscriber on this agent's process. All `result`, `stream_event`, `assistant`, `compact`, `api_error`, `process_exit` events get forwarded to the supervisor.
 
-**Implementation:** Reuse `handleCtlMessage()` logic, plus add supervisor to the ProcessEntry's subscriber list.
+**Implementation:** Use the agent's single `ccProcess` — if active, write to stdin; if idle/null, spawn via agent's repo. No userId involved.
 
 ### 5.4 `send_to_cc` ✨ NEW
 
@@ -370,7 +382,7 @@ Send a follow-up to an already-running CC process (steer). Does NOT spawn a new 
 
 ### 5.5 `subscribe` ✨ NEW
 
-Subscribe to an agent's CC process events without sending a message.
+Subscribe to an agent's events without sending a message. Subscribes to whatever process the agent currently has (or will have next).
 
 ```jsonc
 {
@@ -378,8 +390,7 @@ Subscribe to an agent's CC process events without sending a message.
   "requestId": "...",
   "action": "subscribe",
   "params": {
-    "agentId": "sentinella",
-    "sessionId": "sess-001"    // optional: specific session, or current
+    "agentId": "sentinella"
   }
 }
 ```
@@ -420,31 +431,34 @@ Query agent and session status.
     "agents": [
       {
         "id": "kyobot",
-        "type": "persistent",            // ✨ NEW: persistent | ephemeral
-        "state": "idle",
-        "sessionId": null,
+        "type": "persistent",            // persistent | ephemeral
+        "state": "idle",                 // idle (no process) | active (process running)
         "repo": "/home/fonz/Botverse/KYO",
-        "supervisorSubscribed": false     // ✨ NEW
+        "process": null,                 // no active CC process
+        "supervisorSubscribed": false
       },
       {
         "id": "sentinella",
         "type": "persistent",
         "state": "active",
-        "sessionId": "sess-001",
         "repo": "/home/fonz/Botverse/sentinella",
+        "process": {                     // active CC process
+          "sessionId": "sess-001",
+          "model": "claude-sonnet-4-20250514"
+        },
         "supervisorSubscribed": true
       },
       {
         "id": "oc-spawn-a7f3",
         "type": "ephemeral",
         "state": "active",
-        "sessionId": "sess-003",
         "repo": "/home/fonz/Botverse/KYO",
+        "process": {
+          "sessionId": "sess-003",
+          "model": "opus"
+        },
         "supervisorSubscribed": true
       }
-    ],
-    "sessions": [
-      {"id": "sess-001", "agentId": "sentinella", "messageCount": 12, "totalCostUsd": 0.45}
     ]
   }
 }
@@ -973,47 +987,28 @@ OpenClaw is a **client** that connects to TGCC. TGCC never connects to OpenClaw 
 
 #### What TGCC must build (🔴)
 
-**Phase 1 — New supervisor commands (server-side handlers in `bridge.ts`):**
+**Phase 1 — Agent-level state refactor + supervisor commands:**
 
-| Command | What TGCC does | Implementation hint |
-|---------|---------------|---------------------|
-| `send_message` | Route message to agent → spawn or resume CC. Auto-subscribe supervisor to process events. | Reuse `handleCtlMessage()` logic, add supervisor to `ProcessEntry.subscribers` or a parallel `supervisorSubscriptions` set |
-| `send_to_cc` | Write text to an active CC process's stdin. Error if no active process. | Find process via `agent.processes`, call `proc.sendMessage()` |
-| `subscribe` | Register supervisor as listener on a process without sending a message | Add to subscriber/event routing list |
-| `unsubscribe` | Remove supervisor from a process's listener list | Remove from routing list |
+The prerequisite for all supervisor commands is the agent-level state refactor (see section 13). Once agents have a single `ccProcess` instead of per-user processes, the supervisor commands become straightforward:
+
+| Command | What TGCC does | Implementation |
+|---------|---------------|----------------|
+| `send_message` | Send to agent's `ccProcess` (spawn if needed via agent's repo). Auto-subscribe supervisor. For persistent agents, emit TG system message (`🦞 OpenClaw: ...`). | `agent.ccProcess ? agent.ccProcess.sendMessage() : spawnAndSend()` |
+| `send_to_cc` | Write to agent's active `ccProcess` stdin. Error if no active process. | `agent.ccProcess?.sendMessage()` or error |
+| `subscribe` | Register supervisor as listener on agent's events | Add to `supervisorSubscriptions` set |
+| `unsubscribe` | Remove supervisor from agent's listener list | Remove from set |
 | `ping` | Return `{pong: true, uptime: ...}` | Trivial |
 
-**Phase 1 — Forward `result` and `session_takeover` events to supervisor:**
+**Phase 1 — Event forwarding to supervisor:**
 
-Currently at `bridge.ts:821`, the `proc.on('result')` handler broadcasts to TG subscribers and ctl subscribers but NOT to the supervisor. Similarly, `proc.on('takeover')` at `bridge.ts:947` cleans up subscribers but doesn't notify the supervisor — OpenClaw only sees a generic `process_exit` and can't distinguish a takeover from a normal exit.
+Forward these events to the supervisor when it's subscribed to an agent:
 
-For `result`, add:
-```typescript
-// After existing ctl subscriber broadcast
-this.sendToSupervisor({
-  type: 'event',
-  event: 'result',
-  agentId,
-  sessionId: proc.sessionId,
-  text: extractAssistantText(event),  // or however you extract the text
-  cost_usd: /* from usage stats */,
-  duration_ms: /* from timing */,
-  is_error: event.is_error ?? false,
-});
-```
-
-For `session_takeover`, add to the existing `proc.on('takeover')` handler at `bridge.ts:947`:
-```typescript
-this.sendToSupervisor({
-  type: 'event',
-  event: 'session_takeover',
-  agentId,
-  sessionId: proc.sessionId,
-  exitCode: null,  // takeover exit code isn't meaningful
-});
-```
-
-When `session_takeover` fires, TGCC should NOT also fire `process_exit` for the same process — the takeover event replaces it. OpenClaw uses this to know the session is alive elsewhere (e.g. VS Code) rather than finished.
+| Event | When | Notes |
+|-------|------|-------|
+| `result` | CC returns a result | Include `agentId`, `sessionId`, `text`, `cost_usd`, `duration_ms`, `is_error` |
+| `session_takeover` | Another client steals the session | Fires **instead of** `process_exit` — OpenClaw knows the session is alive elsewhere |
+| `process_exit` | CC process exits normally | NOT fired after a takeover |
+| `state_changed` | Agent's repo changes (from TG `/repo` or supervisor) | Include `agentId`, `repo`, old/new values |
 
 **Phase 2 — Ephemeral agents (new concept in `bridge.ts`):**
 
@@ -1122,7 +1117,7 @@ tgccSupervisor?: {
 **Phase 1 — Event handling:**
 
 When `TgccSupervisorClient` receives events:
-- `result` → find the subagent run by `tgcc:{agentId}:{sessionId}` key → call `markExternalSubagentRunComplete()` → triggers announce flow to deliver result to the requester session
+- `result` → find the subagent run by `tgcc:{agentId}` key → call `markExternalSubagentRunComplete()` → triggers announce flow to deliver result to the requester session
 - `process_exit` → same, mark run as ended
 - `session_takeover` → mark run as **suspended** (not ended) — the session is alive in another client (VS Code, CLI). Don't announce completion. Optionally notify the requester: "sentinella session was taken over by another client"
 - `api_error` → inject as system message into the requester session
