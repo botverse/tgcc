@@ -17,6 +17,7 @@ export interface TelegramSender {
   sendMessage(chatId: number | string, text: string, parseMode?: string): Promise<number>;
   editMessage(chatId: number | string, messageId: number, text: string, parseMode?: string): Promise<void>;
   deleteMessage?(chatId: number | string, messageId: number): Promise<void>;
+  setReaction?(chatId: number | string, messageId: number, emoji: string): Promise<void>;
   sendPhoto?(chatId: number | string, imageBuffer: Buffer, caption?: string): Promise<number>;
 }
 
@@ -204,8 +205,10 @@ export class StreamAccumulator {
       this.currentBlockType = 'tool_use';
       const block = event.content_block as { type: 'tool_use'; id: string; name: string };
       this.currentToolBlockId = block.id;
-      // Send an independent indicator message for this tool_use block
-      await this.sendToolIndicator(block.id, block.name);
+      // Sub-agent tools are handled by SubAgentTracker — skip duplicate indicator
+      if (!isSubAgentTool(block.name)) {
+        await this.sendToolIndicator(block.id, block.name);
+      }
     } else if (blockType === 'image') {
       this.currentBlockType = 'image';
       this.imageBase64Buffer = '';
@@ -357,12 +360,32 @@ export class StreamAccumulator {
     return this.sendQueue;
   }
 
-  /** Resolve a tool indicator with success/failure status. Edits to a compact summary with input detail. */
+  /** MCP media tools — on success, delete indicator (the media was sent directly). On failure, keep + react ❌. */
+  private static MCP_MEDIA_TOOLS = new Set(['mcp__tgcc__send_image', 'mcp__tgcc__send_file', 'mcp__tgcc__send_voice']);
+
+  /** Resolve a tool indicator with success/failure status. Uses TG reaction instead of text icon. */
   async resolveToolMessage(blockId: string, isError: boolean, errorMessage?: string, resultContent?: string, toolUseResult?: Record<string, unknown>): Promise<void> {
     const entry = this.toolMessages.get(blockId);
     if (!entry) return;
     const { msgId, toolName, startTime } = entry;
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+
+    // MCP media tools: delete indicator on success (the media itself is the result)
+    if (StreamAccumulator.MCP_MEDIA_TOOLS.has(toolName) && !isError) {
+      this.toolInputBuffers.delete(blockId);
+      this.toolIndicatorLastSummary.delete(blockId);
+      this.toolMessages.delete(blockId);
+      this.sendQueue = this.sendQueue.then(async () => {
+        try {
+          if (this.sender.deleteMessage) await this.sender.deleteMessage(this.chatId, msgId);
+        } catch (err) {
+          this.logger?.debug?.({ err, toolName }, 'Failed to delete MCP media tool indicator');
+        }
+      }).catch(err => {
+        this.logger?.error?.({ err }, 'resolveToolMessage queue error');
+      });
+      return this.sendQueue;
+    }
 
     const inputJson = this.toolInputBuffers.get(blockId) ?? '';
     const summary = extractToolInputSummary(toolName, inputJson);
@@ -370,8 +393,7 @@ export class StreamAccumulator {
     const codeLine = summary ? `\n<code>${escapeHtml(summary)}</code>` : '';
     const statLine = resultStat ? `\n${escapeHtml(resultStat)}` : '';
 
-    const icon = isError ? '❌' : '✅';
-    const html = formatSystemMessage('tool', `${icon} ${escapeHtml(toolName)} (${elapsed}s)${codeLine}${statLine}`, true);
+    const html = formatSystemMessage('tool', `${escapeHtml(toolName)} (${elapsed}s)${codeLine}${statLine}`, true);
 
     // Clean up input buffer
     this.toolInputBuffers.delete(blockId);
@@ -380,6 +402,11 @@ export class StreamAccumulator {
     this.sendQueue = this.sendQueue.then(async () => {
       try {
         await this.sender.editMessage(this.chatId, msgId, html, 'HTML');
+        // Set reaction instead of text icon
+        if (this.sender.setReaction) {
+          const emoji = isError ? '👎' : '👍';
+          await this.sender.setReaction(this.chatId, msgId, emoji);
+        }
       } catch (err) {
         // Edit failure on resolve — non-critical
         this.logger?.debug?.({ err, toolName }, 'Failed to resolve tool indicator');
@@ -1037,10 +1064,12 @@ export class SubAgentTracker {
       if (info.status !== 'dispatched' || !info.tgMessageId) continue;
       info.status = 'completed';
       const label = info.label || info.toolName;
-      const text = `✅ ${escapeHtml(label)} — see main message`;
+      const text = `🤖 ${escapeHtml(label)} — see main message`;
+      const agentMsgId = info.tgMessageId!;
       this.sendQueue = this.sendQueue.then(async () => {
         try {
-          await this.sender.editMessage(this.chatId, info.tgMessageId!, text, 'HTML');
+          await this.sender.editMessage(this.chatId, agentMsgId, text, 'HTML');
+          await this.sender.setReaction?.(this.chatId, agentMsgId, '👍');
         } catch (err) {
           // Non-critical — edit failure on dispatched agent status
         }
@@ -1122,21 +1151,24 @@ export class SubAgentTracker {
     info.status = 'completed';
 
     const label = info.label || info.toolName;
-    // Truncate result for blockquote (TG message limit ~4096 chars)
     const maxResultLen = 3500;
     const resultText = result.length > maxResultLen ? result.slice(0, maxResultLen) + '…' : result;
 
-    // Use expandable blockquote — collapsed shows "✅ label" + first line, tap to expand
-    const text = `<blockquote expandable>✅ ${escapeHtml(label)}\n${escapeHtml(resultText)}</blockquote>`;
+    // Plain text (no blockquote) — react with ✅ instead
+    const text = `🤖 ${escapeHtml(label)}\n<blockquote expandable>${escapeHtml(resultText)}</blockquote>`;
 
+    const msgId = info.tgMessageId!;
     this.sendQueue = this.sendQueue.then(async () => {
       try {
         await this.sender.editMessage(
           this.chatId,
-          info.tgMessageId!,
+          msgId,
           text,
           'HTML',
         );
+        if (this.sender.setReaction) {
+          await this.sender.setReaction(this.chatId, msgId, '👍');
+        }
       } catch {
         // Edit failure on tool result — non-critical
       }

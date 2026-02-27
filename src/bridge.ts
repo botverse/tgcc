@@ -837,6 +837,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
           return agent.tgBot.editText(cid, msgId, text, parseMode);
         },
         deleteMessage: (cid, msgId) => agent.tgBot.deleteMessage(cid, msgId),
+        setReaction: (cid, msgId, emoji) => agent.tgBot.setReaction(cid, msgId, emoji),
         sendPhoto: (cid, buffer, caption) => agent.tgBot.sendPhotoBuffer(cid, buffer, caption),
       };
       const onError = (err: unknown, context: string) => {
@@ -1672,8 +1673,9 @@ export class Bridge extends EventEmitter implements CtlHandler {
         // For persistent agents: send TG system message BEFORE spawning CC
         const tgChatId = this.getAgentChatId(agent);
         if (tgChatId) {
-          agent.tgBot.sendText(tgChatId, `<blockquote>🦞 <b>OpenClaw:</b> ${escapeHtml(text)}</blockquote>`, 'HTML')
-            .catch(err => this.logger.error({ err }, 'Failed to send supervisor TG notification'));
+          const preview = text.length > 500 ? text.slice(0, 500) + '…' : text;
+          agent.tgBot.sendText(tgChatId, `<blockquote>🦞 <b>OpenClaw:</b> ${escapeHtml(preview)}</blockquote>`, 'HTML')
+            .catch(err => this.logger.error({ err, agentId }, 'Failed to send supervisor TG notification'));
         }
 
         // Send to agent's single CC process
