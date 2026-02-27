@@ -1230,7 +1230,7 @@ Neither side needs to know the other's internals. The protocol is the API.
 **Remaining Phase 1 work:**
 - 🔧 **Refactor TGCC to agent-level state model** (see section 13 — "Architecture Issue"). This is the blocker. Currently processes are per-userId, so supervisor gets a separate process from TG user. Need to make it one process per agent, shared by all clients.
   - Collapse `AgentInstance.processes: Map<userId, CCProcess>` → single `ccProcess`
-  - Move `SessionStore` from per-user to per-agent state (repo, sessionId, model)
+  - Move `SessionStore` from per-user to per-agent state (repo, model) — sessionId lives on the process
   - Remove userId from `sendToCC()` — agent-level lookup
   - Broadcast repo/session changes to all subscribers (TG + supervisor)
   - System messages in TG when supervisor acts, events to supervisor when TG user acts
@@ -1298,8 +1298,9 @@ This means when the supervisor sends with `userId: "supervisor"`, it gets a comp
 ```
 Agent "sentinella":
   repo: /home/fonz/Botverse/sentinella
-  sessionId: abc-123 (or null)
   ccProcess: <CCProcess | null>
+    └─ sessionId: abc-123          # lives on the process, not the agent
+    └─ spawned with: --continue    # or --resume <id>
   subscribers: [TG user, supervisor, CLI attach, ...]
 ```
 
@@ -1318,7 +1319,7 @@ Agent "sentinella":
 | Component | Current | Target |
 |-----------|---------|--------|
 | `AgentInstance.processes` | `Map<userId, CCProcess>` | Single `ccProcess: CCProcess \| null` |
-| `SessionStore` | Per-user state (`users[userId].repo`) | Per-agent state (`agent.repo`, `agent.sessionId`) — agents don't track users |
+| `SessionStore` | Per-user state (`users[userId].repo`) | Per-agent state (`agent.repo`) — `sessionId` lives on the process, not the agent |
 | `sendToCC()` | Takes `userId` to find/spawn process | Takes `agentId` only — agents have one process |
 | `ProcessRegistry` | Still useful for `repo:sessionId` keying | Entry point changes: lookup by agentId first |
 | `/repo` command | Sets repo for `userId` | Sets repo for agent (all clients) |
