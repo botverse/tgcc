@@ -2,6 +2,21 @@
 
 **Telegram ↔ Claude Code bridge** — run Claude Code sessions from Telegram with full streaming, session management, and multi-agent support.
 
+## Why TGCC?
+
+Claude Code is powerful but lives in a terminal. TGCC gives it a **shared, visible interface** through Telegram.
+
+**The problem**: When an AI agent spawns a Claude Code session, it's ephemeral and invisible. No one can watch it work. No one can jump in. When it finishes, the context is gone.
+
+**What TGCC does**: Each CC session gets a Telegram bot that streams output in real-time — thinking, tool use, code edits — all in a single updating message. Multiple sources can share the same CC process:
+
+- Your **OpenClaw agent** delegates a coding task via the supervisor protocol
+- **You** watch it work in Telegram from your phone
+- You can **jump in** mid-session to steer, approve permissions, or add context
+- The agent gets the **result back** automatically when CC finishes
+
+This turns Claude Code from a black-box subprocess into a **collaborative workspace** between humans and AI agents.
+
 ## Quick Start
 
 ```bash
