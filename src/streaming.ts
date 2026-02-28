@@ -175,6 +175,14 @@ export class StreamAccumulator {
   private lastEditTime = 0;
   private editTimer: ReturnType<typeof setTimeout> | null = null;
 
+  // Delayed first send (fix: don't create TG message until real content arrives)
+  private turnStartTime = 0;
+  private firstSendReady = true;  // true until first reset() — pre-turn sends are unrestricted
+  private firstSendTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // Tool hide timers (fix: don't flash ⚡ for fast tools that resolve <500ms)
+  private toolHideTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
   constructor(options: StreamAccumulatorOptions) {
     this.chatId = options.chatId;
     this.sender = options.sender;
@@ -292,6 +300,13 @@ export class StreamAccumulator {
         seg.content = renderSegment(seg);
         this.segments.push(seg);
         this.currentSegmentIdx = this.segments.length - 1;
+        // Suppress the ⚡ pending indicator for 500ms. If the tool resolves within that window
+        // the hide timer is cancelled in resolveToolMessage and we render directly as ✅.
+        const toolBlockId = block.id;
+        this.toolHideTimers.set(toolBlockId, setTimeout(() => {
+          this.toolHideTimers.delete(toolBlockId);
+          void this.throttledRender();
+        }, 500));
       }
       await this.throttledRender();
 
@@ -423,6 +438,15 @@ export class StreamAccumulator {
     }
 
     if (seg.type === 'tool') {
+      // Cancel the hide timer — tool is now visible in its final state.
+      // If it resolved within 500ms the timer was still running; cancelling it means
+      // the ⚡ pending indicator was never shown and we render directly as ✅.
+      const hideTimer = this.toolHideTimers.get(blockId);
+      if (hideTimer !== undefined) {
+        clearTimeout(hideTimer);
+        this.toolHideTimers.delete(blockId);
+      }
+
       // MCP media tools: remove segment on success (media itself is the result)
       if (StreamAccumulator.MCP_MEDIA_TOOLS.has(seg.toolName) && !isError) {
         this.segments.splice(segIdx, 1);
@@ -483,7 +507,11 @@ export class StreamAccumulator {
   /** Render all segments to one HTML string. */
   renderHtml(): string {
     const parts = this.segments
-      .map(s => s.content)
+      .map(s => {
+        // Hide pending tool segments until 500ms has elapsed — fast tools go directly to resolved state
+        if (s.type === 'tool' && s.status === 'pending' && this.toolHideTimers.has(s.id)) return '';
+        return s.content;
+      })
       .filter(c => c.length > 0);
     return parts.join('\n') || '…';
   }
@@ -506,28 +534,55 @@ export class StreamAccumulator {
     }
   }
 
-  /** Enqueue a render on the send queue (for async tool updates). */
-  private async enqueueRender(): Promise<void> {
-    this.sendQueue = this.sendQueue.then(() => this.doRender()).catch(err => {
+  /** Enqueue a render on the send queue (for async tool updates).
+   *  Passes inQueue=true to doRender so it calls _doSendOrEdit directly,
+   *  avoiding a deadlock where doRender re-chains onto the sendQueue it's already inside. */
+  private enqueueRender(): Promise<void> {
+    this.sendQueue = this.sendQueue.then(() => this.doRender(true)).catch(err => {
       this.logger?.error?.({ err }, 'enqueueRender failed');
     });
     return this.sendQueue;
   }
 
-  private async doRender(): Promise<void> {
+  /** inQueue=true: called from within sendQueue chain — uses _doSendOrEdit directly to avoid deadlock.
+   *  inQueue=false (default): called from outside the queue — re-chains via sendOrEdit. */
+  private async doRender(inQueue = false): Promise<void> {
     if (this.sealed) return;
+
+    // Gate: delay the first TG message until real text content arrives or 2s have passed.
+    // Prevents an empty/thinking-only bubble from being created prematurely.
+    if (!this.tgMessageId && !this.checkFirstSendReady()) {
+      if (!this.firstSendTimer) {
+        const remaining = Math.max(0, 2000 - (Date.now() - this.turnStartTime));
+        this.firstSendTimer = setTimeout(() => {
+          this.firstSendTimer = null;
+          this.firstSendReady = true;
+          void this.doRender();
+        }, remaining);
+      }
+      return;
+    }
+
     const html = this.renderHtml();
 
     // Check if we need to split
     if (html.length > this.splitThreshold) {
-      await this.splitMessage();
+      await this.splitMessage(inQueue);
       return;
     }
 
-    await this.sendOrEdit(html);
+    if (inQueue) {
+      await this._doSendOrEdit(html || '…');
+    } else {
+      await this.sendOrEdit(html);
+    }
   }
 
-  private async splitMessage(): Promise<void> {
+  private async splitMessage(inQueue = false): Promise<void> {
+    const sendFn = inQueue
+      ? (h: string) => this._doSendOrEdit(h)
+      : (h: string) => this.sendOrEdit(h);
+
     // Find text segments to split on
     let totalLen = 0;
     let splitSegIdx = -1;
@@ -543,7 +598,7 @@ export class StreamAccumulator {
     if (splitSegIdx <= 0) {
       // Can't split cleanly — truncate the HTML
       const html = this.renderHtml().slice(0, this.splitThreshold);
-      await this.sendOrEdit(html);
+      await sendFn(html);
       return;
     }
 
@@ -552,13 +607,33 @@ export class StreamAccumulator {
     const restSegs = this.segments.slice(splitSegIdx);
 
     const firstHtml = firstSegs.map(s => s.content).filter(Boolean).join('\n');
-    await this.sendOrEdit(firstHtml);
+    await sendFn(firstHtml);
 
     // Start a new message for remainder
     this.tgMessageId = null;
     this.segments = restSegs;
     const restHtml = this.renderHtml();
-    await this.sendOrEdit(restHtml);
+    await sendFn(restHtml);
+  }
+
+  private checkFirstSendReady(): boolean {
+    if (this.firstSendReady) return true;
+    const textChars = this.segments
+      .filter((s): s is Extract<InternalSegment, { type: 'text' }> => s.type === 'text')
+      .reduce((sum, s) => sum + s.rawText.length, 0);
+    if (textChars >= 200 || Date.now() - this.turnStartTime >= 2000) {
+      this.firstSendReady = true;
+      this.clearFirstSendTimer();
+      return true;
+    }
+    return false;
+  }
+
+  private clearFirstSendTimer(): void {
+    if (this.firstSendTimer) {
+      clearTimeout(this.firstSendTimer);
+      this.firstSendTimer = null;
+    }
   }
 
   /** Force-split when a text segment exceeds 50KB */
@@ -588,6 +663,10 @@ export class StreamAccumulator {
       clearTimeout(this.editTimer);
       this.editTimer = null;
     }
+
+    // Ensure first send is unblocked — finalize is the last chance to send anything
+    this.firstSendReady = true;
+    this.clearFirstSendTimer();
 
     // Append usage footer segment
     if (this.turnUsage) {
@@ -666,6 +745,8 @@ export class StreamAccumulator {
     this.turnUsage = null;
     this._lastMsgStartCtx = null;
     this.clearEditTimer();
+    for (const t of this.toolHideTimers.values()) clearTimeout(t);
+    this.toolHideTimers.clear();
   }
 
   /** Full reset: clear everything for a new turn. */
@@ -679,6 +760,11 @@ export class StreamAccumulator {
     this.imageBase64Buffer = '';
     this.lastEditTime = 0;
     this.sendQueue = prevQueue.catch(() => {});
+    this.turnStartTime = Date.now();
+    this.firstSendReady = false;
+    this.clearFirstSendTimer();
+    for (const t of this.toolHideTimers.values()) clearTimeout(t);
+    this.toolHideTimers.clear();
   }
 
   private clearEditTimer(): void {
