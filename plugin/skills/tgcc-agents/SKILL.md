@@ -1,149 +1,161 @@
 ---
 name: tgcc-agents
-description: 'Interact with TGCC-managed agents (sentinella, kyobot, saemem) via the supervisor protocol. Use when: routing tasks to persistent Telegram bots managed by TGCC, checking TGCC agent status, or coordinating across TGCC-managed CC sessions. NOT for: spawning new CC sessions (use coding-agent skill), direct Telegram bot interaction, or tasks that don't involve TGCC agents.'
+description: 'Manage TGCC agents (Claude Code via Telegram) using tgcc_spawn, tgcc_send, tgcc_status, tgcc_kill tools. Use when: spawning CC sessions through TGCC, sending tasks to persistent TGCC bots, checking agent status, killing sessions, or creating ephemeral agents for one-off work.'
 homepage: https://github.com/botverse/tgcc
 metadata:
   {
     "openclaw":
       {
         "emoji": "🔌",
-        "requires": { "bins": ["tgcc"], "sockets": ["/tmp/tgcc/ctl/tgcc.sock"] },
+        "requires": { "sockets": ["/tmp/tgcc/ctl/tgcc.sock"] },
         "install":
           [
             {
               "id": "npm",
               "kind": "npm",
               "package": "@fonz/tgcc",
-              "bins": ["tgcc"],
-              "label": "Install TGCC (npm)",
+              "label": "Install TGCC plugin",
             },
           ],
-        "setup": "After install, run `tgcc init` to configure agents and `tgcc install` to start as a service. Then add `tgccSupervisor.socket` to your OpenClaw config.",
+        "setup": "Install with `openclaw plugins install @fonz/tgcc`, then configure plugin with socketDir and defaultAgent.",
       },
   }
 ---
 
-# TGCC Agents — Supervisor Protocol Integration
+# TGCC Agents — OpenClaw Plugin
 
-Talk to **persistent TGCC agents** (sentinella, kyobot, saemem, etc.) directly from OpenClaw via the supervisor protocol. Messages route through a Unix socket to TGCC, which manages the actual Claude Code processes.
+Manage **Claude Code sessions via TGCC** (Telegram ↔ Claude Code bridge) using four dedicated tools. TGCC manages CC processes with Telegram rendering — you get visibility in both OpenClaw and Telegram.
 
-## Key Concepts
+## Tools
 
-### TGCC vs Direct CC Spawn
-
-| | TGCC Agents | Direct CC Spawn |
-|---|---|---|
-| **What** | Persistent bots with Telegram integration | Ephemeral CC sessions |
-| **How** | `sessions_send` → supervisor protocol → TGCC | `sessions_spawn` or coding-agent skill |
-| **Agents** | sentinella, kyobot, saemem (auto-discovered) | Created on demand |
-| **Shared** | Fnz can also talk to them via Telegram | Only OpenClaw sees them |
-| **Lifecycle** | TGCC manages process start/stop | OpenClaw manages lifecycle |
-
-### Auto-Discovery
-
-TGCC agents are **auto-discovered** — no static config needed beyond the socket path:
-
-```yaml
-# openclaw.json — only config needed
-agents:
-  defaults:
-    subagents:
-      claudeCode:
-        tgccSupervisor:
-          socket: /tmp/tgcc/ctl/tgcc.sock
-```
-
-On connect, OpenClaw queries TGCC for available agents and caches them (60s TTL). The `agents_list` tool shows them automatically.
-
-## Sending Messages to TGCC Agents
-
-Use `sessions_send` with the agent name as the label:
+### `tgcc_status` — Check what's running
 
 ```
-sessions_send(label="sentinella", message="Check tile coverage for Ibiza")
+tgcc_status                          # all agents
+tgcc_status agentId="tgcc"           # specific agent
 ```
 
-This routes through the supervisor protocol:
-1. OpenClaw detects "sentinella" is a known TGCC agent
-2. Sends `send_message` command via Unix socket to TGCC
-3. TGCC spawns or resumes a CC process for that agent
-4. CC works on the task
-5. When done, TGCC sends a `result` event back
-6. OpenClaw's announce flow delivers the result to the requester
+Returns:
+- **agents**: list with repo, type (persistent/ephemeral), state (idle/active/spawning)
+- **pendingResults**: completed CC results not yet consumed (use `drain=true` to consume)
+- **pendingPermissions**: permission requests waiting for approval
+- **recentEvents**: last events (cc_spawned, result, error, etc.)
 
-**Important:** The CC process is shared. If Fnz is also talking to sentinella via Telegram, both see the same session. OpenClaw auto-subscribes to events.
+### `tgcc_spawn` — Start a CC session
 
-## Monitoring & Control
-
-### List active agents
-
+**Existing agent** (persistent, has Telegram bot):
 ```
-subagents list
+tgcc_spawn agentId="tgcc" task="Fix the render pipeline bug"
+tgcc_spawn agentId="sentinella" task="Check tile coverage for Ibiza"
 ```
 
-TGCC-backed runs show with a `[tgcc]` prefix. Untracked TGCC agents with active CC processes also appear at the bottom.
-
-### Steer an active TGCC agent
-
+**Ephemeral agent** (one-off, no Telegram bot — requires `repo`):
 ```
-subagents steer target="sentinella" message="Also compare with last month's data"
+tgcc_spawn agentId="my-task" repo="/home/user/project" task="Add error handling"
+tgcc_spawn agentId="review-pr" repo="/tmp/pr-42" task="Review this PR" model="opus"
 ```
 
-Routes `send_to_cc` through the supervisor — writes directly to the running CC process's stdin. Does NOT spawn a new process.
+Optional params:
+- `model`: override CC model (e.g. `opus`, `sonnet`)
+- `permissionMode`: CC permission mode (`plan`, `default`, `bypassPermissions`)
 
-### Kill a TGCC agent's CC process
+### `tgcc_send` — Message an active agent
 
+Send a follow-up message or new task to an agent that already has a CC session:
 ```
-subagents kill target="sentinella"
-```
-
-Routes `kill_cc` through the supervisor.
-
-## Status
-
-`session_status` shows TGCC connection state:
-
-```
-🔌 TGCC: connected (3 agents)
+tgcc_send agentId="tgcc" text="Also run the tests"
+tgcc_send agentId="sentinella" text="Now compare with last month"
 ```
 
-Or when disconnected:
-```
-🔌 TGCC: reconnecting
-```
+If the agent is idle (no CC process), this spawns a new session. If active, the message is queued and sent to CC when it's ready for input.
 
-## How It Works Under the Hood
+### `tgcc_kill` — Stop a CC session
 
 ```
-OpenClaw                    TGCC Bridge                CC Process
+tgcc_kill agentId="tgcc"                          # kill CC process, keep agent
+tgcc_kill agentId="my-task" destroy=true           # kill CC + destroy ephemeral agent
+```
+
+## Typical Workflows
+
+### Delegate a coding task
+```
+tgcc_spawn agentId="tgcc" task="Implement the OpenClaw plugin per specs/openclaw-plugin.md"
+# ... wait ...
+tgcc_status                    # check pendingResults for completion
+```
+
+### Multi-agent coordination
+```
+tgcc_send agentId="sentinella" text="Generate the fire risk report"
+tgcc_send agentId="kyobot" text="Update the booking dashboard"
+tgcc_status                    # see both working in parallel
+```
+
+### Ephemeral agent for isolated work
+```
+tgcc_spawn agentId="pr-review" repo="/tmp/pr-42" task="Review changes" model="opus"
+# ... result comes back ...
+tgcc_kill agentId="pr-review" destroy=true   # clean up
+```
+
+### Follow up on running work
+```
+tgcc_send agentId="tgcc" text="Also fix the edge case in splitMessage"
+```
+
+## How It Works
+
+```
+OpenClaw Plugin              TGCC Bridge                CC Process
   │                            │                          │
-  │─── send_message ──────────►│                          │
-  │    {agentId, text}         │─── spawn/resume CC ─────►│
-  │◄── response ──────────────│    {sessionId, state}     │
+  │── send_message ───────────►│                          │
+  │   {agentId, text}          │── spawn/resume CC ──────►│
+  │◄── ack ───────────────────│   {sessionId, state}      │
   │                            │                          │
-  │    (CC works...)           │                          │
+  │   (CC works, visible       │                          │
+  │    in Telegram chat)       │                          │
   │                            │◄── result ───────────────│
-  │◄── event: result ─────────│    {text, cost}           │
+  │◄── event: result ─────────│   {text, cost}            │
   │                            │                          │
-  │─── announce to requester   │                          │
 ```
 
-- **Protocol:** NDJSON over Unix socket (`/tmp/tgcc/ctl/tgcc.sock`)
-- **Registration:** OpenClaw registers as `openclaw` supervisor on connect
-- **Heartbeat:** Ping/pong every 30s, reconnect with exponential backoff on failure
-- **Auto-start:** If configured, attempts `systemctl --user start tgcc.service` on first connection failure
+- **Protocol**: NDJSON over Unix socket (default: `/tmp/tgcc/ctl/*.sock`)
+- **Connection**: Plugin registers as supervisor, auto-reconnects with backoff
+- **Discovery**: Agents auto-discovered on connect (persistent bots + ephemeral)
+- **Events**: cc_spawned, result, process_exit, permission_request, api_error
+- **Shared sessions**: Persistent agents share CC sessions with Telegram users — both see the same work
 
-## Subagent Registry Integration
+## Plugin Configuration
 
-TGCC runs are tracked in the subagent registry with:
-- `childSessionKey`: `tgcc:{agentId}` (e.g., `tgcc:sentinella`)
-- `transport`: `"tgcc-supervisor"`
-- `tgccAgentId`: the TGCC agent name
+```json
+{
+  "plugins": {
+    "entries": {
+      "tgcc": {
+        "enabled": true,
+        "config": {
+          "socketDir": "/tmp/tgcc/ctl",
+          "defaultAgent": "tgcc",
+          "telegramChatId": "7016073156"
+        }
+      }
+    }
+  }
+}
+```
 
-One active run per agent — TGCC manages sessions internally.
+- **socketDir**: where TGCC control sockets live (default: `/tmp/tgcc/ctl`)
+- **defaultAgent**: fallback agentId when none specified
+- **telegramChatId**: chat ID for permission request buttons
+- **agents**: optional array of agent IDs to subscribe to (default: all)
+
+## Permission Requests
+
+When CC needs permission (file write, bash command, etc.), TGCC forwards it through the plugin. If `telegramChatId` is configured, approval buttons appear in Telegram (✅ Allow / ❌ Deny). Otherwise, permissions follow CC's configured `permissionMode`.
 
 ## When NOT to Use This
 
-- **New coding tasks in a repo:** Use the coding-agent skill to spawn a fresh CC session
-- **Tasks that need isolation:** TGCC agents share sessions with Telegram users
-- **Quick one-off edits:** Use the `edit` tool directly
+- **Quick file edits**: use the `edit` tool directly
+- **Reading/exploring code**: use `read` / `exec` tools
+- **Tasks needing full isolation from Telegram**: spawn CC directly via coding-agent skill
