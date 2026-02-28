@@ -1,0 +1,50 @@
+{
+  "id": "tgcc",
+  "name": "TGCC Bridge",
+  "description": "Bridge OpenClaw agents to Claude Code sessions via TGCC (Telegram ↔ Claude Code)",
+  "version": "0.6.19",
+  "uiHints": {
+    "socketDir": {
+      "label": "Socket Directory",
+      "help": "Directory containing TGCC control sockets (default: /tmp/tgcc/ctl)"
+    },
+    "defaultAgent": {
+      "label": "Default Agent",
+      "help": "Default TGCC agent ID for spawns"
+    },
+    "agents": {
+      "label": "Agent IDs",
+      "help": "TGCC agent IDs to subscribe to (default: all)"
+    },
+    "telegramChatId": {
+      "label": "Telegram Chat ID",
+      "help": "Chat ID for permission request buttons"
+    }
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "enabled": {
+        "type": "boolean"
+      },
+      "socketDir": {
+        "type": "string",
+        "description": "Directory containing TGCC control sockets (default: /tmp/tgcc/ctl)"
+      },
+      "defaultAgent": {
+        "type": "string",
+        "description": "Default TGCC agent to use for spawns (e.g. 'tgcc')"
+      },
+      "agents": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "TGCC agent IDs to subscribe to (default: all)"
+      },
+      "telegramChatId": {
+        "type": "string",
+        "description": "Telegram chat ID for permission request buttons"
+      }
+    }
+  }
+}

@@ -25,6 +25,10 @@
     "./streaming": {
       "types": "./dist/streaming.d.ts",
       "import": "./dist/streaming.js"
+    },
+    "./plugin": {
+      "types": "./dist/plugin/index.d.ts",
+      "import": "./dist/plugin/index.js"
     }
   },
   "typesVersions": {
@@ -44,7 +48,7 @@
     }
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && tsc -p plugin/tsconfig.json",
     "dev": "tsx src/service.ts",
     "start": "node dist/service.js",
     "test": "vitest run",
@@ -88,6 +92,7 @@
     "zod": "^4.3.6"
   },
   "devDependencies": {
+    "@sinclair/typebox": "0.34.48",
     "@types/node": "^25.3.0",
     "@types/uuid": "^11.0.0",
     "tsx": "^4.21.0",
@@ -96,6 +101,7 @@
   },
   "files": [
     "dist",
+    "plugin/openclaw.plugin.json",
     "README.md"
   ],
   "publishConfig": {
