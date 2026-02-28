@@ -171,9 +171,10 @@ export class StreamAccumulator {
   // Image streaming state
   private imageBase64Buffer = '';
 
-  // Rate limiting
+  // Rate limiting / render scheduling
   private lastEditTime = 0;
-  private editTimer: ReturnType<typeof setTimeout> | null = null;
+  private flushTimer: ReturnType<typeof setTimeout> | null = null;
+  private dirty = false;
 
   // Delayed first send (fix: don't create TG message until real content arrives)
   private turnStartTime = 0;
@@ -216,7 +217,7 @@ export class StreamAccumulator {
       content: `<blockquote>🦞 ${escapeHtml(preview)}</blockquote>`,
     };
     this.segments.push(seg);
-    void this.throttledRender();
+    this.requestRender();
   }
 
   // ── Process stream events ──
@@ -236,7 +237,7 @@ export class StreamAccumulator {
       }
 
       case 'content_block_start':
-        await this.onContentBlockStart(event as StreamContentBlockStart);
+        this.onContentBlockStart(event as StreamContentBlockStart);
         break;
 
       case 'content_block_delta':
@@ -253,7 +254,7 @@ export class StreamAccumulator {
     }
   }
 
-  private async onContentBlockStart(event: StreamContentBlockStart): Promise<void> {
+  private onContentBlockStart(event: StreamContentBlockStart): void {
     const blockType = event.content_block.type;
     this.currentBlockType = blockType as typeof this.currentBlockType;
 
@@ -262,7 +263,7 @@ export class StreamAccumulator {
       seg.content = renderSegment(seg);
       this.segments.push(seg);
       this.currentSegmentIdx = this.segments.length - 1;
-      await this.throttledRender();
+      this.requestRender();
 
     } else if (blockType === 'text') {
       const seg: InternalSegment = { type: 'text', rawText: '', content: '' };
@@ -305,10 +306,10 @@ export class StreamAccumulator {
         const toolBlockId = block.id;
         this.toolHideTimers.set(toolBlockId, setTimeout(() => {
           this.toolHideTimers.delete(toolBlockId);
-          void this.throttledRender();
+          this.requestRender();
         }, 500));
       }
-      await this.throttledRender();
+      this.requestRender();
 
     } else if (blockType === 'image') {
       this.imageBase64Buffer = '';
@@ -328,7 +329,7 @@ export class StreamAccumulator {
           return;
         }
 
-        await this.throttledRender();
+        this.requestRender();
       }
     } else if (this.currentBlockType === 'thinking' && 'delta' in event) {
       const delta = (event as any).delta;
@@ -336,8 +337,7 @@ export class StreamAccumulator {
         const seg = this.segments[this.currentSegmentIdx] as Extract<InternalSegment, { type: 'thinking' }>;
         seg.rawText += delta.thinking;
         seg.content = renderSegment(seg);
-        // Don't throttle thinking updates — they're cheap and users expect live thinking
-        await this.throttledRender();
+        this.requestRender();
       }
     } else if (this.currentBlockType === 'tool_use' && 'delta' in event) {
       const delta = (event as any).delta;
@@ -364,7 +364,7 @@ export class StreamAccumulator {
               }
             }
             seg.content = renderSegment(seg);
-            await this.throttledRender();
+            this.requestRender();
           }
         }
       }
@@ -392,13 +392,13 @@ export class StreamAccumulator {
         // Mark as dispatched (input complete, waiting for tool_result)
         seg.status = 'dispatched';
         seg.content = renderSegment(seg);
-        await this.throttledRender();
+        this.requestRender();
       } else if (seg.type === 'tool') {
         // Finalize preview from complete input
         const summary = extractToolInputSummary(seg.toolName, inputJson, 80);
         if (summary) seg.inputPreview = summary;
         seg.content = renderSegment(seg);
-        await this.throttledRender();
+        this.requestRender();
       }
     } else if (this.currentBlockType === 'image' && this.imageBase64Buffer) {
       await this.sendImage();
@@ -412,7 +412,7 @@ export class StreamAccumulator {
   // ── Public tool resolution API ──
 
   /** Resolve a tool indicator with success/failure status. Called by bridge on tool_result. */
-  async resolveToolMessage(blockId: string, isError: boolean, errorMessage?: string, resultContent?: string, toolUseResult?: Record<string, unknown>): Promise<void> {
+  resolveToolMessage(blockId: string, isError: boolean, errorMessage?: string, resultContent?: string, toolUseResult?: Record<string, unknown>): void {
     const segIdx = this.segments.findIndex(s => (s.type === 'tool' || s.type === 'subagent') && (s as any).id === blockId);
     if (segIdx < 0) return;
 
@@ -426,14 +426,14 @@ export class StreamAccumulator {
       if (isSpawnConfirmation) {
         seg.status = 'dispatched';
         seg.content = renderSegment(seg);
-        await this.enqueueRender();
+        this.requestRender();
         return;
       }
 
       // Tool result (synchronous completion) → mark completed
       seg.status = 'completed';
       seg.content = renderSegment(seg);
-      await this.enqueueRender();
+      this.requestRender();
       return;
     }
 
@@ -450,7 +450,7 @@ export class StreamAccumulator {
       // MCP media tools: remove segment on success (media itself is the result)
       if (StreamAccumulator.MCP_MEDIA_TOOLS.has(seg.toolName) && !isError) {
         this.segments.splice(segIdx, 1);
-        await this.enqueueRender();
+        this.requestRender();
         return;
       }
 
@@ -473,7 +473,7 @@ export class StreamAccumulator {
       }
       this.toolInputBuffers.delete(blockId);
       seg.content = renderSegment(seg);
-      await this.enqueueRender();
+      this.requestRender();
     }
   }
 
@@ -485,7 +485,7 @@ export class StreamAccumulator {
     seg.status = status;
     if (label && label.length > seg.label.length) seg.label = label;
     seg.content = renderSegment(seg);
-    void this.throttledRender();
+    this.requestRender();
   }
 
   /** Append a high-signal progress line to a sub-agent segment (called by bridge on task_progress). */
@@ -497,7 +497,7 @@ export class StreamAccumulator {
     seg.progressLines.push(line);
     if (seg.progressLines.length > MAX_PROGRESS_LINES) seg.progressLines.shift();
     seg.content = renderSegment(seg);
-    void this.throttledRender();
+    this.requestRender();
   }
 
   private static MCP_MEDIA_TOOLS = new Set(['mcp__tgcc__send_image', 'mcp__tgcc__send_file', 'mcp__tgcc__send_voice']);
@@ -516,73 +516,52 @@ export class StreamAccumulator {
     return parts.join('\n') || '…';
   }
 
-  /** Throttled render: batches rapid updates into one edit. */
-  private async throttledRender(): Promise<void> {
-    const now = Date.now();
-    const elapsed = now - this.lastEditTime;
-
-    if (elapsed >= this.editIntervalMs) {
-      await this.doRender();
-    } else if (!this.editTimer) {
-      const delay = this.editIntervalMs - elapsed;
-      this.editTimer = setTimeout(async () => {
-        this.editTimer = null;
-        if (!this.sealed) {
-          await this.doRender();
-        }
-      }, delay);
+  /** Mark dirty and schedule a throttled flush. The single entry point for all renders.
+   *  Data in → dirty flag → throttled flush → TG edit. One path, no re-entrant loops. */
+  private requestRender(): void {
+    this.dirty = true;
+    if (!this.flushTimer) {
+      const elapsed = Date.now() - this.lastEditTime;
+      const delay = Math.max(0, this.editIntervalMs - elapsed);
+      this.flushTimer = setTimeout(() => this.flushRender(), delay);
     }
   }
 
-  /** Enqueue a render on the send queue (for async tool updates).
-   *  Passes inQueue=true to doRender so it calls _doSendOrEdit directly,
-   *  avoiding a deadlock where doRender re-chains onto the sendQueue it's already inside. */
-  private enqueueRender(): Promise<void> {
-    this.sendQueue = this.sendQueue.then(() => this.doRender(true)).catch(err => {
-      this.logger?.error?.({ err }, 'enqueueRender failed');
-    });
-    return this.sendQueue;
-  }
+  /** Timer callback: consumes dirty flag and chains one _doSendOrEdit onto sendQueue. */
+  private flushRender(): void {
+    this.flushTimer = null;
+    if (!this.dirty || this.sealed) return;
 
-  /** inQueue=true: called from within sendQueue chain — uses _doSendOrEdit directly to avoid deadlock.
-   *  inQueue=false (default): called from outside the queue — re-chains via sendOrEdit. */
-  private async doRender(inQueue = false): Promise<void> {
-    if (this.sealed) return;
-
-    // Gate: delay the first TG message until real text content arrives or 2s have passed.
-    // Prevents an empty/thinking-only bubble from being created prematurely.
+    // Gate: delay first TG message until real text content arrives or 2s have passed.
     if (!this.tgMessageId && !this.checkFirstSendReady()) {
       if (!this.firstSendTimer) {
         const remaining = Math.max(0, 2000 - (Date.now() - this.turnStartTime));
         this.firstSendTimer = setTimeout(() => {
           this.firstSendTimer = null;
           this.firstSendReady = true;
-          void this.doRender();
+          this.requestRender();
         }, remaining);
       }
+      // dirty stays true; requestRender() will re-schedule when timer fires
       return;
     }
 
+    this.dirty = false;
     const html = this.renderHtml();
 
-    // Check if we need to split
     if (html.length > this.splitThreshold) {
-      await this.splitMessage(inQueue);
-      return;
-    }
-
-    if (inQueue) {
-      await this._doSendOrEdit(html || '…');
+      this.sendQueue = this.sendQueue
+        .then(() => this.splitMessage())
+        .catch(err => { this.logger?.error?.({ err }, 'flushRender splitMessage failed'); });
     } else {
-      await this.sendOrEdit(html);
+      this.sendQueue = this.sendQueue
+        .then(() => this._doSendOrEdit(html || '…'))
+        .catch(err => { this.logger?.error?.({ err }, 'flushRender failed'); });
     }
   }
 
-  private async splitMessage(inQueue = false): Promise<void> {
-    const sendFn = inQueue
-      ? (h: string) => this._doSendOrEdit(h)
-      : (h: string) => this.sendOrEdit(h);
-
+  /** Split oversized message — called from within the sendQueue chain, uses _doSendOrEdit directly. */
+  private async splitMessage(): Promise<void> {
     // Find text segments to split on
     let totalLen = 0;
     let splitSegIdx = -1;
@@ -598,22 +577,22 @@ export class StreamAccumulator {
     if (splitSegIdx <= 0) {
       // Can't split cleanly — truncate the HTML
       const html = this.renderHtml().slice(0, this.splitThreshold);
-      await sendFn(html);
+      await this._doSendOrEdit(html);
       return;
     }
 
-    // Render first part, seal it, start new message with remainder
+    // Render first part, start new message with remainder
     const firstSegs = this.segments.slice(0, splitSegIdx);
     const restSegs = this.segments.slice(splitSegIdx);
 
     const firstHtml = firstSegs.map(s => s.content).filter(Boolean).join('\n');
-    await sendFn(firstHtml);
+    await this._doSendOrEdit(firstHtml);
 
     // Start a new message for remainder
     this.tgMessageId = null;
     this.segments = restSegs;
     const restHtml = this.renderHtml();
-    await sendFn(restHtml);
+    await this._doSendOrEdit(restHtml);
   }
 
   private checkFirstSendReady(): boolean {
@@ -658,11 +637,8 @@ export class StreamAccumulator {
   }
 
   async finalize(): Promise<void> {
-    // Clear pending edit timer
-    if (this.editTimer) {
-      clearTimeout(this.editTimer);
-      this.editTimer = null;
-    }
+    // Cancel any pending flush — we take over from here
+    this.clearFlushTimer();
 
     // Ensure first send is unblocked — finalize is the last chance to send anything
     this.firstSendReady = true;
@@ -675,10 +651,16 @@ export class StreamAccumulator {
       this.segments.push(seg);
     }
 
-    // Final render
+    // Final render — chain directly onto sendQueue so it runs after any in-flight edits
     const html = this.renderHtml();
     if (html && html !== '…') {
-      await this.sendOrEdit(html);
+      this.sendQueue = this.sendQueue
+        .then(() => this._doSendOrEdit(html))
+        .catch(err => {
+          this.logger?.error?.({ err }, 'finalize failed');
+          this.onError?.(err, 'Failed to send/edit message');
+        });
+      await this.sendQueue;
     }
 
     this.sealed = true;
@@ -744,7 +726,7 @@ export class StreamAccumulator {
     this.sealed = false;
     this.turnUsage = null;
     this._lastMsgStartCtx = null;
-    this.clearEditTimer();
+    this.clearFlushTimer();
     for (const t of this.toolHideTimers.values()) clearTimeout(t);
     this.toolHideTimers.clear();
   }
@@ -759,6 +741,7 @@ export class StreamAccumulator {
     this.toolInputBuffers.clear();
     this.imageBase64Buffer = '';
     this.lastEditTime = 0;
+    this.dirty = false;
     this.sendQueue = prevQueue.catch(() => {});
     this.turnStartTime = Date.now();
     this.firstSendReady = false;
@@ -767,10 +750,10 @@ export class StreamAccumulator {
     this.toolHideTimers.clear();
   }
 
-  private clearEditTimer(): void {
-    if (this.editTimer) {
-      clearTimeout(this.editTimer);
-      this.editTimer = null;
+  private clearFlushTimer(): void {
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
     }
   }
 }
