@@ -1953,7 +1953,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
         const tgChatId = this.getAgentChatId(agent);
         if (tgChatId && agent.tgBot) {
           const preview = text.length > 500 ? text.slice(0, 500) + '…' : text;
-          agent.tgBot.sendText(tgChatId, `<blockquote>🦞 <b>OpenClaw:</b> ${escapeHtml(preview)}</blockquote>`, 'HTML', true) // silent
+          agent.tgBot.sendText(tgChatId, `<blockquote>🦞 ${escapeHtml(preview)}</blockquote>`, 'HTML', true) // silent
             .catch(err => this.logger.error({ err, agentId }, 'Failed to send supervisor TG notification'));
         }
 
