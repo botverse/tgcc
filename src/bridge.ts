@@ -1491,7 +1491,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
         }
 
         const keyboard = new InlineKeyboard();
-        keyboard.text('🔓 Bypass', 'permissions:dangerously-skip').text('✏️ Accept Edits', 'permissions:acceptEdits').row();
+        keyboard.text('🔓 Bypass', 'permissions:dangerously-skip').text('🛂 Accept Edits', 'permissions:acceptEdits').row();
         keyboard.text('🔒 Default', 'permissions:default').text('📋 Plan', 'permissions:plan').row();
 
         await agent.tgBot.sendTextWithKeyboard(

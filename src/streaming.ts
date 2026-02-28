@@ -95,6 +95,17 @@ type InternalSegment =
   | { type: 'usage'; content: string }
   | { type: 'image'; content: string };  // image block placeholder (no visible segment)
 
+function toolEmoji(toolName: string): string {
+  switch (toolName) {
+    case 'Read':                         return '👓';
+    case 'Write':                        return '✏️';
+    case 'Edit': case 'MultiEdit':       return '✏️';
+    case 'Grep': case 'Search': case 'Glob': return '🔍';
+    case 'WebFetch': case 'WebSearch':   return '🌐';
+    default:                             return '⚡';
+  }
+}
+
 /** Render a single segment to its HTML string. */
 function renderSegment(seg: InternalSegment): string {
   switch (seg.type) {
@@ -105,16 +116,15 @@ function renderSegment(seg: InternalSegment): string {
       return seg.rawText ? makeHtmlSafe(seg.rawText) : '';
 
     case 'tool': {
+      const emoji = toolEmoji(seg.toolName);
+      const inputPart = seg.inputPreview ? ` <code>${escapeHtml(seg.inputPreview)}</code>` : '';
       if (seg.status === 'resolved') {
-        const previewPart = seg.inputPreview ? ` · <code>${escapeHtml(seg.inputPreview)}</code>` : '';
-        const statPart = seg.resultStat ? ` · <code>${escapeHtml(seg.resultStat)}</code>` : '';
-        return `<blockquote>✅ ${escapeHtml(seg.toolName)} (${seg.elapsed ?? '?'})${previewPart}${statPart}</blockquote>`;
+        const resultLine = seg.resultStat ? `\n<code>${escapeHtml(seg.resultStat)}</code>` : '';
+        return `<blockquote>${emoji} ${seg.elapsed ?? '?'} · ✔${inputPart}${resultLine}</blockquote>`;
       } else if (seg.status === 'error') {
-        const previewPart = seg.inputPreview ? ` · <code>${escapeHtml(seg.inputPreview)}</code>` : '';
-        return `<blockquote>❌ ${escapeHtml(seg.toolName)} (${seg.elapsed ?? '?'})${previewPart}</blockquote>`;
+        return `<blockquote>${emoji} ${seg.elapsed ?? '?'} · ✘${inputPart}</blockquote>`;
       } else {
-        const previewPart = seg.inputPreview ? ` · <code>${escapeHtml(seg.inputPreview)}</code>` : '…';
-        return `<blockquote>⚡ ${escapeHtml(seg.toolName)}${previewPart}</blockquote>`;
+        return `<blockquote>${emoji}${inputPart || ' …'}</blockquote>`;
       }
     }
 
