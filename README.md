@@ -96,6 +96,68 @@ CC processes can communicate back to the orchestrator via built-in MCP tools:
 See [`docs/SPEC-SUPERVISOR-PROTOCOL.md`](docs/SPEC-SUPERVISOR-PROTOCOL.md) for the full protocol spec.
 See [`docs/SPEC-SUBAGENT-OBSERVABILITY.md`](docs/SPEC-SUBAGENT-OBSERVABILITY.md) for the observability spec.
 
+
+## OpenClaw Plugin
+
+TGCC ships an **OpenClaw community plugin** that gives your OpenClaw agents direct access to TGCC-managed Claude Code sessions.
+
+### Install
+
+```bash
+openclaw plugins install @fonz/tgcc
+```
+
+### Configure
+
+Add to your OpenClaw config (`~/.openclaw/openclaw.json`):
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "tgcc": {
+        "enabled": true,
+        "config": {
+          "socketDir": "/tmp/tgcc/ctl",
+          "defaultAgent": "tgcc",
+          "telegramChatId": "your-chat-id"
+        }
+      }
+    }
+  }
+}
+```
+
+### Tools
+
+The plugin registers four agent tools:
+
+| Tool | Description |
+|------|-------------|
+| `tgcc_status` | List agents, check state, view pending results and events |
+| `tgcc_spawn` | Start a CC session (existing or ephemeral agent) |
+| `tgcc_send` | Send a message to an active agent |
+| `tgcc_kill` | Kill a CC process or destroy an ephemeral agent |
+
+### Example
+
+```
+# From your OpenClaw agent:
+tgcc_spawn agentId="tgcc" task="Fix the render pipeline"
+tgcc_status                    # check progress
+tgcc_send agentId="tgcc" text="Also run the tests"
+tgcc_kill agentId="tgcc"      # done
+```
+
+Ephemeral agents for isolated work:
+
+```
+tgcc_spawn agentId="pr-42" repo="/tmp/pr-42" task="Review this PR" model="opus"
+tgcc_kill agentId="pr-42" destroy=true
+```
+
+The plugin also ships a **skill** (`tgcc-agents`) that teaches OpenClaw agents how to use these tools effectively.
+
 ## Service Management
 
 ```bash
