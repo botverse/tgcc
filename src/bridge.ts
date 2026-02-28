@@ -706,6 +706,10 @@ export class Bridge extends EventEmitter implements CtlHandler {
       if (agent.subAgentTracker) {
         agent.subAgentTracker.handleTaskStarted(event.tool_use_id, event.description, event.task_type);
       }
+      // Update the in-turn sub-agent segment in the main bubble
+      if (agent.accumulator && event.tool_use_id) {
+        agent.accumulator.updateSubAgentSegment(event.tool_use_id, 'dispatched', event.description);
+      }
     });
 
     proc.on('task_progress', (event: TaskProgressEvent) => {
@@ -717,6 +721,10 @@ export class Bridge extends EventEmitter implements CtlHandler {
     proc.on('task_completed', (event: TaskCompletedEvent) => {
       if (agent.subAgentTracker) {
         agent.subAgentTracker.handleTaskCompleted(event.tool_use_id);
+      }
+      // Update the in-turn sub-agent segment in the main bubble
+      if (agent.accumulator && event.tool_use_id) {
+        agent.accumulator.updateSubAgentSegment(event.tool_use_id, 'completed');
       }
     });
 
@@ -1028,6 +1036,8 @@ export class Bridge extends EventEmitter implements CtlHandler {
       this.logger.info({ agentId }, 'Turn ended with background sub-agents still running');
       const ccProcess = agent.ccProcess;
       if (ccProcess) ccProcess.clearIdleTimer();
+      // Create standalone post-turn status bubble (main bubble is now sealed)
+      tracker.startPostTurnTracking().catch(err => this.logger.error({ err, agentId }, 'Failed to start post-turn tracking'));
       // Start mailbox watcher (works for general-purpose agents that have SendMessage)
       tracker.startMailboxWatch();
       // Fallback: send ONE follow-up after 60s if mailbox hasn't resolved all agents
