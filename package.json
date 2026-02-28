@@ -1,7 +1,7 @@
 {
   "name": "@fonz/tgcc",
-  "version": "0.6.19",
-  "description": "Telegram \u2194 Claude Code CLI bridge",
+  "version": "0.7.0",
+  "description": "Telegram ↔ Claude Code CLI bridge",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
