@@ -39,43 +39,51 @@ describe('isSubAgentTool', () => {
 });
 
 describe('extractAgentLabel', () => {
+  // extractAgentLabel now returns { label, field } — use .label for the string
+
   it('extracts from explicit name field (highest priority)', () => {
-    expect(extractAgentLabel('{"name": "spec-reviewer", "prompt": "Review the spec"}')).toBe('spec-reviewer');
+    expect(extractAgentLabel('{"name": "spec-reviewer", "prompt": "Review the spec"}').label).toBe('spec-reviewer');
   });
 
   it('extracts from description field', () => {
-    expect(extractAgentLabel('{"description": "Review code quality", "prompt": "Check..."}')).toBe('Review code quality');
+    expect(extractAgentLabel('{"description": "Review code quality", "prompt": "Check..."}').label).toBe('Review code quality');
   });
 
   it('extracts from subagent_type field', () => {
-    expect(extractAgentLabel('{"subagent_type": "code-reviewer", "prompt": "Review code"}')).toBe('code-reviewer');
+    expect(extractAgentLabel('{"subagent_type": "code-reviewer", "prompt": "Review code"}').label).toBe('code-reviewer');
   });
 
   it('extracts from team_name field', () => {
-    expect(extractAgentLabel('{"team_name": "review-team", "prompt": "Review all the things"}')).toBe('review-team');
+    expect(extractAgentLabel('{"team_name": "review-team", "prompt": "Review all the things"}').label).toBe('review-team');
   });
 
   it('falls back to first line of prompt', () => {
-    const label = extractAgentLabel('{"prompt": "Analyze the authentication middleware for vulnerabilities in the codebase"}');
-    expect(label).toBe('Analyze the authentication middleware for vulnerabilities in…');
+    const result = extractAgentLabel('{"prompt": "Analyze the authentication middleware for vulnerabilities in the codebase"}');
+    expect(result.label).toBe('Analyze the authentication middleware for vulnerabilities in…');
   });
 
   it('handles partial JSON during streaming (name field complete)', () => {
-    expect(extractAgentLabel('{"name": "spec-reviewer", "prompt": "You are')).toBe('spec-reviewer');
+    expect(extractAgentLabel('{"name": "spec-reviewer", "prompt": "You are').label).toBe('spec-reviewer');
   });
 
   it('handles partial JSON during streaming (description field)', () => {
-    expect(extractAgentLabel('{"description": "Verify weights", "prompt": "incomplete')).toBe('Verify weights');
+    expect(extractAgentLabel('{"description": "Verify weights", "prompt": "incomplete').label).toBe('Verify weights');
   });
 
-  it('returns empty for no parseable content', () => {
-    expect(extractAgentLabel('')).toBe('');
-    expect(extractAgentLabel('{}')).toBe('');
+  it('returns empty label for no parseable content', () => {
+    expect(extractAgentLabel('').label).toBe('');
+    expect(extractAgentLabel('{}').label).toBe('');
   });
 
   it('prioritizes name over description over subagent_type', () => {
-    expect(extractAgentLabel('{"name": "alice", "description": "helper", "subagent_type": "reviewer"}')).toBe('alice');
-    expect(extractAgentLabel('{"description": "helper", "subagent_type": "reviewer"}')).toBe('helper');
+    expect(extractAgentLabel('{"name": "alice", "description": "helper", "subagent_type": "reviewer"}').label).toBe('alice');
+    expect(extractAgentLabel('{"description": "helper", "subagent_type": "reviewer"}').label).toBe('helper');
+  });
+
+  it('returns the correct field name', () => {
+    expect(extractAgentLabel('{"name": "alice"}').field).toBe('name');
+    expect(extractAgentLabel('{"description": "helper"}').field).toBe('description');
+    expect(extractAgentLabel('{}').field).toBeNull();
   });
 });
 
@@ -97,16 +105,20 @@ describe('SubAgentTracker', () => {
     vi.useRealTimers();
   });
 
-  it('sends standalone message when sub-agent tool is detected (no reply_to)', async () => {
+  it('does NOT send TG messages during turn — StreamAccumulator handles in-turn rendering', async () => {
+    // During a turn (inTurn = true), SubAgentTracker only tracks agent metadata.
+    // StreamAccumulator renders sub-agent segments inline in the main bubble.
     await tracker.handleEvent({
       type: 'content_block_start',
       index: 0,
       content_block: { type: 'tool_use', id: 'toolu_1', name: 'dispatch_agent', input: {} },
     } as StreamInnerEvent);
 
-    expect(sender.sends).toHaveLength(1);
-    expect(sender.sends[0].text).toContain('🤖');
-    expect(sender.sends[0].text).toContain('Starting sub-agent');
+    // No TG messages sent during turn — tracker just registers the agent
+    expect(sender.sends).toHaveLength(0);
+    expect(tracker.activeAgents).toHaveLength(1);
+    expect(tracker.activeAgents[0].status).toBe('running');
+    expect(tracker.hadSubAgents).toBe(true);
   });
 
   it('does NOT send message for normal tools', async () => {
@@ -119,7 +131,7 @@ describe('SubAgentTracker', () => {
     expect(sender.sends).toHaveLength(0);
   });
 
-  it('marks dispatched on content_block_stop with "Working…" format', async () => {
+  it('marks agent as dispatched on content_block_stop (no TG edits during turn)', async () => {
     await tracker.handleEvent({
       type: 'content_block_start',
       index: 0,
@@ -131,25 +143,22 @@ describe('SubAgentTracker', () => {
       index: 0,
     } as StreamInnerEvent);
 
-    // Should show 🤖 dispatched with "— Working…"
-    expect(sender.edits).toHaveLength(1);
-    expect(sender.edits[0].text).toContain('🤖');
-    expect(sender.edits[0].text).toContain('— Working…');
-    expect(sender.edits[0].text).not.toContain('✅');
+    // No TG messages or edits during turn
+    expect(sender.sends).toHaveLength(0);
+    expect(sender.edits).toHaveLength(0);
 
     // Status should be dispatched
     const agents = tracker.activeAgents;
     expect(agents[0].status).toBe('dispatched');
   });
 
-  it('shows collapsible blockquote on handleToolResult', async () => {
+  it('marks agent completed on handleToolResult without spawn confirmation', async () => {
     await tracker.handleEvent({
       type: 'content_block_start',
       index: 0,
       content_block: { type: 'tool_use', id: 'toolu_1', name: 'dispatch_agent', input: {} },
     } as StreamInnerEvent);
 
-    // Feed some input to set a label
     await tracker.handleEvent({
       type: 'content_block_delta',
       index: 0,
@@ -161,40 +170,37 @@ describe('SubAgentTracker', () => {
       index: 0,
     } as StreamInnerEvent);
 
-    // Now simulate tool_result
+    // Tool result without spawn confirmation → synchronous completion
     await tracker.handleToolResult('toolu_1', 'Found 3 discrepancies in weight calculations.');
 
-    const lastEdit = sender.edits[sender.edits.length - 1];
-    // Should use expandable blockquote format
-    expect(lastEdit.text).toContain('<blockquote expandable>');
-    expect(lastEdit.text).toContain('✅ spec-reviewer');
-    expect(lastEdit.text).toContain('Found 3 discrepancies');
-    expect(lastEdit.text).toContain('</blockquote>');
-
+    // No TG edits during turn
+    expect(sender.edits).toHaveLength(0);
+    // Agent is now completed
     expect(tracker.activeAgents[0].status).toBe('completed');
   });
 
-  it('updates message once label is extracted from input_json_delta', async () => {
+  it('extracts label from input_json_delta (no TG messages during turn)', async () => {
     await tracker.handleEvent({
       type: 'content_block_start',
       index: 0,
       content_block: { type: 'tool_use', id: 'toolu_1', name: 'Task', input: {} },
     } as StreamInnerEvent);
 
-    // Send input with extractable label
     await tracker.handleEvent({
       type: 'content_block_delta',
       index: 0,
       delta: { type: 'input_json_delta', partial_json: '{"name": "code-reviewer", "prompt": "Review the code"}' },
     } as StreamInnerEvent);
 
-    // Should have edited to show label with "Working…" format
-    const labelEdits = sender.edits.filter(e => e.text.includes('code-reviewer'));
-    expect(labelEdits.length).toBeGreaterThanOrEqual(1);
-    expect(labelEdits[0].text).toContain('🤖 code-reviewer — Working…');
+    // No TG edits during turn
+    expect(sender.edits).toHaveLength(0);
+    // Label is extracted into tracker metadata
+    const agent = tracker.activeAgents[0];
+    expect(agent.label).toBe('code-reviewer');
+    expect(agent.agentName).toBe('code-reviewer');
   });
 
-  it('handles multiple concurrent sub-agents', async () => {
+  it('handles multiple concurrent sub-agents (tracking only, no TG messages during turn)', async () => {
     await tracker.handleEvent({
       type: 'content_block_start',
       index: 0,
@@ -207,8 +213,11 @@ describe('SubAgentTracker', () => {
       content_block: { type: 'tool_use', id: 'toolu_2', name: 'Task', input: {} },
     } as StreamInnerEvent);
 
-    expect(sender.sends).toHaveLength(2);
+    // No TG messages during turn
+    expect(sender.sends).toHaveLength(0);
+    // Both agents are tracked
     expect(tracker.activeAgents).toHaveLength(2);
+    expect(tracker.hadSubAgents).toBe(true);
   });
 
   it('tracks hadSubAgents correctly', async () => {
@@ -258,7 +267,7 @@ describe('SubAgentTracker', () => {
     expect(sender.edits).toHaveLength(0);
   });
 
-  it('truncates long tool results in collapsible blockquote', async () => {
+  it('handleToolResult marks agent completed (no TG edits during turn)', async () => {
     await tracker.handleEvent({
       type: 'content_block_start',
       index: 0,
@@ -268,11 +277,10 @@ describe('SubAgentTracker', () => {
     const longResult = 'A'.repeat(4000);
     await tracker.handleToolResult('toolu_1', longResult);
 
-    const lastEdit = sender.edits[sender.edits.length - 1];
-    expect(lastEdit.text).toContain('<blockquote expandable>');
-    expect(lastEdit.text).toContain('…');
-    // Should be truncated to ~3500 chars + markup
-    expect(lastEdit.text.length).toBeLessThan(3700);
+    // No TG edits during turn
+    expect(sender.edits).toHaveLength(0);
+    // Agent is marked completed
+    expect(tracker.activeAgents[0].status).toBe('completed');
   });
 });
 
@@ -391,8 +399,8 @@ describe('SubAgentTracker — mailbox watching', () => {
     expect(matched.label).toBe('spec-reviewer');
   });
 
-  it('processMailbox updates agent TG message with mailbox result', async () => {
-    // Set up a dispatched agent
+  it('processMailbox marks agent completed and reacts on standalone bubble', async () => {
+    // Set up a dispatched agent during a turn
     await tracker.handleEvent({
       type: 'content_block_start',
       index: 0,
@@ -410,6 +418,12 @@ describe('SubAgentTracker — mailbox watching', () => {
       index: 0,
     } as StreamInnerEvent);
 
+    // Simulate post-turn: create standalone bubble
+    tracker.setTeamName('test-team');
+    (tracker as any).mailboxPath = path.join(tmpDir, 'team-lead.json');
+    await tracker.startPostTurnTracking();
+    expect(sender.sends).toHaveLength(1);  // standalone bubble created
+
     // Write mailbox file
     const mailboxFile = path.join(tmpDir, 'team-lead.json');
     const messages: MailboxMessage[] = [
@@ -424,21 +438,16 @@ describe('SubAgentTracker — mailbox watching', () => {
     ];
     fs.writeFileSync(mailboxFile, JSON.stringify(messages));
 
-    // Set up mailbox path and process
-    tracker.setTeamName('test-team');
-    (tracker as any).mailboxPath = mailboxFile;
     (tracker as any).lastMailboxCount = 0;
     (tracker as any).processMailbox();
 
     // Wait for async queue to flush
     await (tracker as any).sendQueue;
 
-    // Check: agent should be completed and TG message edited with blockquote
-    const agents = tracker.activeAgents;
-    expect(agents[0].status).toBe('completed');
-
-    // Agent should be completed — reaction sent instead of edit
-    expect(sender.setReaction).toHaveBeenCalled();
+    // Agent should be completed
+    expect(tracker.activeAgents[0].status).toBe('completed');
+    // Reaction set on standalone bubble
+    expect(sender.setReaction).toHaveBeenCalledWith(expect.anything(), sender.sends[0].messageId, '👍');
   });
 
   it('processMailbox calls onAllReported when all agents complete', async () => {
@@ -555,7 +564,7 @@ describe('SubAgentTracker — mailbox watching', () => {
     expect(tracker.activeAgents[0].status).toBe('dispatched');
   });
 
-  it('processMailbox truncates long text', async () => {
+  it('processMailbox completes agent and edits standalone bubble', async () => {
     await tracker.handleEvent({
       type: 'content_block_start',
       index: 0,
@@ -568,26 +577,30 @@ describe('SubAgentTracker — mailbox watching', () => {
     } as StreamInnerEvent);
     await tracker.handleEvent({ type: 'content_block_stop', index: 0 } as StreamInnerEvent);
 
-    const longText = 'X'.repeat(2000);
+    // Set up post-turn standalone bubble
+    tracker.setTeamName('test-team');
+    (tracker as any).mailboxPath = path.join(tmpDir, 'team-lead.json');
+    await tracker.startPostTurnTracking();
+    expect(sender.sends).toHaveLength(1);
+
     const mailboxFile = path.join(tmpDir, 'team-lead.json');
     fs.writeFileSync(mailboxFile, JSON.stringify([
-      { from: 'spec-reviewer', text: longText, summary: 'Done', timestamp: new Date().toISOString(), color: 'green', read: false },
+      { from: 'spec-reviewer', text: 'Done!', summary: 'Done', timestamp: new Date().toISOString(), color: 'green', read: false },
     ]));
 
-    tracker.setTeamName('test-team');
-    (tracker as any).mailboxPath = mailboxFile;
     (tracker as any).lastMailboxCount = 0;
     (tracker as any).processMailbox();
 
     await (tracker as any).sendQueue;
 
+    // Agent is completed
+    expect(tracker.activeAgents[0].status).toBe('completed');
+    // Standalone bubble edited with "✅ Done"
     const lastEdit = sender.edits[sender.edits.length - 1];
-    expect(lastEdit.text).toContain('…');
-    // Should be truncated - text portion should be ~1024 + markup
-    expect(lastEdit.text.length).toBeLessThan(1300);
+    expect(lastEdit.text).toContain('✅ Done');
   });
 
-  it('uses color emoji from mailbox message', async () => {
+  it('uses color emoji from mailbox message on standalone bubble', async () => {
     await tracker.handleEvent({
       type: 'content_block_start',
       index: 0,
@@ -599,28 +612,32 @@ describe('SubAgentTracker — mailbox watching', () => {
       delta: { type: 'input_json_delta', partial_json: '{"name": "spec-reviewer"}' },
     } as StreamInnerEvent);
     await tracker.handleEvent({ type: 'content_block_stop', index: 0 } as StreamInnerEvent);
+
+    // Set up post-turn standalone bubble
+    tracker.setTeamName('test-team');
+    (tracker as any).mailboxPath = path.join(tmpDir, 'team-lead.json');
+    await tracker.startPostTurnTracking();
+    const standaloneId = sender.sends[0].messageId;
 
     const mailboxFile = path.join(tmpDir, 'team-lead.json');
     fs.writeFileSync(mailboxFile, JSON.stringify([
       { from: 'spec-reviewer', text: 'Failed!', summary: 'Errors found', timestamp: new Date().toISOString(), color: 'red', read: false },
     ]));
 
-    tracker.setTeamName('test-team');
-    (tracker as any).mailboxPath = mailboxFile;
     (tracker as any).lastMailboxCount = 0;
     (tracker as any).processMailbox();
 
     await (tracker as any).sendQueue;
 
-    // Red color → 👎 reaction
+    // Red color → 👎 reaction on standalone bubble
     expect(sender.setReaction).toHaveBeenCalledWith(
-      expect.anything(), expect.anything(), '👎'
+      expect.anything(), standaloneId, '👎'
     );
   });
 });
 
 describe('markdownToHtml — table conversion', () => {
-  it('converts a simple table to list format', () => {
+  it('converts a simple table to codeBlock format (default mode)', () => {
     const md = `Some text
 
 | Agent | Task |
@@ -631,20 +648,23 @@ describe('markdownToHtml — table conversion', () => {
 More text`;
 
     const html = markdownToHtml(md);
-    expect(html).toContain('<b>spec-reviewer</b> — Verifying weights...');
-    expect(html).toContain('<b>hci-reviewer</b> — Verifying sensitivity...');
-    expect(html).not.toContain('|---|');
+    // Default mode is 'codeBlock' — wraps in <pre><code>
+    expect(html).toContain('<pre><code>');
+    expect(html).toContain('spec-reviewer');
+    expect(html).toContain('hci-reviewer');
+    expect(html).not.toContain('|---|');  // separator not in output
   });
 
-  it('converts a three-column table', () => {
+  it('converts a three-column table to codeBlock format', () => {
     const md = `| Name | Status | Notes |
 |---|---|---|
 | Alice | Active | Doing well |
 | Bob | Idle | On break |`;
 
     const html = markdownToHtml(md);
-    expect(html).toContain('<b>Alice</b> — Active — Doing well');
-    expect(html).toContain('<b>Bob</b> — Idle — On break');
+    expect(html).toContain('<pre><code>');
+    expect(html).toContain('Alice');
+    expect(html).toContain('Bob');
   });
 
   it('leaves non-table pipe characters alone', () => {

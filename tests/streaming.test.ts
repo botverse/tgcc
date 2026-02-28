@@ -32,7 +32,8 @@ describe('markdownToHtml', () => {
   it('converts code blocks with language', () => {
     const result = markdownToHtml('```python\nprint("hi")\n```');
     expect(result).toContain('<pre><code class="language-python">');
-    expect(result).toContain('print("hi")');
+    // Telegram HTML requires entities inside pre/code
+    expect(result).toContain('print(&quot;hi&quot;)');
   });
 
   it('converts inline code', () => {
@@ -57,9 +58,13 @@ describe('markdownToHtml', () => {
     expect(result).toContain('<a href="https://google.com">Google</a>');
   });
 
-  it('escapes HTML in non-code text', () => {
+  it('drops raw HTML tags in non-code text', () => {
+    // Remark treats <div> as an inline HTML node, which has no TG representation.
+    // The surrounding text is preserved, the raw tag is dropped.
     const result = markdownToHtml('use <div> tag');
-    expect(result).toContain('&lt;div&gt;');
+    expect(result).not.toContain('<div>');
+    expect(result).toContain('use');
+    expect(result).toContain('tag');
   });
 
   it('handles empty string', () => {
@@ -117,7 +122,7 @@ describe('StreamAccumulator', () => {
     } as StreamInnerEvent);
 
     expect(sender.sentMessages).toHaveLength(1);
-    expect(sender.sentMessages[0].text).toContain('💭 Processing...');
+    expect(sender.sentMessages[0].text).toContain('💭 Processing…');
     expect(sender.sentMessages[0].text).toContain('blockquote');
   });
 
@@ -218,7 +223,7 @@ describe('StreamAccumulator', () => {
 
     // Thinking indicator should show but not the thinking content yet (no text block yet)
     expect(sender.sentMessages).toHaveLength(1);
-    expect(sender.sentMessages[0].text).toContain('💭 Processing...');
+    expect(sender.sentMessages[0].text).toContain('💭 Processing…');
 
     // End thinking block, start text block
     await acc.handleEvent({ type: 'content_block_stop', index: 0 } as StreamInnerEvent);
@@ -318,8 +323,8 @@ describe('StreamAccumulator', () => {
     expect(editCount).toBeGreaterThanOrEqual(1);
   });
 
-  it('softReset keeps tgMessageId for multi-turn editing', async () => {
-    // First turn: send a message
+  it('bridge calls acc.reset() on message_start — new TG message each API call', async () => {
+    // First API call: send a message
     await acc.handleEvent({
       type: 'content_block_start',
       index: 0,
@@ -333,12 +338,10 @@ describe('StreamAccumulator', () => {
     } as StreamInnerEvent);
 
     await acc.finalize();
-
     expect(sender.sentMessages).toHaveLength(1);
-    const firstMsgId = sender.sentMessages[0].messageId;
 
-    // Simulate new turn: message_start triggers softReset
-    await acc.handleEvent({ type: 'message_start' } as StreamInnerEvent);
+    // Bridge calls acc.reset() on message_start (not softReset)
+    acc.reset();
 
     await acc.handleEvent({
       type: 'content_block_start',
@@ -352,13 +355,9 @@ describe('StreamAccumulator', () => {
       delta: { type: 'text_delta', text: 'Turn 2' },
     } as StreamInnerEvent);
 
-    // Should NOT have sent a new message — should have edited the existing one
-    expect(sender.sentMessages).toHaveLength(1);
-    expect(sender.editedMessages.length).toBeGreaterThanOrEqual(1);
-    // The edit should target the same message ID
-    const lastEdit = sender.editedMessages[sender.editedMessages.length - 1];
-    expect(lastEdit.messageId).toBe(firstMsgId);
-    expect(lastEdit.text).toContain('Turn 2');
+    // Full reset clears tgMessageId → new message on second API call
+    expect(sender.sentMessages).toHaveLength(2);
+    expect(sender.sentMessages[1].text).toContain('Turn 2');
   });
 
   it('full reset clears tgMessageId (new message on next send)', async () => {

@@ -149,3 +149,23 @@ This bubble gets edited as status changes (progress events, elapsed time). When 
 
 ### Key rule
 **A finalized bubble is never edited again.** Once `result` fires and usage footer is appended, that bubble is sealed. All subsequent updates (sub-agent status, mailbox results) go to a new bubble.
+
+## Sub-Agent Progress in Bubble
+
+While a sub-agent is running, high-signal events should update the sub-agent segment inline:
+
+```
+<blockquote>🤖 bugfixer — Working (2m 15s)
+📋 [2/4] Rewire bridge.ts ✅
+🔨 Build passed ✅</blockquote>
+```
+
+Events to show (from `task_progress` and high-signal events):
+- 📋 Plan step progress
+- 🔨 Build results
+- 🧠 Context % warnings
+- 📝 Commit messages
+
+Keep last 3-5 lines to avoid the blockquote growing too large. Older lines drop off.
+
+This applies to BOTH the in-turn bubble (while CC is still responding) and the post-turn standalone bubble.

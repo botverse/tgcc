@@ -90,7 +90,7 @@ type InternalSegment =
   | { type: 'thinking'; content: string; rawText: string }
   | { type: 'text'; content: string; rawText: string }
   | { type: 'tool'; id: string; content: string; toolName: string; status: 'pending' | 'resolved' | 'error'; inputPreview?: string; elapsed?: string; resultStat?: string; startTime: number }
-  | { type: 'subagent'; id: string; content: string; toolName: string; label: string; status: 'running' | 'dispatched' | 'completed'; inputPreview?: string; startTime: number }
+  | { type: 'subagent'; id: string; content: string; toolName: string; label: string; status: 'running' | 'dispatched' | 'completed'; inputPreview?: string; startTime: number; progressLines: string[] }
   | { type: 'supervisor'; content: string }
   | { type: 'usage'; content: string }
   | { type: 'image'; content: string };  // image block placeholder (no visible segment)
@@ -118,13 +118,14 @@ function renderSegment(seg: InternalSegment): string {
 
     case 'subagent': {
       const label = seg.label || seg.toolName;
+      const elapsed = formatElapsed(Date.now() - seg.startTime);
+      const progressBlock = seg.progressLines.length > 0
+        ? '\n' + seg.progressLines.join('\n')
+        : '';
       if (seg.status === 'completed') {
-        return `<blockquote>🤖 ${escapeHtml(label)} — ✅ Done</blockquote>`;
-      } else if (seg.status === 'dispatched') {
-        return `<blockquote>🤖 ${escapeHtml(label)} — Waiting for results…</blockquote>`;
+        return `<blockquote>🤖 ${escapeHtml(label)} — ✅ Done (${elapsed})${progressBlock}</blockquote>`;
       } else {
-        const previewPart = seg.inputPreview ? `: ${escapeHtml(seg.inputPreview.slice(0, 80))}` : '';
-        return `<blockquote>🤖 ${escapeHtml(label)} — Working…${previewPart}</blockquote>`;
+        return `<blockquote>🤖 ${escapeHtml(label)} — Working (${elapsed})…${progressBlock}</blockquote>`;
       }
     }
 
@@ -273,6 +274,7 @@ export class StreamAccumulator {
           label: '',
           status: 'running',
           startTime: Date.now(),
+          progressLines: [],
           content: '',
         };
         seg.content = renderSegment(seg);
@@ -458,6 +460,18 @@ export class StreamAccumulator {
     if (seg.status === 'completed') return;  // don't downgrade
     seg.status = status;
     if (label && label.length > seg.label.length) seg.label = label;
+    seg.content = renderSegment(seg);
+    void this.throttledRender();
+  }
+
+  /** Append a high-signal progress line to a sub-agent segment (called by bridge on task_progress). */
+  appendSubAgentProgress(blockId: string, description: string, lastToolName?: string): void {
+    const seg = this.segments.find(s => s.type === 'subagent' && (s as any).id === blockId) as Extract<InternalSegment, { type: 'subagent' }> | undefined;
+    if (!seg || seg.status === 'completed') return;
+    const line = formatProgressLine(description, lastToolName);
+    if (!line) return;
+    seg.progressLines.push(line);
+    if (seg.progressLines.length > MAX_PROGRESS_LINES) seg.progressLines.shift();
     seg.content = renderSegment(seg);
     void this.throttledRender();
   }
@@ -851,6 +865,37 @@ function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+function formatElapsed(ms: number): string {
+  const s = Math.floor(ms / 1000);
+  const m = Math.floor(s / 60);
+  if (m > 0) return `${m}m ${s % 60}s`;
+  return `${s}s`;
+}
+
+const MAX_PROGRESS_LINES = 5;
+
+/** Format a task_progress event into a single HTML-safe progress line.
+ *  Returns null if the event has no useful display content. */
+export function formatProgressLine(description: string, lastToolName?: string): string | null {
+  const desc = description?.trim();
+  if (!desc) return null;
+
+  const lower = desc.toLowerCase();
+  const tool = lastToolName?.toLowerCase() ?? '';
+
+  let emoji = '📋';
+  if (tool === 'bash' && /build|compile|npm run|pnpm|yarn|make/.test(lower)) {
+    emoji = '🔨';
+  } else if (tool === 'bash' && /git commit|git push/.test(lower)) {
+    emoji = '📝';
+  } else if (/context.*%|%.*context|\d{2,3}%/.test(lower)) {
+    emoji = '🧠';
+  }
+
+  const truncated = desc.length > 60 ? desc.slice(0, 60) + '…' : desc;
+  return `${emoji} ${escapeHtml(truncated)}`;
+}
+
 function formatTokens(n: number): string {
   if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
   return String(n);
@@ -980,7 +1025,9 @@ export interface SubAgentInfo {
   labelField: string | null;
   agentName: string;
   inputPreview: string;
+  startTime: number;
   dispatchedAt: number | null;
+  progressLines: string[];
 }
 
 export interface SubAgentSender {
@@ -1149,7 +1196,9 @@ export class SubAgentTracker {
       labelField: null,
       agentName: '',
       inputPreview: '',
+      startTime: Date.now(),
       dispatchedAt: null,
+      progressLines: [],
     };
 
     this.agents.set(block.id, info);
@@ -1331,9 +1380,14 @@ export class SubAgentTracker {
     if (!this.inTurn) this.updateStandaloneMessage();
   }
 
-  handleTaskProgress(toolUseId: string, _description: string, _lastToolName?: string): void {
+  handleTaskProgress(toolUseId: string, description: string, lastToolName?: string): void {
     const info = this.agents.get(toolUseId);
     if (!info || info.status === 'completed') return;
+    const line = formatProgressLine(description, lastToolName);
+    if (line) {
+      info.progressLines.push(line);
+      if (info.progressLines.length > MAX_PROGRESS_LINES) info.progressLines.shift();
+    }
     if (!this.inTurn) this.updateStandaloneMessage();
   }
 
@@ -1353,15 +1407,22 @@ export class SubAgentTracker {
 
   /** Build the standalone status bubble HTML. */
   private buildStandaloneHtml(): string {
-    const lines: string[] = [];
+    const entries: string[] = [];
     for (const info of this.agents.values()) {
       const label = info.label || info.agentName || info.toolName;
-      const status = info.status === 'completed' ? '✅ Done'
-        : info.status === 'dispatched' ? 'Waiting for results…'
-        : 'Working…';
-      lines.push(`🤖 ${escapeHtml(label)} — ${status}`);
+      const elapsed = formatElapsed(Date.now() - info.startTime);
+      let statusLine: string;
+      if (info.status === 'completed') {
+        statusLine = `🤖 ${escapeHtml(label)} — ✅ Done (${elapsed})`;
+      } else {
+        statusLine = `🤖 ${escapeHtml(label)} — Working (${elapsed})…`;
+      }
+      const progressBlock = info.progressLines.length > 0
+        ? '\n' + info.progressLines.join('\n')
+        : '';
+      entries.push(statusLine + progressBlock);
     }
-    return `<blockquote>${lines.join('\n')}</blockquote>`;
+    return `<blockquote>${entries.join('\n\n')}</blockquote>`;
   }
 
   /** Edit the standalone status bubble with current state. */

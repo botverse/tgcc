@@ -716,6 +716,10 @@ export class Bridge extends EventEmitter implements CtlHandler {
       if (agent.subAgentTracker) {
         agent.subAgentTracker.handleTaskProgress(event.tool_use_id, event.description, event.last_tool_name);
       }
+      // Update the in-turn sub-agent segment in the main bubble with progress
+      if (agent.accumulator && event.tool_use_id) {
+        agent.accumulator.appendSubAgentProgress(event.tool_use_id, event.description, event.last_tool_name);
+      }
     });
 
     proc.on('task_completed', (event: TaskCompletedEvent) => {
@@ -1959,12 +1963,18 @@ export class Bridge extends EventEmitter implements CtlHandler {
         // Auto-subscribe supervisor
         this.supervisorSubscriptions.add(`${agentId}:*`);
 
-        // For persistent agents: send TG system message BEFORE spawning CC
-        const tgChatId = this.getAgentChatId(agent);
-        if (tgChatId && agent.tgBot) {
-          const preview = text.length > 500 ? text.slice(0, 500) + '…' : text;
-          agent.tgBot.sendText(tgChatId, `<blockquote>🦞 ${escapeHtml(preview)}</blockquote>`, 'HTML', true) // silent
-            .catch(err => this.logger.error({ err, agentId }, 'Failed to send supervisor TG notification'));
+        // For persistent agents: route supervisor message through the accumulator so it
+        // appears inline in the current bubble. Fall back to a standalone silent message
+        // if no accumulator is active (e.g. agent is idle before first CC turn).
+        if (agent.accumulator) {
+          agent.accumulator.addSupervisorMessage(text);
+        } else {
+          const tgChatId = this.getAgentChatId(agent);
+          if (tgChatId && agent.tgBot) {
+            const preview = text.length > 500 ? text.slice(0, 500) + '…' : text;
+            agent.tgBot.sendText(tgChatId, `<blockquote>🦞 ${escapeHtml(preview)}</blockquote>`, 'HTML', true) // silent
+              .catch(err => this.logger.error({ err, agentId }, 'Failed to send supervisor TG notification'));
+          }
         }
 
         // Send to agent's single CC process
