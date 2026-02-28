@@ -5,21 +5,28 @@
  * Subscribes to the agent's events so results flow back through the plugin.
  */
 
-import { Type, type Static } from "@sinclair/typebox";
 import type { AnyAgentTool } from "openclaw/plugin-sdk";
 import type { TgccSupervisorClient } from "../client.js";
 
-const TgccSpawnParams = Type.Object({
-  agentId: Type.String({ description: "TGCC agent ID to send the task to" }),
-  task: Type.String({ description: "Task description / prompt for Claude Code" }),
-  repo: Type.Optional(Type.String({ description: "Repository path (for ephemeral agents)" })),
-  model: Type.Optional(Type.String({ description: "Model override (e.g. 'opus', 'sonnet')" })),
-  permissionMode: Type.Optional(
-    Type.String({ description: "CC permission mode (e.g. 'plan', 'default')" }),
-  ),
-});
+const TgccSpawnParams = {
+  type: "object",
+  properties: {
+    agentId: { type: "string", description: "TGCC agent ID to send the task to" },
+    task: { type: "string", description: "Task description / prompt for Claude Code" },
+    repo: { type: "string", description: "Repository path (for ephemeral agents)" },
+    model: { type: "string", description: "Model override (e.g. 'opus', 'sonnet')" },
+    permissionMode: { type: "string", description: "CC permission mode (e.g. 'plan', 'default')" },
+  },
+  required: ["agentId", "task"],
+} as const;
 
-type SpawnParams = Static<typeof TgccSpawnParams>;
+interface SpawnParams {
+  agentId: string;
+  task: string;
+  repo?: string;
+  model?: string;
+  permissionMode?: string;
+}
 
 const json = (payload: unknown) => ({
   content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }],
@@ -37,7 +44,7 @@ export function createTgccSpawnTool(
       "Spawn a Claude Code session via TGCC. Sends a task to a TGCC agent which runs " +
       "Claude Code in a managed process. Returns the session ID for tracking. " +
       "Use tgcc_status to check progress and get results.",
-    parameters: TgccSpawnParams,
+    parameters: TgccSpawnParams as Record<string, unknown>,
     async execute(_toolCallId: string, params: Record<string, unknown>) {
       const p = params as unknown as SpawnParams;
       const client = getClient();

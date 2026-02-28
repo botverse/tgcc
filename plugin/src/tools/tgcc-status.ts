@@ -5,7 +5,6 @@
  * and recent observability events.
  */
 
-import { Type, type Static } from "@sinclair/typebox";
 import type { AnyAgentTool } from "openclaw/plugin-sdk";
 import type { TgccSupervisorClient } from "../client.js";
 import {
@@ -16,19 +15,26 @@ import {
   getRecentEvents,
 } from "../events.js";
 
-const TgccStatusParams = Type.Object({
-  agentId: Type.Optional(Type.String({ description: "Filter by specific agent ID" })),
-  drain: Type.Optional(
-    Type.Boolean({
+const TgccStatusParams = {
+  type: "object",
+  properties: {
+    agentId: { type: "string", description: "Filter by specific agent ID" },
+    drain: {
+      type: "boolean",
       description: "If true, drain pending results (remove after reading). Default: false.",
-    }),
-  ),
-  eventsSince: Type.Optional(
-    Type.Number({ description: "Only return events after this Unix timestamp (ms)" }),
-  ),
-});
+    },
+    eventsSince: {
+      type: "number",
+      description: "Only return events after this Unix timestamp (ms)",
+    },
+  },
+} as const;
 
-type StatusParams = Static<typeof TgccStatusParams>;
+interface StatusParams {
+  agentId?: string;
+  drain?: boolean;
+  eventsSince?: number;
+}
 
 const json = (payload: unknown) => ({
   content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }],
@@ -45,7 +51,7 @@ export function createTgccStatusTool(
       "Get the status of TGCC agents and sessions. Shows agent states, " +
       "pending results from completed CC sessions, pending permission requests, " +
       "and recent observability events. Use drain=true to consume pending results.",
-    parameters: TgccStatusParams,
+    parameters: TgccStatusParams as Record<string, unknown>,
     async execute(_toolCallId: string, params: Record<string, unknown>) {
       const p = params as unknown as StatusParams;
       const client = getClient();

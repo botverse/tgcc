@@ -5,21 +5,27 @@
  * if the agent is idle.
  */
 
-import { Type, type Static } from "@sinclair/typebox";
 import type { AnyAgentTool } from "openclaw/plugin-sdk";
 import type { TgccSupervisorClient } from "../client.js";
 
-const TgccSendParams = Type.Object({
-  agentId: Type.String({ description: "TGCC agent ID to send to" }),
-  text: Type.String({ description: "Message text to send" }),
-  followUp: Type.Optional(
-    Type.Boolean({
+const TgccSendParams = {
+  type: "object",
+  properties: {
+    agentId: { type: "string", description: "TGCC agent ID to send to" },
+    text: { type: "string", description: "Message text to send" },
+    followUp: {
+      type: "boolean",
       description: "If true, send to running CC process (sendToCC). If false or omitted, send as new message (may spawn CC).",
-    }),
-  ),
-});
+    },
+  },
+  required: ["agentId", "text"],
+} as const;
 
-type SendParams = Static<typeof TgccSendParams>;
+interface SendParams {
+  agentId: string;
+  text: string;
+  followUp?: boolean;
+}
 
 const json = (payload: unknown) => ({
   content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }],
@@ -35,7 +41,7 @@ export function createTgccSendTool(
     description:
       "Send a message to a TGCC agent. By default sends a new message (which may spawn " +
       "a CC process if idle). Set followUp=true to send to an already-running CC process.",
-    parameters: TgccSendParams,
+    parameters: TgccSendParams as Record<string, unknown>,
     async execute(_toolCallId: string, params: Record<string, unknown>) {
       const p = params as unknown as SendParams;
       const client = getClient();
