@@ -614,12 +614,15 @@ export class StreamAccumulator {
       }
     }
 
-    if (splitSegIdx <= 0) {
-      // Can't split cleanly — truncate the HTML
+    if (splitSegIdx < 0) {
+      // No segment crossed the threshold — shouldn't happen, but truncate as last resort
       const html = this.renderHtml().slice(0, this.splitThreshold);
       await this._doSendOrEdit(html);
       return;
     }
+
+    // Ensure we always make forward progress: send at least one segment
+    if (splitSegIdx === 0) splitSegIdx = 1;
 
     // Render first part, start new message with remainder
     const firstSegs = this.segments.slice(0, splitSegIdx);

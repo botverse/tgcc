@@ -48,7 +48,7 @@
     }
   },
   "scripts": {
-    "build": "tsc && tsc -p plugin/tsconfig.json",
+    "build": "tsc && tsc -p plugin/tsconfig.json && cp plugin/package.json plugin/openclaw.plugin.json dist/plugin/",
     "dev": "tsx src/service.ts",
     "start": "node dist/service.js",
     "test": "vitest run",
