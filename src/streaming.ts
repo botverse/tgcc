@@ -518,9 +518,13 @@ export class StreamAccumulator {
 
   /** Mark dirty and schedule a throttled flush. The single entry point for all renders.
    *  Data in → dirty flag → throttled flush → TG edit. One path, no re-entrant loops. */
+  private flushInFlight = false;
+
   private requestRender(): void {
     this.dirty = true;
-    if (!this.flushTimer) {
+    // Don't schedule a new flush while one is in-flight (waiting on sendQueue).
+    // The in-flight flush will reschedule after the edit completes.
+    if (!this.flushTimer && !this.flushInFlight) {
       const elapsed = Date.now() - this.lastEditTime;
       const delay = Math.max(0, this.editIntervalMs - elapsed);
       this.flushTimer = setTimeout(() => this.flushRender(), delay);
@@ -547,16 +551,25 @@ export class StreamAccumulator {
     }
 
     this.dirty = false;
+    this.flushInFlight = true;
     const html = this.renderHtml();
+
+    const afterFlush = () => {
+      this.flushInFlight = false;
+      // If new data arrived while we were in-flight, schedule another flush
+      if (this.dirty && !this.sealed) {
+        this.requestRender();
+      }
+    };
 
     if (html.length > this.splitThreshold) {
       this.sendQueue = this.sendQueue
         .then(() => this.splitMessage())
-        .catch(err => { this.logger?.error?.({ err }, 'flushRender splitMessage failed'); });
+        .then(afterFlush, (err) => { afterFlush(); this.logger?.error?.({ err }, 'flushRender splitMessage failed'); });
     } else {
       this.sendQueue = this.sendQueue
         .then(() => this._doSendOrEdit(html || '…'))
-        .catch(err => { this.logger?.error?.({ err }, 'flushRender failed'); });
+        .then(afterFlush, (err) => { afterFlush(); this.logger?.error?.({ err }, 'flushRender failed'); });
     }
   }
 
@@ -742,6 +755,7 @@ export class StreamAccumulator {
     this.imageBase64Buffer = '';
     this.lastEditTime = 0;
     this.dirty = false;
+    this.flushInFlight = false;
     this.sendQueue = prevQueue.catch(() => {});
     this.turnStartTime = Date.now();
     this.firstSendReady = false;
