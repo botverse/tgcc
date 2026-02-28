@@ -155,7 +155,7 @@ export class StreamAccumulator {
   // State
   private tgMessageId: number | null = null;
   private messageIds: number[] = [];
-  private sealed = false;
+  sealed = false;
   private sendQueue: Promise<void> = Promise.resolve();
   private turnUsage: TurnUsage | null = null;
   private _lastMsgStartCtx: { input: number; cacheRead: number; cacheCreation: number } | null = null;

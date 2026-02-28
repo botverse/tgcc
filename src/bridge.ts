@@ -992,11 +992,19 @@ export class Bridge extends EventEmitter implements CtlHandler {
       });
     }
 
-    // On message_start: new CC turn — full reset for text accumulator.
+    // On message_start: only start a new bubble if the previous turn was sealed
+    // (i.e. a result event finalized it). CC sends message_start on every tool-use
+    // loop within the same turn — those must reuse the same bubble via softReset.
     if (event.type === 'message_start') {
-      agent.accumulator?.reset();
-      if (agent.subAgentTracker && !agent.subAgentTracker.hasDispatchedAgents) {
-        agent.subAgentTracker.reset();
+      if (agent.accumulator?.sealed) {
+        // Previous turn is done (result event sealed it) → new bubble
+        agent.accumulator.reset();
+        if (agent.subAgentTracker && !agent.subAgentTracker.hasDispatchedAgents) {
+          agent.subAgentTracker.reset();
+        }
+      } else if (agent.accumulator) {
+        // Mid-turn tool-use loop → keep same bubble, clear transient state
+        agent.accumulator.softReset();
       }
     }
 
