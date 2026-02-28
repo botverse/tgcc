@@ -1973,8 +1973,8 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
         // For persistent agents: route supervisor message through the accumulator so it
         // appears inline in the current bubble. Fall back to a standalone silent message
-        // if no accumulator is active (e.g. agent is idle before first CC turn).
-        if (agent.accumulator) {
+        // if no accumulator is active or the previous turn is already sealed (agent idle).
+        if (agent.accumulator && !agent.accumulator.sealed) {
           agent.accumulator.addSupervisorMessage(text);
         } else {
           const tgChatId = this.getAgentChatId(agent);

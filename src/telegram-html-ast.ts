@@ -396,6 +396,10 @@ export function nodeToHtml(node: Node, context: { listDepth?: number; parent?: N
         }
 
 
+        case 'html':
+            // Raw HTML from markdown — escape it so it doesn't become TG formatting
+            return escapeHtml(node.value || '');
+
         case 'break':
             return '\n';
 

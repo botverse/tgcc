@@ -58,16 +58,15 @@ describe('integration: CC stream → TG messages', () => {
       await acc.handleEvent(parsed.event);
     }
 
-    // Verify thinking indicator was shown
-    const thinkingMsgs = sender.messages.filter(m => m.text.includes('Thinking'));
-    expect(thinkingMsgs.length).toBeGreaterThanOrEqual(1);
+    await acc.finalize();
 
-    // Verify final text was sent
+    // With editIntervalMs:0 everything batches into one final send.
+    // The thinking segment appears as an expandable blockquote alongside the text.
     const allTexts = sender.messages.map(m => m.text);
     expect(allTexts.some(t => t.includes('Hello!'))).toBe(true);
     expect(allTexts.some(t => t.includes('Here is my response.'))).toBe(true);
 
-    // Thinking content should now appear inside an expandable blockquote
+    // Thinking content should appear inside an expandable blockquote
     const hasThinkingBlockquote = allTexts.some(t =>
       t.includes('blockquote expandable') && t.includes('Let me think about this')
     );
@@ -75,27 +74,36 @@ describe('integration: CC stream → TG messages', () => {
   });
 
   it('processes a turn with tool use', async () => {
-    const sender = createMockSender();
-    const acc = new StreamAccumulator({ chatId: 456, sender, editIntervalMs: 0 });
+    vi.useFakeTimers();
+    try {
+      const sender = createMockSender();
+      const acc = new StreamAccumulator({ chatId: 456, sender, editIntervalMs: 0 });
 
-    const events = [
-      '{"type":"stream_event","event":{"type":"message_start","message":{"model":"claude-opus-4-6","id":"msg_2","role":"assistant","content":[],"stop_reason":null,"usage":{}}}}',
-      '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}',
-      '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Let me read that file."}}}',
-      '{"type":"stream_event","event":{"type":"content_block_stop","index":0}}',
-      '{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"Read","input":{}}}}',
-      '{"type":"stream_event","event":{"type":"content_block_stop","index":1}}',
-      '{"type":"stream_event","event":{"type":"message_stop"}}',
-    ];
+      const events = [
+        '{"type":"stream_event","event":{"type":"message_start","message":{"model":"claude-opus-4-6","id":"msg_2","role":"assistant","content":[],"stop_reason":null,"usage":{}}}}',
+        '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}',
+        '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Let me read that file."}}}',
+        '{"type":"stream_event","event":{"type":"content_block_stop","index":0}}',
+        '{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"Read","input":{}}}}',
+        '{"type":"stream_event","event":{"type":"content_block_stop","index":1}}',
+        '{"type":"stream_event","event":{"type":"message_stop"}}',
+      ];
 
-    for (const line of events) {
-      const parsed = parseCCOutputLine(line) as StreamEvent;
-      await acc.handleEvent(parsed.event);
+      for (const line of events) {
+        const parsed = parseCCOutputLine(line) as StreamEvent;
+        await acc.handleEvent(parsed.event);
+      }
+
+      // Advance past the 500ms tool hide debounce so the indicator becomes visible
+      await vi.runAllTimersAsync();
+      await acc.finalize();
+
+      const allTexts = sender.messages.map(m => m.text);
+      expect(allTexts.some(t => t.includes('Let me read that file'))).toBe(true);
+      expect(allTexts.some(t => t.includes('Read'))).toBe(true);
+    } finally {
+      vi.useRealTimers();
     }
-
-    const allTexts = sender.messages.map(m => m.text);
-    expect(allTexts.some(t => t.includes('Let me read that file'))).toBe(true);
-    expect(allTexts.some(t => t.includes('Read'))).toBe(true);
   });
 });
 

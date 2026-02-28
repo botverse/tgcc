@@ -121,6 +121,8 @@ describe('StreamAccumulator', () => {
       content_block: { type: 'thinking', thinking: '' },
     } as StreamInnerEvent);
 
+    await acc.flush();
+
     expect(sender.sentMessages).toHaveLength(1);
     expect(sender.sentMessages[0].text).toContain('💭 Processing…');
     expect(sender.sentMessages[0].text).toContain('blockquote');
@@ -141,6 +143,8 @@ describe('StreamAccumulator', () => {
       delta: { type: 'text_delta', text: 'Hello world' },
     } as StreamInnerEvent);
 
+    await acc.flush();
+
     // First text should trigger sendMessage
     expect(sender.sentMessages.length).toBeGreaterThanOrEqual(1);
   });
@@ -158,11 +162,15 @@ describe('StreamAccumulator', () => {
       delta: { type: 'text_delta', text: 'Hello' },
     } as StreamInnerEvent);
 
+    await acc.flush();
+
     await acc.handleEvent({
       type: 'content_block_delta',
       index: 0,
       delta: { type: 'text_delta', text: ' world' },
     } as StreamInnerEvent);
+
+    await acc.flush();
 
     // Should have sent once and edited at least once
     expect(sender.sentMessages.length).toBeGreaterThanOrEqual(1);
@@ -186,6 +194,8 @@ describe('StreamAccumulator', () => {
 
     await acc.handleEvent({ type: 'message_stop' } as StreamInnerEvent);
 
+    await acc.finalize();
+
     // The final text should have been sent/edited
     const allTexts = [
       ...sender.sentMessages.map(m => m.text),
@@ -195,17 +205,26 @@ describe('StreamAccumulator', () => {
   });
 
   it('shows tool use indicator', async () => {
-    await acc.handleEvent({
-      type: 'content_block_start',
-      index: 0,
-      content_block: { type: 'tool_use', id: 'toolu_1', name: 'Bash', input: {} },
-    } as StreamInnerEvent);
+    vi.useFakeTimers();
+    try {
+      await acc.handleEvent({
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'tool_use', id: 'toolu_1', name: 'Bash', input: {} },
+      } as StreamInnerEvent);
 
-    const allTexts = [
-      ...sender.sentMessages.map(m => m.text),
-      ...sender.editedMessages.map(m => m.text),
-    ];
-    expect(allTexts.some(t => t.includes('Bash'))).toBe(true);
+      // Advance past the 500ms tool hide debounce so the indicator becomes visible
+      await vi.runAllTimersAsync();
+      await acc.flush();
+
+      const allTexts = [
+        ...sender.sentMessages.map(m => m.text),
+        ...sender.editedMessages.map(m => m.text),
+      ];
+      expect(allTexts.some(t => t.includes('Bash'))).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('accumulates thinking content for expandable blockquote', async () => {
@@ -214,6 +233,8 @@ describe('StreamAccumulator', () => {
       index: 0,
       content_block: { type: 'thinking', thinking: '' },
     } as StreamInnerEvent);
+
+    await acc.flush();
 
     await acc.handleEvent({
       type: 'content_block_delta',
@@ -242,6 +263,8 @@ describe('StreamAccumulator', () => {
 
     await acc.handleEvent({ type: 'message_stop' } as StreamInnerEvent);
 
+    await acc.finalize();
+
     // Thinking gets its own message (edited from "Processing..." to actual content);
     // text response goes in a separate message
     const allTexts = [
@@ -269,10 +292,12 @@ describe('StreamAccumulator', () => {
       delta: { type: 'text_delta', text: 'Hi' },
     } as StreamInnerEvent);
 
+    await acc.flush();
+
     expect(acc.allMessageIds.length).toBeGreaterThanOrEqual(1);
   });
 
-  it('serializes concurrent sendOrEdit calls via mutex (no duplicate messages)', async () => {
+  it('batches concurrent events into a single send (no duplicate messages)', async () => {
     // Simulate a slow sendMessage to expose the race condition
     let sendCount = 0;
     let editCount = 0;
@@ -301,26 +326,24 @@ describe('StreamAccumulator', () => {
       content_block: { type: 'text', text: '' },
     } as StreamInnerEvent);
 
-    // Fire two deltas rapidly WITHOUT awaiting (simulates sync event dispatch from bridge)
-    const p1 = slowAcc.handleEvent({
+    // Fire two deltas rapidly without flushing in between (simulates sync event dispatch)
+    await slowAcc.handleEvent({
       type: 'content_block_delta',
       index: 0,
       delta: { type: 'text_delta', text: 'Hello' },
     } as StreamInnerEvent);
 
-    // Don't await p1 — fire second delta immediately while first is in-flight
-    const p2 = slowAcc.handleEvent({
+    await slowAcc.handleEvent({
       type: 'content_block_delta',
       index: 0,
       delta: { type: 'text_delta', text: ' world' },
     } as StreamInnerEvent);
 
-    await Promise.all([p1, p2]);
+    // Flush: both deltas are batched into a single send
+    await slowAcc.flush();
 
-    // With the mutex, only ONE sendMessage call should have been made
-    // The second delta should have been serialized and used editMessage instead
+    // With the batched pipeline, only ONE sendMessage call should have been made
     expect(sendCount).toBe(1);
-    expect(editCount).toBeGreaterThanOrEqual(1);
   });
 
   it('bridge calls acc.reset() on message_start — new TG message each API call', async () => {
@@ -355,6 +378,8 @@ describe('StreamAccumulator', () => {
       delta: { type: 'text_delta', text: 'Turn 2' },
     } as StreamInnerEvent);
 
+    await acc.flush();
+
     // Full reset clears tgMessageId → new message on second API call
     expect(sender.sentMessages).toHaveLength(2);
     expect(sender.sentMessages[1].text).toContain('Turn 2');
@@ -374,6 +399,7 @@ describe('StreamAccumulator', () => {
       delta: { type: 'text_delta', text: 'First' },
     } as StreamInnerEvent);
 
+    await acc.flush();
     expect(sender.sentMessages).toHaveLength(1);
 
     // Full reset (simulates process exit)
@@ -391,6 +417,8 @@ describe('StreamAccumulator', () => {
       index: 0,
       delta: { type: 'text_delta', text: 'Second' },
     } as StreamInnerEvent);
+
+    await acc.flush();
 
     expect(sender.sentMessages).toHaveLength(2);
   });

@@ -106,10 +106,12 @@ function renderSegment(seg: InternalSegment): string {
 
     case 'tool': {
       if (seg.status === 'resolved') {
-        const statPart = seg.resultStat ? ` · <code>${escapeHtml(seg.resultStat)}</code>` : (seg.inputPreview ? ` · <code>${escapeHtml(seg.inputPreview)}</code>` : '');
-        return `<blockquote>✅ ${escapeHtml(seg.toolName)} (${seg.elapsed ?? '?'})${statPart}</blockquote>`;
+        const previewPart = seg.inputPreview ? ` · <code>${escapeHtml(seg.inputPreview)}</code>` : '';
+        const statPart = seg.resultStat ? ` · <code>${escapeHtml(seg.resultStat)}</code>` : '';
+        return `<blockquote>✅ ${escapeHtml(seg.toolName)} (${seg.elapsed ?? '?'})${previewPart}${statPart}</blockquote>`;
       } else if (seg.status === 'error') {
-        return `<blockquote>❌ ${escapeHtml(seg.toolName)} (${seg.elapsed ?? '?'})</blockquote>`;
+        const previewPart = seg.inputPreview ? ` · <code>${escapeHtml(seg.inputPreview)}</code>` : '';
+        return `<blockquote>❌ ${escapeHtml(seg.toolName)} (${seg.elapsed ?? '?'})${previewPart}</blockquote>`;
       } else {
         const previewPart = seg.inputPreview ? ` · <code>${escapeHtml(seg.inputPreview)}</code>` : '…';
         return `<blockquote>⚡ ${escapeHtml(seg.toolName)}${previewPart}</blockquote>`;
@@ -516,6 +518,21 @@ export class StreamAccumulator {
     return parts.join('\n') || '…';
   }
 
+  /** Force any pending timer to fire immediately and await the send queue.
+   *  Bypasses the first-send gate (like finalize). Useful in tests. */
+  async flush(): Promise<void> {
+    this.firstSendReady = true;
+    this.clearFirstSendTimer();
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+      this.flushRender();
+    } else if (this.dirty && !this.flushInFlight && !this.sealed) {
+      this.flushRender();
+    }
+    await this.sendQueue;
+  }
+
   /** Mark dirty and schedule a throttled flush. The single entry point for all renders.
    *  Data in → dirty flag → throttled flush → TG edit. One path, no re-entrant loops. */
   private flushInFlight = false;
@@ -650,6 +667,8 @@ export class StreamAccumulator {
   }
 
   async finalize(): Promise<void> {
+    if (this.sealed) return; // already finalized — guard against double-call (result + exit)
+
     // Cancel any pending flush — we take over from here
     this.clearFlushTimer();
 
@@ -821,6 +840,15 @@ function extractToolInputSummary(toolName: string, inputJson: string, maxLen = 1
       const prefix = `[${done}/${total}] `;
       const combined = prefix + label;
       return combined.length > maxLen ? combined.slice(0, maxLen) + '…' : combined;
+    }
+
+    if (toolName === 'Grep' || toolName === 'Search') {
+      const pattern = (parsed.pattern || parsed.query || '').trim();
+      const searchPath = (parsed.path || parsed.glob || '').trim();
+      if (pattern) {
+        const combined = searchPath ? `${pattern} in ${shortenPath(searchPath)}` : pattern;
+        return combined.length > maxLen ? combined.slice(0, maxLen) + '…' : combined;
+      }
     }
 
     if (fields) {
