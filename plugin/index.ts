@@ -29,6 +29,7 @@ interface TgccPluginConfig {
   defaultAgent?: string;
   agents?: string[];
   telegramChatId?: string;
+  mainSessionKey?: string;
 }
 
 function parseConfig(raw: Record<string, unknown> | undefined): TgccPluginConfig {
@@ -39,6 +40,7 @@ function parseConfig(raw: Record<string, unknown> | undefined): TgccPluginConfig
     defaultAgent: typeof obj.defaultAgent === "string" ? obj.defaultAgent : undefined,
     agents: Array.isArray(obj.agents) ? (obj.agents as string[]) : undefined,
     telegramChatId: typeof obj.telegramChatId === "string" ? obj.telegramChatId : undefined,
+    mainSessionKey: typeof obj.mainSessionKey === "string" ? obj.mainSessionKey : undefined,
   };
 }
 
@@ -85,6 +87,10 @@ const tgccPlugin = {
       telegramChatId: {
         label: "Telegram Chat ID",
         help: "Chat ID for permission request buttons",
+      },
+      mainSessionKey: {
+        label: "Main Session Key",
+        help: "Session key to wake on agent events (default: agent:main:main)",
       },
     },
   },
@@ -179,7 +185,7 @@ const tgccPlugin = {
         });
 
         // Wire up event handlers
-        attachEventHandlers(client, log);
+        attachEventHandlers(client, log, api.runtime, config.telegramChatId, config.mainSessionKey);
 
         // Wire up permission request handler
         setPermissionRequestHandler((event) => {

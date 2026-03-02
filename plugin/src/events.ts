@@ -5,7 +5,7 @@
  * for retrieval via tools and gateway methods.
  */
 
-import type { PluginLogger } from "openclaw/plugin-sdk";
+import type { PluginLogger, PluginRuntime } from "openclaw/plugin-sdk";
 import type {
   TgccSupervisorClient,
   TgccResultEvent,
@@ -175,7 +175,43 @@ export function setPermissionRequestHandler(handler: PermissionRequestHandler): 
 // Attach event handlers to the client
 // ---------------------------------------------------------------------------
 
-export function attachEventHandlers(client: TgccSupervisorClient, log: PluginLogger): void {
+export function attachEventHandlers(
+  client: TgccSupervisorClient,
+  log: PluginLogger,
+  runtime?: PluginRuntime,
+  telegramChatId?: string,
+  mainSessionKey?: string,
+): void {
+  const sendTelegram = (text: string): void => {
+    if (!runtime || !telegramChatId) return;
+    const sendMessageTelegram = runtime.channel?.telegram?.sendMessageTelegram;
+    if (!sendMessageTelegram) return;
+    void (sendMessageTelegram as (
+      target: string | number,
+      text: string,
+      opts?: Record<string, unknown>,
+    ) => Promise<unknown>)(telegramChatId, text, { textMode: "html" }).catch((err: unknown) => {
+      log.warn(`[tgcc] telegram delivery failed: ${err instanceof Error ? err.message : String(err)}`);
+    });
+  };
+
+  const resolvedSessionKey = mainSessionKey ?? "agent:main:main";
+  const wakeAgent = async (message: string): Promise<void> => {
+    if (typeof runtime?.system?.deliverToSession === "function") {
+      type DeliverFn = (s: string, m: string, opts?: { deliver?: boolean; channel?: string; to?: string }) => Promise<void>;
+      await (runtime.system.deliverToSession as DeliverFn)(
+        resolvedSessionKey,
+        `[System Event] ${message}`,
+        { deliver: true },
+      ).catch((err: unknown) =>
+        log.warn(`[tgcc] deliverToSession failed: ${String(err)}`),
+      );
+    } else {
+      runtime?.system?.enqueueSystemEvent?.(`[System Event] ${message}`);
+      log.warn("[tgcc] deliverToSession not available, fell back to enqueueSystemEvent");
+    }
+  };
+
   client.on("connected", () => void refreshAgentCache(client, log));
 
   client.on("tgcc:result", (event: TgccResultEvent) => {
@@ -185,6 +221,12 @@ export function attachEventHandlers(client: TgccSupervisorClient, log: PluginLog
     pendingResults.push({ ...event, receivedAt: Date.now() });
     if (pendingResults.length > MAX_PENDING_RESULTS) pendingResults.shift();
     pushRecentEvent("result", event.agentId, event.is_error ? "error" : "ok");
+    const icon = event.is_error ? "❌" : "✔";
+    const label = event.is_error ? "error" : "done";
+    const preview = event.text ? `\n${event.text.slice(0, 200)}` : "";
+    const tgMsg = `${icon} <b>${event.agentId}</b> ${label}${preview}`;
+    sendTelegram(tgMsg);
+    void wakeAgent(`${icon} ${event.agentId} ${label}${preview}`);
   });
 
   client.on("tgcc:process_exit", (event: TgccProcessExitEvent) => {
@@ -250,6 +292,19 @@ export function attachEventHandlers(client: TgccSupervisorClient, log: PluginLog
     }
   });
 
+  // cc_message — deliver to Telegram
+  client.on("tgcc:cc_message", (event: Record<string, unknown>) => {
+    const agentId = String(event.agentId ?? "unknown");
+    const text = typeof event.text === "string" ? event.text : "?";
+    const message = formatObservabilityMessage(event);
+    if (message) {
+      log.info(`[tgcc] observability: ${message}`);
+      pushRecentEvent("cc_message", agentId, message);
+    }
+    sendTelegram(`💬 <b>${agentId}</b>: ${text}`);
+    void wakeAgent(`💬 ${agentId}: ${text}`);
+  });
+
   // Observability events
   const observabilityEvents = [
     "tgcc:build_result",
@@ -258,10 +313,11 @@ export function attachEventHandlers(client: TgccSupervisorClient, log: PluginLog
     "tgcc:failure_loop",
     "tgcc:stuck",
     "tgcc:task_milestone",
-    "tgcc:cc_message",
     "tgcc:subagent_spawn",
     "tgcc:budget_alert",
   ];
+  const telegramObsEvents = new Set(["tgcc:stuck", "tgcc:failure_loop", "tgcc:task_milestone"]);
+  const wakeObsEvents = new Set(["tgcc:stuck", "tgcc:failure_loop"]);
   for (const evt of observabilityEvents) {
     client.on(evt, (event: Record<string, unknown>) => {
       const message = formatObservabilityMessage(event);
@@ -272,14 +328,23 @@ export function attachEventHandlers(client: TgccSupervisorClient, log: PluginLog
           String(event.agentId ?? ""),
           message,
         );
+        if (telegramObsEvents.has(evt)) {
+          sendTelegram(message);
+        } else if (evt === "tgcc:build_result" && event.passed !== true) {
+          sendTelegram(message);
+        }
+        if (wakeObsEvents.has(evt)) {
+          void wakeAgent(message);
+        }
       }
     });
   }
 
-  // Reverse notify
+  // Reverse notify — deliver to Telegram
   client.on("tgcc:reverse_notify", (event: { target: string; message: string }) => {
     log.info(`[tgcc] reverse notify to ${event.target}: ${event.message.slice(0, 200)}`);
     pushRecentEvent("reverse_notify", undefined, event.message.slice(0, 100));
+    sendTelegram(event.message);
   });
 
   // Status sync
