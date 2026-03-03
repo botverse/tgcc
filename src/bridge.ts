@@ -1185,12 +1185,16 @@ export class Bridge extends EventEmitter implements CtlHandler {
         const contSession = agent.ccProcess?.sessionId;
         this.killAgentProcess(agentId);
 
-        // If no session, auto-pick the most recent one
+        // Resolve session to resume and look up its title in one pass
         let sessionToResume = contSession;
-        if (!sessionToResume && agent.repo) {
-          const recent = discoverCCSessions(agent.repo, 1);
-          if (recent.length > 0) {
-            sessionToResume = recent[0].id;
+        let sessionTitle: string | null = null;
+        if (agent.repo) {
+          const discovered = discoverCCSessions(agent.repo, 20);
+          if (!sessionToResume && discovered.length > 0) {
+            sessionToResume = discovered[0].id;
+          }
+          if (sessionToResume) {
+            sessionTitle = discovered.find(s => s.id === sessionToResume)?.title ?? null;
           }
         }
         if (sessionToResume) {
@@ -1201,6 +1205,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
         if (agent.repo) contLines.push(`📂 <code>${escapeHtml(shortenRepoPath(agent.repo))}</code>`);
         if (agent.model) contLines.push(`🤖 ${escapeHtml(agent.model)}`);
         if (sessionToResume) contLines.push(`📎 <code>${escapeHtml(sessionToResume.slice(0, 8))}</code>`);
+        if (sessionTitle) contLines.push(`💬 ${escapeHtml(sessionTitle)}`);
         await agent.tgBot.sendText(cmd.chatId, `<blockquote>${contLines.join('\n')}</blockquote>`, 'HTML');
         break;
       }

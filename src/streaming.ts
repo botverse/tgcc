@@ -453,6 +453,7 @@ export class StreamAccumulator {
         this.sendQueue = this.sendQueue
           .then(() => this._doSendOrEdit(preHtml || '…', capturedMsgId))
           .then(() => this._doSendOrEdit(thinkingHtml || '…', null))
+          .then(() => { this.tgMessageId = null; }) // clear so response creates its own bubble
           .catch(err => {
             this.logger?.error?.({ err }, 'thinking bubble split send failed');
           });
@@ -465,6 +466,7 @@ export class StreamAccumulator {
         this.tgMessageId = null;
         this.sendQueue = this.sendQueue
           .then(() => this._doSendOrEdit(thinkingHtml || '…', null))
+          .then(() => { this.tgMessageId = null; }) // clear so response creates its own bubble
           .catch(err => {
             this.logger?.error?.({ err }, 'thinking bubble send failed');
           });
