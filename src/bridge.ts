@@ -173,6 +173,7 @@ const HELP_TEXT = `<b>TGCC Commands</b>
 
 export class Bridge extends EventEmitter implements CtlHandler {
   private config: TgccConfig;
+  private readonly startedAt = Date.now();
   private agents = new Map<string, AgentInstance>();
   private processRegistry = new ProcessRegistry();
   private mcpServer: McpBridgeServer;
@@ -465,6 +466,22 @@ export class Bridge extends EventEmitter implements CtlHandler {
         }
       }
 
+      // Notify if spawning a genuinely stale session (no pending session, last activity >2h ago,
+      // and activity was during this run — not a restart scenario already notified at shutdown)
+      if (!agent.pendingSessionId) {
+        const agentState = this.sessionStore.getAgent(agentId);
+        const lastActivityMs = new Date(agentState.lastActivity).getTime();
+        const isStale = Date.now() - lastActivityMs >= 2 * 60 * 60 * 1000;
+        const isFromThisRun = lastActivityMs >= this.startedAt;
+        if (isStale && isFromThisRun) {
+          const staleChatId = source?.chatId;
+          if (staleChatId && agent.tgBot) {
+            agent.tgBot.sendText(staleChatId, '<blockquote>Starting a new session. Use /sessions to resume a previous one.</blockquote>', 'HTML', true)
+              .catch(err => this.logger.error({ err }, 'Failed to send stale session notification'));
+          }
+        }
+      }
+
       proc = this.spawnCCProcess(agentId);
       agent.ccProcess = proc;
 
@@ -569,9 +586,14 @@ export class Bridge extends EventEmitter implements CtlHandler {
       userConfig.permissionMode = agentState.permissionMode as typeof userConfig.permissionMode;
     }
 
-    // Determine session ID: pending from /resume, or let CC create new
+    // Determine session ID and whether to continue
     const sessionId = agent.pendingSessionId ?? undefined;
     agent.pendingSessionId = null; // consumed
+
+    // Auto-continue if no explicit session and last activity was recent (<2h)
+    const STALE_THRESHOLD_MS = 2 * 60 * 60 * 1000;
+    const lastActivityMs = new Date(agentState.lastActivity).getTime();
+    const continueSession = !!sessionId || (Date.now() - lastActivityMs < STALE_THRESHOLD_MS);
 
     // Generate MCP config (use agentId as the "userId" for socket naming)
     const mcpServerPath = resolveMcpServerPath();
@@ -593,7 +615,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
       userConfig,
       mcpConfigPath,
       sessionId,
-      continueSession: !!sessionId,
+      continueSession,
       logger: this.logger,
     });
 
@@ -769,7 +791,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
     proc.on('result', (event: ResultEvent) => {
       this.stopTypingIndicator(agent);
       agent.eventBuffer.push({ ts: Date.now(), type: 'system', text: `Turn complete${event.is_error ? ' (error)' : ''}${event.total_cost_usd ? ` · $${event.total_cost_usd.toFixed(4)}` : ''}` });
-      this.handleResult(agentId, event);
+      void this.handleResult(agentId, event);
 
       // Forward to supervisor
       if (this.isSupervisorSubscribed(agentId, proc.sessionId)) {
@@ -868,11 +890,22 @@ export class Bridge extends EventEmitter implements CtlHandler {
       }
     });
 
+    proc.on('idle', () => {
+      agent.pendingSessionId = proc.sessionId ?? null;
+      this.stopTypingIndicator(agent);
+      const idleChatId = this.getAgentChatId(agent);
+      if (idleChatId && agent.tgBot) {
+        agent.tgBot.sendText(idleChatId, '<blockquote>⏸ Session ended. Use /sessions to resume it.</blockquote>', 'HTML', true)
+          .catch(err => this.logger.error({ err }, 'Failed to send idle notification'));
+      }
+    });
+
     proc.on('hang', () => {
+      agent.pendingSessionId = proc.sessionId ?? null;
       this.stopTypingIndicator(agent);
       const hangChatId = this.getAgentChatId(agent);
       if (hangChatId && agent.tgBot) {
-        agent.tgBot.sendText(hangChatId, '<blockquote>⏸ Session paused. Send a message to continue.</blockquote>', 'HTML', true) // silent
+        agent.tgBot.sendText(hangChatId, '<blockquote>⚠️ Session killed — Claude was unresponsive. Send a message to resume.</blockquote>', 'HTML', true)
           .catch(err => this.logger.error({ err }, 'Failed to send hang notification'));
       }
     });
@@ -884,7 +917,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
       // Send TG system message for takeover
       const takeoverChatId = this.getAgentChatId(agent);
       if (takeoverChatId && agent.tgBot) {
-        agent.tgBot.sendText(takeoverChatId, '<blockquote>⚠️ Session taken over by another client</blockquote>', 'HTML', true)
+        agent.tgBot.sendText(takeoverChatId, '<blockquote>⚠️ Session taken over by another client. Next message will start a new session.</blockquote>', 'HTML', true)
           .catch(err => this.logger.error({ err, agentId }, 'Failed to send takeover notification'));
       }
 
@@ -1008,11 +1041,15 @@ export class Bridge extends EventEmitter implements CtlHandler {
       }
     }
 
-    agent.accumulator?.handleEvent(event);
-    agent.subAgentTracker?.handleEvent(event);
+    agent.accumulator?.handleEvent(event).catch(err => {
+      this.logger.error({ err: err instanceof Error ? { message: err.message, stack: err.stack } : err, agentId }, 'Stream accumulator handleEvent error');
+    });
+    agent.subAgentTracker?.handleEvent(event).catch(err => {
+      this.logger.error({ err: err instanceof Error ? { message: err.message, stack: err.stack } : err, agentId }, 'Sub-agent tracker handleEvent error');
+    });
   }
 
-  private handleResult(agentId: string, event: ResultEvent): void {
+  private async handleResult(agentId: string, event: ResultEvent): Promise<void> {
     const agent = this.agents.get(agentId);
     if (!agent) return;
 
@@ -1033,7 +1070,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
           model: (event as { model?: string }).model ?? entry?.model,
         });
       }
-      acc.finalize();
+      await acc.finalize();
     }
 
     // Handle errors (only send to TG if bot available)
@@ -2170,6 +2207,18 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
   async stop(): Promise<void> {
     this.logger.info('Stopping bridge');
+
+    // Notify all active chats before shutting down bots
+    await Promise.allSettled(
+      [...this.agents.values()]
+        .filter(a => a.tgBot)
+        .map(a => {
+          const chatId = this.getAgentChatId(a);
+          if (!chatId) return Promise.resolve();
+          return a.tgBot!.sendText(chatId, '<blockquote>🔄 Restarting… Your next message will start a new session. Use /sessions to resume a previous one.</blockquote>', 'HTML', true)
+            .catch(err => this.logger.warn({ err }, 'Failed to send shutdown notification'));
+        })
+    );
 
     for (const agentId of [...this.agents.keys()]) {
       await this.stopAgent(agentId);

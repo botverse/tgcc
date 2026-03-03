@@ -110,7 +110,7 @@ function toolEmoji(toolName: string): string {
 function renderSegment(seg: InternalSegment): string {
   switch (seg.type) {
     case 'thinking':
-      return `<blockquote expandable>💭 ${seg.rawText ? markdownToTelegramHtml(seg.rawText.length > 1024 ? seg.rawText.slice(0, 1024) + '…' : seg.rawText) : 'Processing…'}</blockquote>`;
+      return `<blockquote expandable>💭 ${seg.rawText ? markdownToTelegramHtml(seg.rawText.length > 4000 ? seg.rawText.slice(0, 4000) + '…' : seg.rawText) : 'Processing…'}</blockquote>`;
 
     case 'text':
       return seg.rawText ? makeHtmlSafe(seg.rawText) : '';
@@ -135,7 +135,7 @@ function renderSegment(seg: InternalSegment): string {
         ? '\n' + seg.progressLines.join('\n')
         : '';
       if (seg.status === 'completed') {
-        return `<blockquote>🤖 ${escapeHtml(label)} — ✅ Done (${elapsed})${progressBlock}</blockquote>`;
+        return `<blockquote>🤖 ${escapeHtml(label)} — ✔ Done (${elapsed})${progressBlock}</blockquote>`;
       } else {
         return `<blockquote>🤖 ${escapeHtml(label)} — Working (${elapsed})…${progressBlock}</blockquote>`;
       }
@@ -175,7 +175,7 @@ export class StreamAccumulator {
   // Per-block streaming state
   private currentBlockType: 'text' | 'thinking' | 'tool_use' | 'image' | null = null;
   private currentBlockId: string | null = null;
-  private currentSegmentIdx = -1;  // index into segments[] for currently-building block
+  private currentSegment: InternalSegment | null = null;  // direct ref to currently-building block
 
   // Tool streaming state
   private toolInputBuffers = new Map<string, string>();  // blockId → accumulated JSON input
@@ -274,13 +274,13 @@ export class StreamAccumulator {
       const seg: InternalSegment = { type: 'thinking', rawText: '', content: '' };
       seg.content = renderSegment(seg);
       this.segments.push(seg);
-      this.currentSegmentIdx = this.segments.length - 1;
+      this.currentSegment = seg;
       this.requestRender();
 
     } else if (blockType === 'text') {
       const seg: InternalSegment = { type: 'text', rawText: '', content: '' };
       this.segments.push(seg);
-      this.currentSegmentIdx = this.segments.length - 1;
+      this.currentSegment = seg;
 
     } else if (blockType === 'tool_use') {
       const block = event.content_block as { type: 'tool_use'; id: string; name: string };
@@ -300,7 +300,7 @@ export class StreamAccumulator {
         };
         seg.content = renderSegment(seg);
         this.segments.push(seg);
-        this.currentSegmentIdx = this.segments.length - 1;
+        this.currentSegment = seg;
       } else {
         const seg: InternalSegment = {
           type: 'tool',
@@ -312,7 +312,7 @@ export class StreamAccumulator {
         };
         seg.content = renderSegment(seg);
         this.segments.push(seg);
-        this.currentSegmentIdx = this.segments.length - 1;
+        this.currentSegment = seg;
         // Suppress the ⚡ pending indicator for 500ms. If the tool resolves within that window
         // the hide timer is cancelled in resolveToolMessage and we render directly as ✅.
         const toolBlockId = block.id;
@@ -331,8 +331,8 @@ export class StreamAccumulator {
   private async onContentBlockDelta(event: StreamInnerEvent): Promise<void> {
     if (this.currentBlockType === 'text' && 'delta' in event) {
       const delta = (event as StreamTextDelta).delta;
-      if (delta?.type === 'text_delta' && this.currentSegmentIdx >= 0) {
-        const seg = this.segments[this.currentSegmentIdx] as Extract<InternalSegment, { type: 'text' }>;
+      const seg = this.currentSegment;
+      if (delta?.type === 'text_delta' && seg?.type === 'text') {
         seg.rawText += delta.text;
         seg.content = renderSegment(seg);
 
@@ -345,8 +345,8 @@ export class StreamAccumulator {
       }
     } else if (this.currentBlockType === 'thinking' && 'delta' in event) {
       const delta = (event as any).delta;
-      if (delta?.type === 'thinking_delta' && delta.thinking && this.currentSegmentIdx >= 0) {
-        const seg = this.segments[this.currentSegmentIdx] as Extract<InternalSegment, { type: 'thinking' }>;
+      const seg = this.currentSegment;
+      if (delta?.type === 'thinking_delta' && delta.thinking && seg?.type === 'thinking') {
         seg.rawText += delta.thinking;
         seg.content = renderSegment(seg);
         this.requestRender();
@@ -360,24 +360,22 @@ export class StreamAccumulator {
         this.toolInputBuffers.set(blockId, next);
 
         // Update segment preview if we have enough input
-        if (this.currentSegmentIdx >= 0) {
-          const seg = this.segments[this.currentSegmentIdx];
-          if (seg.type === 'tool' || seg.type === 'subagent') {
-            const toolName = seg.type === 'tool' ? seg.toolName : seg.toolName;
-            const summary = extractToolInputSummary(toolName, next, 80, true);
-            if (summary) {
-              (seg as any).inputPreview = summary;
-            }
-            if (seg.type === 'subagent') {
-              const extracted = extractAgentLabel(next);
-              if (extracted.label && labelFieldPriority(extracted.field) < labelFieldPriority((seg as any).labelField ?? null)) {
-                (seg as any).label = extracted.label;
-                (seg as any).labelField = extracted.field;
-              }
-            }
-            seg.content = renderSegment(seg);
-            this.requestRender();
+        const seg = this.currentSegment;
+        if (seg && (seg.type === 'tool' || seg.type === 'subagent')) {
+          const toolName = seg.type === 'tool' ? seg.toolName : seg.toolName;
+          const summary = extractToolInputSummary(toolName, next, 80, true);
+          if (summary) {
+            (seg as any).inputPreview = summary;
           }
+          if (seg.type === 'subagent') {
+            const extracted = extractAgentLabel(next);
+            if (extracted.label && labelFieldPriority(extracted.field) < labelFieldPriority((seg as any).labelField ?? null)) {
+              (seg as any).label = extracted.label;
+              (seg as any).labelField = extracted.field;
+            }
+          }
+          seg.content = renderSegment(seg);
+          this.requestRender();
         }
       }
     } else if (this.currentBlockType === 'image' && 'delta' in event) {
@@ -389,9 +387,17 @@ export class StreamAccumulator {
   }
 
   private async onContentBlockStop(_event: StreamContentBlockStop): Promise<void> {
-    if (this.currentBlockType === 'tool_use' && this.currentBlockId && this.currentSegmentIdx >= 0) {
-      const blockId = this.currentBlockId;
-      const seg = this.segments[this.currentSegmentIdx];
+    // Snapshot and immediately clear current-block state. Must happen BEFORE any
+    // await so that content_block_start events arriving during async operations
+    // can set up their own state without being wiped by our cleanup at the end.
+    const blockType = this.currentBlockType;
+    const blockId = this.currentBlockId;
+    const seg = this.currentSegment;
+    this.currentBlockType = null;
+    this.currentBlockId = null;
+    this.currentSegment = null;
+
+    if (blockType === 'tool_use' && blockId && seg) {
       const inputJson = this.toolInputBuffers.get(blockId) ?? '';
 
       if (seg.type === 'subagent') {
@@ -412,13 +418,49 @@ export class StreamAccumulator {
         seg.content = renderSegment(seg);
         this.requestRender();
       }
-    } else if (this.currentBlockType === 'image' && this.imageBase64Buffer) {
+    } else if (blockType === 'image' && this.imageBase64Buffer) {
       await this.sendImage();
-    }
+    } else if (blockType === 'thinking' && seg?.type === 'thinking' && seg.rawText.length > 0) {
+      const thinkingIdx = this.segments.indexOf(seg);
+      if (thinkingIdx < 0) return; // segment already removed (defensive)
 
-    this.currentBlockType = null;
-    this.currentBlockId = null;
-    this.currentSegmentIdx = -1;
+      // Cancel any pending throttled render — we're taking over message sequencing.
+      if (this.flushTimer) {
+        clearTimeout(this.flushTimer);
+        this.flushTimer = null;
+      }
+      this.dirty = false;
+
+      if (thinkingIdx > 0) {
+        // Thinking appeared mid-turn (after text/tool segments).
+        const preHtml = this.segments.slice(0, thinkingIdx).map(s => s.content).filter(Boolean).join('\n');
+        const capturedMsgId = this.tgMessageId;
+        const thinkingHtml = seg.content;
+
+        // Remove ALL segments and null msgId synchronously — NO awaits.
+        this.segments = this.segments.slice(thinkingIdx + 1);
+        this.tgMessageId = null;
+        this.sendQueue = this.sendQueue
+          .then(() => this._doSendOrEdit(preHtml || '…', capturedMsgId))
+          .then(() => this._doSendOrEdit(thinkingHtml || '…', null))
+          .catch(err => {
+            this.logger?.error?.({ err }, 'thinking bubble split send failed');
+          });
+      } else {
+        // Thinking is the first/only segment.
+        const thinkingHtml = seg.content;
+
+        // Remove segment and null msgId synchronously — NO awaits.
+        this.segments = this.segments.slice(1);
+        this.tgMessageId = null;
+        this.sendQueue = this.sendQueue
+          .then(() => this._doSendOrEdit(thinkingHtml || '…', null))
+          .catch(err => {
+            this.logger?.error?.({ err }, 'thinking bubble send failed');
+          });
+      }
+      // DO NOT await sendQueue — handleEvent must return synchronously.
+    }
   }
 
   // ── Public tool resolution API ──
@@ -487,6 +529,24 @@ export class StreamAccumulator {
       seg.content = renderSegment(seg);
       this.requestRender();
     }
+  }
+
+  /** Inject a pre-resolved tool segment (for MCP supervisor tools that bypass the CC stream). */
+  injectResolvedTool(toolName: string, inputPreview?: string, elapsedMs?: number): void {
+    const elapsed = elapsedMs !== undefined ? (elapsedMs / 1000).toFixed(1) + 's' : '0.0s';
+    const seg: InternalSegment = {
+      type: 'tool',
+      id: `synthetic-${Date.now()}`,
+      toolName,
+      status: 'resolved',
+      inputPreview,
+      elapsed,
+      startTime: Date.now() - (elapsedMs ?? 0),
+      content: '',
+    };
+    seg.content = renderSegment(seg);
+    this.segments.push(seg);
+    this.requestRender();
   }
 
   /** Update a sub-agent segment status (called by bridge on task_started/progress/completed). */
@@ -580,6 +640,7 @@ export class StreamAccumulator {
     this.dirty = false;
     this.flushInFlight = true;
     const html = this.renderHtml();
+    const targetMsgId = this.tgMessageId; // capture NOW before any reset() can clear it
 
     const afterFlush = () => {
       this.flushInFlight = false;
@@ -595,7 +656,7 @@ export class StreamAccumulator {
         .then(afterFlush, (err) => { afterFlush(); this.logger?.error?.({ err }, 'flushRender splitMessage failed'); });
     } else {
       this.sendQueue = this.sendQueue
-        .then(() => this._doSendOrEdit(html || '…'))
+        .then(() => this._doSendOrEdit(html || '…', targetMsgId))
         .then(afterFlush, (err) => { afterFlush(); this.logger?.error?.({ err }, 'flushRender failed'); });
     }
   }
@@ -626,14 +687,17 @@ export class StreamAccumulator {
 
     // Render first part, start new message with remainder
     const firstSegs = this.segments.slice(0, splitSegIdx);
-    const restSegs = this.segments.slice(splitSegIdx);
-
     const firstHtml = firstSegs.map(s => s.content).filter(Boolean).join('\n');
-    await this._doSendOrEdit(firstHtml);
 
-    // Start a new message for remainder
+    // Set segments to restSegs BEFORE awaiting — stream events that arrive during
+    // the async send will be appended to this.segments (the remainder), not lost.
+    this.segments = this.segments.slice(splitSegIdx);
+
+    const targetMsgId = this.tgMessageId; // capture NOW before any reset() can clear it
+    await this._doSendOrEdit(firstHtml, targetMsgId);
+
+    // Start a new message for remainder — no captured id, must create fresh
     this.tgMessageId = null;
-    this.segments = restSegs;
     const restHtml = this.renderHtml();
     await this._doSendOrEdit(restHtml);
   }
@@ -675,12 +739,13 @@ export class StreamAccumulator {
     const newSeg: InternalSegment = { type: 'text', rawText: remainder, content: '' };
     newSeg.content = renderSegment(newSeg);
     this.segments = [newSeg];
-    this.currentSegmentIdx = 0;
+    this.currentSegment = newSeg;
     await this.sendOrEdit(this.renderHtml());
   }
 
   async finalize(): Promise<void> {
     if (this.sealed) return; // already finalized — guard against double-call (result + exit)
+    this.sealed = true; // SET IMMEDIATELY — prevents race with next turn's message_start
 
     // Cancel any pending flush — we take over from here
     this.clearFlushTimer();
@@ -696,19 +761,28 @@ export class StreamAccumulator {
       this.segments.push(seg);
     }
 
-    // Final render — chain directly onto sendQueue so it runs after any in-flight edits
+    // Final render — chain directly onto sendQueue so it runs after any in-flight edits.
+    // Use splitMessage if over threshold, same as flushRender, to avoid silent Telegram failures.
     const html = this.renderHtml();
+    const targetMsgId = this.tgMessageId; // capture NOW before any reset() can clear it
     if (html && html !== '…') {
-      this.sendQueue = this.sendQueue
-        .then(() => this._doSendOrEdit(html))
-        .catch(err => {
-          this.logger?.error?.({ err }, 'finalize failed');
-          this.onError?.(err, 'Failed to send/edit message');
-        });
+      if (html.length > this.splitThreshold) {
+        this.sendQueue = this.sendQueue
+          .then(() => this.splitMessage())
+          .catch(err => {
+            this.logger?.error?.({ err }, 'finalize splitMessage failed');
+            this.onError?.(err, 'Failed to send/edit message');
+          });
+      } else {
+        this.sendQueue = this.sendQueue
+          .then(() => this._doSendOrEdit(html, targetMsgId))
+          .catch(err => {
+            this.logger?.error?.({ err }, 'finalize failed');
+            this.onError?.(err, 'Failed to send/edit message');
+          });
+      }
       await this.sendQueue;
     }
-
-    this.sealed = true;
   }
 
   // ── TG message management ──
@@ -722,18 +796,21 @@ export class StreamAccumulator {
     return this.sendQueue;
   }
 
-  private async _doSendOrEdit(html: string): Promise<void> {
+  private async _doSendOrEdit(html: string, targetMsgId?: number | null): Promise<void> {
     let text = html || '…';
     if (!text.replace(/<[^>]*>/g, '').trim()) text = '…';
 
     this.lastEditTime = Date.now();
 
+    // Use captured id if provided, fall back to current (for direct callers like sendOrEdit)
+    const msgId = targetMsgId !== undefined ? targetMsgId : this.tgMessageId;
+
     try {
-      if (!this.tgMessageId) {
+      if (!msgId) {
         this.tgMessageId = await this.sender.sendMessage(this.chatId, text, 'HTML');
         this.messageIds.push(this.tgMessageId);
       } else {
-        await this.sender.editMessage(this.chatId, this.tgMessageId, text, 'HTML');
+        await this.sender.editMessage(this.chatId, msgId, text, 'HTML');
       }
     } catch (err: unknown) {
       const errorCode = err && typeof err === 'object' && 'error_code' in err
@@ -743,7 +820,7 @@ export class StreamAccumulator {
         const retryAfter = (err as { parameters?: { retry_after?: number } }).parameters?.retry_after ?? 5;
         this.editIntervalMs = Math.min(this.editIntervalMs * 2, 5000);
         await sleep(retryAfter * 1000);
-        return this._doSendOrEdit(text);
+        return this._doSendOrEdit(text, targetMsgId); // preserve captured id through retry
       }
       if (err instanceof Error && err.message.includes('message is not modified')) return;
       this.logger?.error?.({ err, errorCode }, 'Telegram API error in _doSendOrEdit — skipping');
@@ -767,7 +844,7 @@ export class StreamAccumulator {
   softReset(): void {
     this.currentBlockType = null;
     this.currentBlockId = null;
-    this.currentSegmentIdx = -1;
+    this.currentSegment = null;
     this.sealed = false;
     this.turnUsage = null;
     this._lastMsgStartCtx = null;
@@ -873,10 +950,14 @@ function extractToolInputSummary(toolName: string, inputJson: string, maxLen = 1
         }
       }
     }
-    for (const val of Object.values(parsed)) {
-      if (typeof val === 'string' && val.trim()) {
-        const v = val.trim();
-        return v.length > maxLen ? v.slice(0, maxLen) + '…' : v;
+    // Generic fallback only for tools without an explicit field list above — known tools
+    // have specific handlers that already returned or fell through intentionally.
+    if (!(toolName in fieldsByTool)) {
+      for (const val of Object.values(parsed)) {
+        if (typeof val === 'string' && val.trim()) {
+          const v = val.trim();
+          return v.length > maxLen ? v.slice(0, maxLen) + '…' : v;
+        }
       }
     }
     return null;
@@ -1537,7 +1618,7 @@ export class SubAgentTracker {
       const elapsed = formatElapsed(Date.now() - info.startTime);
       let statusLine: string;
       if (info.status === 'completed') {
-        statusLine = `🤖 ${escapeHtml(label)} — ✅ Done (${elapsed})`;
+        statusLine = `🤖 ${escapeHtml(label)} — ✔ Done (${elapsed})`;
       } else {
         statusLine = `🤖 ${escapeHtml(label)} — Working (${elapsed})…`;
       }

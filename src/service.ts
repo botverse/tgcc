@@ -85,7 +85,7 @@ export async function main(): Promise<void> {
   });
 
   process.on('unhandledRejection', (reason) => {
-    logger.error({ reason }, 'Unhandled rejection');
+    logger.error({ reason: reason instanceof Error ? { message: reason.message, stack: reason.stack } : reason }, 'Unhandled rejection');
   });
 
   // ── Start ──

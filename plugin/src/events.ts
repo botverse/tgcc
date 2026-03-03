@@ -98,9 +98,34 @@ export function getRecentEvents(since?: number): RecentEvent[] {
   return recentEvents;
 }
 
+// ---------------------------------------------------------------------------
+// Per-agent activity tracking
+// ---------------------------------------------------------------------------
+
+export interface AgentActivityData {
+  lastActivityTs: number;
+  lastActivitySummary: string;
+  contextPercent: number | null;
+}
+
+const perAgentData: Record<string, AgentActivityData> = {};
+
+export function getPerAgentData(): Record<string, AgentActivityData> {
+  return perAgentData;
+}
+
 function pushRecentEvent(event: string, agentId: string | undefined, summary: string): void {
-  recentEvents.push({ event, agentId, summary, ts: Date.now() });
+  const ts = Date.now();
+  recentEvents.push({ event, agentId, summary, ts });
   if (recentEvents.length > MAX_RECENT_EVENTS) recentEvents.shift();
+  if (agentId && summary) {
+    const existing = perAgentData[agentId];
+    perAgentData[agentId] = {
+      lastActivityTs: ts,
+      lastActivitySummary: summary,
+      contextPercent: existing?.contextPercent ?? null,
+    };
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -317,23 +342,70 @@ export function attachEventHandlers(
     "tgcc:budget_alert",
   ];
   const telegramObsEvents = new Set(["tgcc:stuck", "tgcc:failure_loop", "tgcc:task_milestone"]);
-  const wakeObsEvents = new Set(["tgcc:stuck", "tgcc:failure_loop"]);
+  const wakeObsEvents = new Set([
+    "tgcc:stuck",
+    "tgcc:failure_loop",
+    "tgcc:build_result",
+    "tgcc:git_commit",
+    "tgcc:task_milestone",
+    "tgcc:context_pressure",
+    "tgcc:budget_alert",
+  ]);
+
+  // Debounce state: track last build result and last commit per agent
+  const lastBuildResult = new Map<string, { ts: number; passed: boolean }>();
+  const lastCommit = new Map<string, number>();
+
+  function shouldWakeForObsEvent(evt: string, event: Record<string, unknown>): boolean {
+    const agentId = String(event.agentId ?? "");
+    const now = Date.now();
+    if (evt === "tgcc:build_result") {
+      const passed = event.passed === true;
+      const last = lastBuildResult.get(agentId);
+      lastBuildResult.set(agentId, { ts: now, passed });
+      // Don't wake if this build passed AND the last build also passed within 60s
+      if (passed && last?.passed && now - last.ts < 60_000) return false;
+      return true;
+    }
+    if (evt === "tgcc:git_commit") {
+      const last = lastCommit.get(agentId);
+      lastCommit.set(agentId, now);
+      // Don't wake if last commit was <30s ago (batch commits)
+      if (last && now - last < 30_000) return false;
+      return true;
+    }
+    return true;
+  }
+
   for (const evt of observabilityEvents) {
     client.on(evt, (event: Record<string, unknown>) => {
       const message = formatObservabilityMessage(event);
       if (message) {
         log.info(`[tgcc] observability: ${message}`);
+        const agentId = String(event.agentId ?? "");
         pushRecentEvent(
           String(event.event ?? evt.replace("tgcc:", "")),
-          String(event.agentId ?? ""),
+          agentId,
           message,
         );
+        // Update contextPercent tracking for context_pressure events
+        if (evt === "tgcc:context_pressure" && agentId) {
+          const pct = typeof event.percent === "number" ? event.percent : null;
+          if (pct !== null) {
+            const existing = perAgentData[agentId];
+            perAgentData[agentId] = {
+              lastActivityTs: existing?.lastActivityTs ?? Date.now(),
+              lastActivitySummary: existing?.lastActivitySummary ?? message,
+              contextPercent: pct,
+            };
+          }
+        }
         if (telegramObsEvents.has(evt)) {
           sendTelegram(message);
         } else if (evt === "tgcc:build_result" && event.passed !== true) {
           sendTelegram(message);
         }
-        if (wakeObsEvents.has(evt)) {
+        if (wakeObsEvents.has(evt) && shouldWakeForObsEvent(evt, event)) {
           void wakeAgent(message);
         }
       }

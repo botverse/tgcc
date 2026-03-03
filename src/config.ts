@@ -55,7 +55,7 @@ const DEFAULT_AGENT_DEFAULTS: AgentDefaults = {
   model: 'claude-sonnet-4-20250514',
   repo: homedir(),
   maxTurns: 50,
-  idleTimeoutMs: 300_000,
+  idleTimeoutMs: 7_200_000,
   hangTimeoutMs: 300_000,
   permissionMode: 'dangerously-skip',
 };

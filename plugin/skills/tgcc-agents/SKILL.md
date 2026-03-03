@@ -1,6 +1,6 @@
 ---
 name: tgcc-agents
-description: 'Manage TGCC agents (Claude Code via Telegram) using tgcc_spawn, tgcc_send, tgcc_status, tgcc_kill tools. Use when: spawning CC sessions through TGCC, sending tasks to persistent TGCC bots, checking agent status, killing sessions, or creating ephemeral agents for one-off work.'
+description: 'Manage TGCC agents (Claude Code via Telegram) using tgcc_spawn, tgcc_send, tgcc_status, tgcc_kill, tgcc_log tools. Use when: spawning CC sessions through TGCC, sending tasks to persistent TGCC bots, checking agent status/logs, killing sessions, or creating ephemeral agents for one-off work.'
 homepage: https://github.com/botverse/tgcc
 metadata:
   {
@@ -24,7 +24,24 @@ metadata:
 
 # TGCC Agents — OpenClaw Plugin
 
-Manage **Claude Code sessions via TGCC** (Telegram ↔ Claude Code bridge) using four dedicated tools. TGCC manages CC processes with Telegram rendering — you get visibility in both OpenClaw and Telegram.
+Manage **Claude Code sessions via TGCC** (Telegram ↔ Claude Code bridge) using five dedicated tools. TGCC manages CC processes with Telegram rendering — you get visibility in both OpenClaw and Telegram.
+
+## Auto-Wake Events
+
+The agent is automatically woken (receives a `[System Event]`) when the following events occur:
+
+| Event | Wake condition |
+|-------|---------------|
+| `stuck` | Agent silent for too long |
+| `failure_loop` | Consecutive failures |
+| `build_result` | Build failed **or** first passing build (debounced: no wake if previous build also passed within 60s) |
+| `git_commit` | Commit made (debounced: no wake if previous commit was <30s ago) |
+| `task_milestone` | Agent reports progress milestone |
+| `context_pressure` | Context window filling up |
+| `budget_alert` | Cost threshold reached |
+| `result` | CC session completed (always wakes) |
+
+Events **not** waking the agent (pull-only): `subagent_spawn`, lifecycle events.
 
 ## Tools
 
@@ -36,10 +53,29 @@ tgcc_status agentId="tgcc"           # specific agent
 ```
 
 Returns:
-- **agents**: list with repo, type (persistent/ephemeral), state (idle/active/spawning)
+- **agents**: list with repo, type (persistent/ephemeral), state (idle/active), plus per-agent `lastActivity` (ts + summary of last event) and `contextPercent` (last known context window %)
 - **pendingResults**: completed CC results not yet consumed (use `drain=true` to consume)
 - **pendingPermissions**: permission requests waiting for approval
 - **recentEvents**: last events (cc_spawned, result, error, etc.)
+
+### `tgcc_log` — View an agent's event log
+
+```
+tgcc_log agentId="tgcc"                          # last 30 lines
+tgcc_log agentId="tgcc" limit=50                 # last 50 lines
+tgcc_log agentId="tgcc" since=300000             # last 5 minutes
+tgcc_log agentId="tgcc" grep="error|fail"        # filter by regex
+tgcc_log agentId="tgcc" type="system"            # filter by entry type
+tgcc_log agentId="tgcc" offset=100 limit=20      # paginate
+```
+
+Shows build results, commits, milestones, errors, and assistant output from the CC session's event buffer. Use this to check what an agent is working on **without waking it**.
+
+Entry types: `text` (assistant output), `tool` (tool calls), `system` (events), `error`, `user` (messages sent to CC).
+
+**When to use `tgcc_log` vs `tgcc_status`:**
+- `tgcc_status` — broad overview: which agents are running, pending results, recent event summaries
+- `tgcc_log` — deep dive: actual CC output, tool calls, build details for a specific agent
 
 ### `tgcc_spawn` — Start a CC session
 

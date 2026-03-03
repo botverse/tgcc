@@ -13,6 +13,7 @@ import {
   drainPendingResults,
   getPendingPermissions,
   getRecentEvents,
+  getPerAgentData,
 } from "../events.js";
 
 const TgccStatusParams = {
@@ -59,6 +60,7 @@ export function createTgccStatusTool(
 
       // Get cached agent state
       const cache = getAgentCache();
+      const activity = getPerAgentData();
 
       // Get pending data
       const results = p.drain ? drainPendingResults() : getPendingResults();
@@ -79,13 +81,29 @@ export function createTgccStatusTool(
         }
       }
 
+      // Build enriched agents map with per-agent lastActivity and contextPercent
+      const rawCache = p.agentId
+        ? cache[p.agentId]
+          ? { [p.agentId]: cache[p.agentId] }
+          : {}
+        : cache;
+      const enrichedAgents: Record<string, unknown> = {};
+      for (const [id, agent] of Object.entries(rawCache)) {
+        enrichedAgents[id] = {
+          ...agent,
+          lastActivity: activity[id]
+            ? {
+                ts: activity[id].lastActivityTs,
+                summary: activity[id].lastActivitySummary,
+              }
+            : null,
+          contextPercent: activity[id]?.contextPercent ?? null,
+        };
+      }
+
       return json({
         connected,
-        agents: p.agentId
-          ? cache[p.agentId]
-            ? { [p.agentId]: cache[p.agentId] }
-            : {}
-          : cache,
+        agents: enrichedAgents,
         liveStatus,
         pendingResults: filterAgent(results),
         pendingPermissions: filterAgent(permissions),

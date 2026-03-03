@@ -14,6 +14,7 @@ import { createTgccSpawnTool } from "./src/tools/tgcc-spawn.js";
 import { createTgccSendTool } from "./src/tools/tgcc-send.js";
 import { createTgccStatusTool } from "./src/tools/tgcc-status.js";
 import { createTgccKillTool } from "./src/tools/tgcc-kill.js";
+import { createTgccLogTool } from "./src/tools/tgcc-log.js";
 import {
   handlePermissionRequest,
   createPermissionResponseHandler,
@@ -116,6 +117,7 @@ const tgccPlugin = {
     api.registerTool(createTgccSendTool(getClient));
     api.registerTool(createTgccStatusTool(getClient));
     api.registerTool(createTgccKillTool(getClient));
+    api.registerTool(createTgccLogTool(getClient));
 
     // ── Register gateway methods ────────────────────────────────────
 

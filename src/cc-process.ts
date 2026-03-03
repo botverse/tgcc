@@ -481,6 +481,7 @@ export class CCProcess extends EventEmitter {
         return;
       }
       this.logger.info('Idle timeout — killing CC process');
+      this.emit('idle');
       this.kill();
     }, this.options.userConfig.idleTimeoutMs);
   }
