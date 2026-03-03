@@ -110,7 +110,17 @@ function toolEmoji(toolName: string): string {
 function renderSegment(seg: InternalSegment): string {
   switch (seg.type) {
     case 'thinking':
-      return `<blockquote expandable>💭 ${seg.rawText ? markdownToTelegramHtml(seg.rawText.length > 4000 ? seg.rawText.slice(0, 4000) + '…' : seg.rawText) : 'Processing…'}</blockquote>`;
+    {
+      if (!seg.rawText) return '<blockquote expandable>💭 Processing…</blockquote>';
+      const html = markdownToTelegramHtml(seg.rawText);
+      // Cap rendered HTML at 3900 chars (Telegram limit is 4096; blockquote tags add ~38).
+      // Remove any trailing incomplete tag opener so we don't send malformed HTML.
+      const maxHtml = 3900;
+      const content = html.length > maxHtml
+        ? html.slice(0, maxHtml).replace(/<[^>]*$/, '') + '…'
+        : html;
+      return `<blockquote expandable>💭 ${content}</blockquote>`;
+    }
 
     case 'text':
       return seg.rawText ? makeHtmlSafe(seg.rawText) : '';
@@ -642,6 +652,12 @@ export class StreamAccumulator {
     const html = this.renderHtml();
     const targetMsgId = this.tgMessageId; // capture NOW before any reset() can clear it
 
+    // Skip empty renders — nothing to show yet (e.g. gap between thinking split and first text delta)
+    if ((!html || html === '…') && !targetMsgId) {
+      this.flushInFlight = false;
+      return;
+    }
+
     const afterFlush = () => {
       this.flushInFlight = false;
       // If new data arrived while we were in-flight, schedule another flush
@@ -804,6 +820,9 @@ export class StreamAccumulator {
 
     // Use captured id if provided, fall back to current (for direct callers like sendOrEdit)
     const msgId = targetMsgId !== undefined ? targetMsgId : this.tgMessageId;
+
+    // Skip editing existing message with placeholder — prevents edit loops
+    if (msgId && text === '…') return;
 
     try {
       if (!msgId) {
