@@ -12,6 +12,7 @@ import { TgccSupervisorClient } from "./src/client.js";
 import { attachEventHandlers, setPermissionRequestHandler } from "./src/events.js";
 import { createTgccSpawnTool } from "./src/tools/tgcc-spawn.js";
 import { createTgccSendTool } from "./src/tools/tgcc-send.js";
+import { createTgccSessionTool } from "./src/tools/tgcc-session.js";
 import { createTgccStatusTool } from "./src/tools/tgcc-status.js";
 import { createTgccKillTool } from "./src/tools/tgcc-kill.js";
 import { createTgccLogTool } from "./src/tools/tgcc-log.js";
@@ -115,6 +116,7 @@ const tgccPlugin = {
 
     api.registerTool(createTgccSpawnTool(getClient, config.defaultAgent));
     api.registerTool(createTgccSendTool(getClient));
+    api.registerTool(createTgccSessionTool(getClient));
     api.registerTool(createTgccStatusTool(getClient));
     api.registerTool(createTgccKillTool(getClient));
     api.registerTool(createTgccLogTool(getClient));

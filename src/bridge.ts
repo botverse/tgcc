@@ -429,17 +429,20 @@ export class Bridge extends EventEmitter implements CtlHandler {
     if (!agent) return;
 
     // Construct CC message
+    const text = source?.spawnSource === 'supervisor'
+      ? `[Supervisor — BossBot]: ${data.text}`
+      : data.text;
     let ccMsg;
     if (data.imageBase64) {
       ccMsg = createImageMessage(
-        data.text || 'What do you see in this image?',
+        text || 'What do you see in this image?',
         data.imageBase64,
         data.imageMediaType as 'image/jpeg' | undefined,
       );
     } else if (data.filePath && data.fileName) {
-      ccMsg = createDocumentMessage(data.text, data.filePath, data.fileName);
+      ccMsg = createDocumentMessage(text, data.filePath, data.fileName);
     } else {
-      ccMsg = createTextMessage(data.text);
+      ccMsg = createTextMessage(text);
     }
 
     let proc = agent.ccProcess;
@@ -1022,6 +1025,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
       agent.subAgentTracker = new SubAgentTracker({
         chatId,
         sender: subAgentSender,
+        onEditAttempt: (msgId, preview) => agent.accumulator?.logIfSealed(msgId, preview),
       });
     }
 
@@ -1235,15 +1239,11 @@ export class Bridge extends EventEmitter implements CtlHandler {
           break;
         }
 
-        // Sort: current session first, then by recency
-        merged.sort((a, b) => {
-          if (a.isCurrent && !b.isCurrent) return -1;
-          if (!a.isCurrent && b.isCurrent) return 1;
-          return 0; // already sorted by mtime from discovery
-        });
+        // Oldest first, most recent at bottom (reverse the mtime-desc order from discovery)
+        merged.reverse();
 
         // One message per session, each with its own resume button
-        for (const s of merged.slice(0, 5)) {
+        for (const s of merged) {
           const displayTitle = escapeHtml(s.title);
           const kb = new InlineKeyboard();
           if (s.isCurrent) {
@@ -2157,6 +2157,143 @@ export class Bridge extends EventEmitter implements CtlHandler {
         return { responded: true, decision };
       }
 
+      // ── Phase B: Session management ──
+
+      case 'session_new': {
+        const agentId = params.agentId as string;
+        if (!agentId) throw new Error('Missing agentId');
+        const agent = this.agents.get(agentId);
+        if (!agent) throw new Error(`Unknown agent: ${agentId}`);
+        this.killAgentProcess(agentId);
+        agent.pendingSessionId = null;
+        return { cleared: true };
+      }
+
+      case 'session_continue': {
+        const agentId = params.agentId as string;
+        if (!agentId) throw new Error('Missing agentId');
+        const agent = this.agents.get(agentId);
+        if (!agent) throw new Error(`Unknown agent: ${agentId}`);
+        const contSession = agent.ccProcess?.sessionId ?? null;
+        this.killAgentProcess(agentId);
+        let sessionToResume = contSession;
+        if (!sessionToResume && agent.repo) {
+          const discovered = discoverCCSessions(agent.repo, 1);
+          if (discovered.length > 0) sessionToResume = discovered[0].id;
+        }
+        if (sessionToResume) {
+          agent.pendingSessionId = sessionToResume;
+        }
+        return { sessionId: agent.pendingSessionId ?? null };
+      }
+
+      case 'session_resume': {
+        const agentId = params.agentId as string;
+        const sessionId = params.sessionId as string;
+        if (!agentId) throw new Error('Missing agentId');
+        if (!sessionId) throw new Error('Missing sessionId');
+        const agent = this.agents.get(agentId);
+        if (!agent) throw new Error(`Unknown agent: ${agentId}`);
+        this.killAgentProcess(agentId);
+        agent.pendingSessionId = sessionId;
+        return { pendingSessionId: agent.pendingSessionId };
+      }
+
+      case 'session_list': {
+        const agentId = params.agentId as string;
+        if (!agentId) throw new Error('Missing agentId');
+        const agent = this.agents.get(agentId);
+        if (!agent) throw new Error(`Unknown agent: ${agentId}`);
+        const limit = (params.limit as number | undefined) ?? 10;
+        const currentSessionId = agent.ccProcess?.sessionId ?? null;
+        const discovered = agent.repo ? discoverCCSessions(agent.repo, limit) : [];
+        const sessions = discovered.map(d => ({
+          id: d.id,
+          title: d.title,
+          age: formatAge(d.mtime),
+          lineCount: d.lineCount,
+          contextPct: d.contextPct ?? null,
+          model: d.model ?? null,
+          isCurrent: d.id === currentSessionId,
+        }));
+        return { sessions };
+      }
+
+      case 'set_model': {
+        const agentId = params.agentId as string;
+        const model = params.model as string;
+        if (!agentId) throw new Error('Missing agentId');
+        if (!model) throw new Error('Missing model');
+        const agent = this.agents.get(agentId);
+        if (!agent) throw new Error(`Unknown agent: ${agentId}`);
+        const previousModel = agent.model ?? '';
+        agent.model = model;
+        this.sessionStore.setModel(agentId, model);
+        this.killAgentProcess(agentId);
+        this.emitStateChanged(agentId, 'model', previousModel, model, 'supervisor');
+        return { model, previousModel };
+      }
+
+      case 'set_repo': {
+        const agentId = params.agentId as string;
+        const repo = params.repo as string;
+        if (!agentId) throw new Error('Missing agentId');
+        if (!repo) throw new Error('Missing repo');
+        const agent = this.agents.get(agentId);
+        if (!agent) throw new Error(`Unknown agent: ${agentId}`);
+        const previousRepo = agent.repo ?? '';
+        const repoPath = resolveRepoPath(this.config.repos, repo);
+        agent.repo = repoPath;
+        agent.pendingSessionId = null;
+        this.sessionStore.setRepo(agentId, repoPath);
+        this.killAgentProcess(agentId);
+        return { repo: repoPath, previousRepo };
+      }
+
+      case 'cancel_turn': {
+        const agentId = params.agentId as string;
+        if (!agentId) throw new Error('Missing agentId');
+        const agent = this.agents.get(agentId);
+        if (!agent) throw new Error(`Unknown agent: ${agentId}`);
+        const cancelled = agent.ccProcess?.state === 'active';
+        if (cancelled) {
+          agent.ccProcess!.cancel();
+        }
+        return { cancelled };
+      }
+
+      case 'compact': {
+        const agentId = params.agentId as string;
+        if (!agentId) throw new Error('Missing agentId');
+        const agent = this.agents.get(agentId);
+        if (!agent) throw new Error(`Unknown agent: ${agentId}`);
+        if (!agent.ccProcess || agent.ccProcess.state !== 'active') {
+          throw new Error('No active CC process to compact');
+        }
+        const instructions = params.instructions as string | undefined;
+        const compactMsg = instructions ? `/compact ${instructions}` : '/compact';
+        agent.ccProcess.sendMessage(createTextMessage(compactMsg));
+        return { sent: true };
+      }
+
+      case 'set_permissions': {
+        const agentId = params.agentId as string;
+        const mode = params.mode as string;
+        if (!agentId) throw new Error('Missing agentId');
+        if (!mode) throw new Error('Missing mode');
+        const validModes = ['dangerously-skip', 'acceptEdits', 'default', 'plan'];
+        if (!validModes.includes(mode)) {
+          throw new Error(`Invalid mode: ${mode}. Valid: ${validModes.join(', ')}`);
+        }
+        const agent = this.agents.get(agentId);
+        if (!agent) throw new Error(`Unknown agent: ${agentId}`);
+        const agentState = this.sessionStore.getAgent(agentId);
+        const previousMode = agentState.permissionMode || agent.config.defaults.permissionMode;
+        this.sessionStore.setPermissionMode(agentId, mode);
+        this.killAgentProcess(agentId);
+        return { mode, previousMode };
+      }
+
       default:
         throw new Error(`Unknown supervisor action: ${action}`);
     }
@@ -2220,7 +2357,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
         .map(a => {
           const chatId = this.getAgentChatId(a);
           if (!chatId) return Promise.resolve();
-          return a.tgBot!.sendText(chatId, '<blockquote>🔄 Restarting… Your next message will start a new session. Use /sessions to resume a previous one.</blockquote>', 'HTML', true)
+          return a.tgBot!.sendText(chatId, '<blockquote>🔄 Restarting… Session will resume on next message.</blockquote>', 'HTML', true)
             .catch(err => this.logger.warn({ err }, 'Failed to send shutdown notification'));
         })
     );

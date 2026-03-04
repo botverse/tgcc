@@ -105,6 +105,38 @@ tgcc_send agentId="sentinella" text="Now compare with last month"
 
 If the agent is idle (no CC process), this spawns a new session. If active, the message is queued and sent to CC when it's ready for input.
 
+**One-call session management + dispatch** (optional params apply before sending):
+```
+tgcc_send agentId="tgcc" text="start fresh task" newSession=true
+tgcc_send agentId="tgcc" text="continue this" sessionId="abc12345..."
+tgcc_send agentId="tgcc" text="big refactor" model="opus"
+tgcc_send agentId="tgcc" text="plan it out" newSession=true model="opus"
+```
+
+- `newSession`: clear current session before sending (start fresh)
+- `sessionId`: resume a specific session by ID before sending
+- `model`: switch model before sending (kills current process)
+
+### `tgcc_session` — Session management without sending
+
+For session lifecycle operations that don't involve sending a message:
+```
+tgcc_session agentId="tgcc" action="list"                          # list recent sessions
+tgcc_session agentId="tgcc" action="new"                           # clear session (next msg starts fresh)
+tgcc_session agentId="tgcc" action="continue"                      # preserve session for auto-resume
+tgcc_session agentId="tgcc" action="resume" sessionId="abc12345"   # set specific session to resume
+tgcc_session agentId="tgcc" action="cancel"                        # cancel current turn (process stays alive)
+tgcc_session agentId="tgcc" action="compact"                       # trigger context compaction
+tgcc_session agentId="tgcc" action="compact" instructions="focus on streaming.ts"
+tgcc_session agentId="tgcc" action="set_model" model="opus"        # switch model
+tgcc_session agentId="tgcc" action="set_repo" repo="myproject"     # switch repo
+tgcc_session agentId="tgcc" action="set_permissions" mode="acceptEdits"
+```
+
+`action="list"` returns sessions with id, title, age, lineCount, contextPct, model, isCurrent.
+
+Permission modes: `dangerously-skip`, `acceptEdits`, `default`, `plan`
+
 ### `tgcc_kill` — Stop a CC session
 
 ```
@@ -138,6 +170,14 @@ tgcc_kill agentId="pr-review" destroy=true   # clean up
 ### Follow up on running work
 ```
 tgcc_send agentId="tgcc" text="Also fix the edge case in splitMessage"
+```
+
+### Session management
+```
+tgcc_session agentId="tgcc" action="list"             # see available sessions
+tgcc_session agentId="tgcc" action="cancel"           # interrupt running turn
+tgcc_session agentId="tgcc" action="compact"          # compact context when approaching limit
+tgcc_send agentId="tgcc" text="new task" newSession=true model="haiku"  # fresh session, different model
 ```
 
 ## How It Works

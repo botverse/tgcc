@@ -266,6 +266,69 @@ export class TgccSupervisorClient extends EventEmitter {
     return (await this.sendCommand("destroy_agent", { agentId })) as { destroyed: boolean };
   }
 
+  async sessionNew(agentId: string): Promise<{ cleared: boolean }> {
+    return (await this.sendCommand("session_new", { agentId })) as { cleared: boolean };
+  }
+
+  async sessionContinue(agentId: string): Promise<{ sessionId: string | null }> {
+    return (await this.sendCommand("session_continue", { agentId })) as { sessionId: string | null };
+  }
+
+  async sessionResume(agentId: string, sessionId: string): Promise<{ pendingSessionId: string }> {
+    return (await this.sendCommand("session_resume", { agentId, sessionId })) as { pendingSessionId: string };
+  }
+
+  async sessionList(
+    agentId: string,
+    limit?: number,
+  ): Promise<{
+    sessions: Array<{
+      id: string;
+      title: string;
+      age: string;
+      lineCount: number;
+      contextPct: number | null;
+      model: string | null;
+      isCurrent: boolean;
+    }>;
+  }> {
+    const params: Record<string, unknown> = { agentId };
+    if (limit != null) params.limit = limit;
+    return (await this.sendCommand("session_list", params)) as {
+      sessions: Array<{
+        id: string;
+        title: string;
+        age: string;
+        lineCount: number;
+        contextPct: number | null;
+        model: string | null;
+        isCurrent: boolean;
+      }>;
+    };
+  }
+
+  async setAgentModel(agentId: string, model: string): Promise<{ model: string; previousModel: string }> {
+    return (await this.sendCommand("set_model", { agentId, model })) as { model: string; previousModel: string };
+  }
+
+  async setAgentRepo(agentId: string, repo: string): Promise<{ repo: string; previousRepo: string }> {
+    return (await this.sendCommand("set_repo", { agentId, repo })) as { repo: string; previousRepo: string };
+  }
+
+  async cancelTurn(agentId: string): Promise<{ cancelled: boolean }> {
+    return (await this.sendCommand("cancel_turn", { agentId })) as { cancelled: boolean };
+  }
+
+  async compact(agentId: string, instructions?: string): Promise<{ sent: boolean }> {
+    const params: Record<string, unknown> = { agentId };
+    if (instructions) params.instructions = instructions;
+    return (await this.sendCommand("compact", params)) as { sent: boolean };
+  }
+
+  async setAgentPermissions(agentId: string, mode: string): Promise<{ mode: string; previousMode: string }> {
+    return (await this.sendCommand("set_permissions", { agentId, mode })) as { mode: string; previousMode: string };
+  }
+
   async getLog(
     agentId: string,
     opts?: { offset?: number; limit?: number; grep?: string; since?: number; type?: string },

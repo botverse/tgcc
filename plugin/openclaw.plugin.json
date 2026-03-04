@@ -2,7 +2,7 @@
   "id": "tgcc",
   "name": "TGCC Bridge",
   "description": "Bridge OpenClaw agents to Claude Code sessions via TGCC (Telegram \u2194 Claude Code)",
-  "version": "0.6.19",
+  "version": "0.7.1",
   "uiHints": {
     "socketDir": {
       "label": "Socket Directory",
