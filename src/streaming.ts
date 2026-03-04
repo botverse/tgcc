@@ -87,7 +87,7 @@ export function makeMarkdownSafe(text: string): string {
 // ── Segment types (internal) ──
 
 type InternalSegment =
-  | { type: 'thinking'; content: string; rawText: string }
+  | { type: 'thinking'; content: string; rawText: string; splitOff?: boolean; pendingSplit?: boolean }
   | { type: 'text'; content: string; rawText: string }
   | { type: 'tool'; id: string; content: string; toolName: string; status: 'pending' | 'resolved' | 'error'; inputPreview?: string; elapsed?: string; resultStat?: string; startTime: number }
   | { type: 'subagent'; id: string; content: string; toolName: string; label: string; status: 'running' | 'dispatched' | 'completed'; inputPreview?: string; startTime: number; progressLines: string[] }
@@ -113,17 +113,28 @@ function renderSegment(seg: InternalSegment): string {
     {
       if (!seg.rawText) return '<blockquote expandable>💭 Processing…</blockquote>';
       const html = markdownToTelegramHtml(seg.rawText);
-      // Cap rendered HTML at 3900 chars (Telegram limit is 4096; blockquote tags add ~38).
-      // Remove any trailing incomplete tag opener so we don't send malformed HTML.
-      const maxHtml = 3900;
-      const content = html.length > maxHtml
-        ? html.slice(0, maxHtml).replace(/<[^>]*$/, '') + '…'
-        : html;
+      // Telegram can't nest <pre> inside <blockquote expandable> — collapse code blocks to inline <code>.
+      const safeHtml = html.replace(/<pre><code(?:[^>]*)>([\s\S]*?)<\/code><\/pre>/g, (_, code: string) =>
+        `<code>${code.trim().replace(/\n/g, ' ')}</code>`,
+      );
+      // Cap rendered HTML at 4000 chars (Telegram limit is 4096; blockquote tags add ~40,
+      // leaving ~56 chars safety buffer). Remove trailing incomplete tag opener.
+      const maxHtml = 4000;
+      const content = safeHtml.length > maxHtml
+        ? safeHtml.slice(0, maxHtml).replace(/<[^>]*$/, '') + '…'
+        : safeHtml;
       return `<blockquote expandable>💭 ${content}</blockquote>`;
     }
 
-    case 'text':
-      return seg.rawText ? makeHtmlSafe(seg.rawText) : '';
+    case 'text': {
+      if (!seg.rawText) return '';
+      const html = makeHtmlSafe(seg.rawText);
+      const maxHtml = 4000;
+      const truncated = html.length > maxHtml
+        ? html.slice(0, maxHtml).replace(/<[^>]*$/, '') + '…'
+        : html;
+      return truncated;
+    }
 
     case 'tool': {
       const emoji = toolEmoji(seg.toolName);
@@ -206,16 +217,34 @@ export class StreamAccumulator {
   // Tool hide timers (fix: don't flash ⚡ for fast tools that resolve <500ms)
   private toolHideTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
+  // Sealed message IDs — used to detect re-editing of retired/split-off bubbles.
+  // 'writing'   = split has claimed this ID for ONE authorized final edit; others are violations
+  // 'thinking'  = thinking bubble fully sealed (split complete); any edit is a violation
+  // 'bubble-end'= turn ended via reset(); any edit is a violation
+  // Never cleared: violations from past turns are still violations.
+  private sealedMsgIds = new Map<number, 'writing' | 'thinking' | 'bubble-end'>();
+
   constructor(options: StreamAccumulatorOptions) {
     this.chatId = options.chatId;
     this.sender = options.sender;
     this.editIntervalMs = options.editIntervalMs ?? 1000;
-    this.splitThreshold = options.splitThreshold ?? 3500;
+    this.splitThreshold = options.splitThreshold ?? 4000;
     this.logger = options.logger;
     this.onError = options.onError;
   }
 
   get allMessageIds(): number[] { return [...this.messageIds]; }
+
+  /** Check if msgId is sealed and emit a warn log. Used by external callers (e.g. SubAgentTracker). */
+  logIfSealed(msgId: number, preview: string): void {
+    const reason = this.sealedMsgIds.get(msgId);
+    if (reason === 'thinking') {
+      this.logger?.warn?.({ msgId, preview: preview.slice(0, 120) }, '[BLOCKQUOTE-REWRITE] edit attempt on sealed thinking bubble');
+    } else if (reason === 'bubble-end') {
+      this.logger?.warn?.({ msgId, preview: preview.slice(0, 120) }, '[OLD-BUBBLE-REWRITE] edit attempt on retired message bubble');
+    }
+    // 'writing' = authorized split edit — not a violation
+  }
 
   /** Set usage stats for the current turn (called from bridge on result event) */
   setTurnUsage(usage: TurnUsage): void {
@@ -233,10 +262,20 @@ export class StreamAccumulator {
 
   /** Append a supervisor message segment. Renders in stream order with everything else. */
   addSupervisorMessage(text: string): void {
-    const preview = text.length > 500 ? text.slice(0, 500) + '…' : text;
+    const html = escapeHtml(text);
+    // Cap at 4000 chars of HTML (Telegram limit is 4096; blockquote tags add ~40 chars overhead).
+    // Cut at a word boundary to avoid mid-word truncation.
+    const maxHtml = 4000;
+    const truncated = html.length > maxHtml
+      ? html.slice(0, maxHtml).replace(/\s+\S*$/, '') + '…'
+      : html;
+    // Use expandable blockquote for long messages so they collapse in Telegram.
+    const long = html.length > 200;
     const seg: InternalSegment = {
       type: 'supervisor',
-      content: `<blockquote>🦞 ${escapeHtml(preview)}</blockquote>`,
+      content: long
+        ? `<blockquote expandable>🦞 ${truncated}</blockquote>`
+        : `<blockquote>🦞 ${truncated}</blockquote>`,
     };
     this.segments.push(seg);
     this.requestRender();
@@ -281,7 +320,7 @@ export class StreamAccumulator {
     this.currentBlockType = blockType as typeof this.currentBlockType;
 
     if (blockType === 'thinking') {
-      const seg: InternalSegment = { type: 'thinking', rawText: '', content: '' };
+      const seg: InternalSegment = { type: 'thinking', rawText: '', content: '', pendingSplit: this.segments.length > 0 };
       seg.content = renderSegment(seg);
       this.segments.push(seg);
       this.currentSegment = seg;
@@ -447,26 +486,65 @@ export class StreamAccumulator {
         const capturedMsgId = this.tgMessageId;
         const thinkingHtml = seg.content;
 
-        // Remove ALL segments and null msgId synchronously — NO awaits.
+        // Mark split-off and remove synchronously — NO awaits.
+        seg.splitOff = true;
         this.segments = this.segments.slice(thinkingIdx + 1);
         this.tgMessageId = null;
+
+        // Seal capturedMsgId synchronously (before any async), so any flushRender item already
+        // in the sendQueue sees the 'writing' marker. 'writing' = one authorized final edit pending.
+        if (capturedMsgId) this.sealedMsgIds.set(capturedMsgId, 'writing');
+
+        // Capture thinkingMsgId in a local — never read this.tgMessageId across a .then() boundary.
+        let capturedThinkingId: number | null = null;
         this.sendQueue = this.sendQueue
           .then(() => this._doSendOrEdit(preHtml || '…', capturedMsgId))
-          .then(() => this._doSendOrEdit(thinkingHtml || '…', null))
-          .then(() => { this.tgMessageId = null; }) // clear so response creates its own bubble
+          .then(async () => {
+            // Upgrade pre-thinking bubble: 'writing' → 'bubble-end' (no further edits allowed).
+            if (capturedMsgId) this.sealedMsgIds.set(capturedMsgId, 'bubble-end');
+            await this._doSendOrEdit(thinkingHtml || '…', null);
+            // Capture thinking ID immediately after send, before the next .then() boundary
+            // (microtasks don't yield to macrotasks between these two lines).
+            capturedThinkingId = this.tgMessageId;
+          })
+          .then(() => {
+            if (capturedThinkingId) this.sealedMsgIds.set(capturedThinkingId, 'thinking');
+            this.tgMessageId = null; // clear so response creates its own bubble
+          })
           .catch(err => {
             this.logger?.error?.({ err }, 'thinking bubble split send failed');
           });
       } else {
         // Thinking is the first/only segment.
+        // Capture tgMessageId before nulling — flushRender may have already live-edited
+        // this message with thinking content; EDIT it (not create a new one) to avoid duplicates.
         const thinkingHtml = seg.content;
+        const capturedMsgId = this.tgMessageId;
 
-        // Remove segment and null msgId synchronously — NO awaits.
+        // Mark split-off and remove synchronously — NO awaits.
+        seg.splitOff = true;
         this.segments = this.segments.slice(1);
         this.tgMessageId = null;
+
+        // Seal capturedMsgId synchronously before the chain. 'writing' = one authorized final edit.
+        // If capturedMsgId is null, the thinking bubble doesn't exist yet (will be sent fresh).
+        if (typeof capturedMsgId === 'number') this.sealedMsgIds.set(capturedMsgId, 'writing');
+
+        // Capture thinking ID in a local — if capturedMsgId is a number, it's already known.
+        // If null (send case), capture from this.tgMessageId immediately after the send,
+        // before the next .then() boundary where flushRender could mutate it.
+        let capturedThinkingId: number | null = typeof capturedMsgId === 'number' ? capturedMsgId : null;
         this.sendQueue = this.sendQueue
-          .then(() => this._doSendOrEdit(thinkingHtml || '…', null))
-          .then(() => { this.tgMessageId = null; }) // clear so response creates its own bubble
+          .then(async () => {
+            await this._doSendOrEdit(thinkingHtml || '…', capturedMsgId);
+            // Capture fresh send ID immediately (same microtask continuation — no macrotask gap).
+            if (capturedThinkingId === null) capturedThinkingId = this.tgMessageId;
+          })
+          .then(() => {
+            // Upgrade from 'writing' to 'thinking' (or record the new send ID as 'thinking').
+            if (capturedThinkingId) this.sealedMsgIds.set(capturedThinkingId, 'thinking');
+            this.tgMessageId = null; // clear so response creates its own bubble
+          })
           .catch(err => {
             this.logger?.error?.({ err }, 'thinking bubble send failed');
           });
@@ -592,6 +670,7 @@ export class StreamAccumulator {
   renderHtml(): string {
     const parts = this.segments
       .map(s => {
+        if (s.type === 'thinking' && (s.splitOff || s.pendingSplit)) return ''; // already rendered / will be split into its own bubble
         // Hide pending tool segments until 500ms has elapsed — fast tools go directly to resolved state
         if (s.type === 'tool' && s.status === 'pending' && this.toolHideTimers.has(s.id)) return '';
         return s.content;
@@ -782,7 +861,13 @@ export class StreamAccumulator {
     // Final render — chain directly onto sendQueue so it runs after any in-flight edits.
     // Use splitMessage if over threshold, same as flushRender, to avoid silent Telegram failures.
     const html = this.renderHtml();
-    const targetMsgId = this.tgMessageId; // capture NOW before any reset() can clear it
+    // Capture NOW before any reset() can clear it, but treat sealed IDs as null
+    // (thinking split may have sealed tgMessageId before finalize() runs).
+    const rawTargetId = this.tgMessageId;
+    if (rawTargetId !== null && this.sealedMsgIds.has(rawTargetId)) {
+      this.logger?.warn?.({ targetMsgId: rawTargetId }, '[FINALIZE-SEALED-TARGET] finalize() captured sealed msgId — creating new message instead');
+    }
+    const targetMsgId = (rawTargetId !== null && this.sealedMsgIds.has(rawTargetId)) ? null : rawTargetId;
     if (html && html !== '…') {
       if (html.length > this.splitThreshold) {
         this.sendQueue = this.sendQueue
@@ -831,6 +916,16 @@ export class StreamAccumulator {
         this.tgMessageId = await this.sender.sendMessage(this.chatId, text, 'HTML');
         this.messageIds.push(this.tgMessageId);
       } else {
+        // Sealed check — lowest level, right before the API call.
+        // 'writing'    = authorized split final edit in progress — allow, no warning.
+        // 'thinking'   = thinking bubble fully sealed — violation.
+        // 'bubble-end' = turn ended, bubble retired — violation.
+        const sealReason = this.sealedMsgIds.get(msgId);
+        if (sealReason === 'thinking') {
+          this.logger?.warn?.({ msgId, preview: text.slice(0, 120) }, '[BLOCKQUOTE-REWRITE] editing sealed thinking bubble');
+        } else if (sealReason === 'bubble-end') {
+          this.logger?.warn?.({ msgId, preview: text.slice(0, 120) }, '[OLD-BUBBLE-REWRITE] editing retired message bubble');
+        }
         await this.sender.editMessage(this.chatId, msgId, text, 'HTML');
       }
     } catch (err: unknown) {
@@ -879,6 +974,8 @@ export class StreamAccumulator {
     const prevQueue = this.sendQueue;
     this.softReset();
     this.segments = [];
+    // Seal current bubble before retiring it — detects any future edits to this message ID
+    if (this.tgMessageId) this.sealedMsgIds.set(this.tgMessageId, 'bubble-end');
     this.tgMessageId = null;
     this.messageIds = [];
     this.toolInputBuffers.clear();
@@ -1000,10 +1097,12 @@ function extractToolInputSummary(toolName: string, inputJson: string, maxLen = 1
 
 function extractToolResultStat(toolName: string, content?: string, toolUseResult?: Record<string, unknown>): string {
   if (toolUseResult && (toolName === 'Edit' || toolName === 'MultiEdit')) {
-    const patches = toolUseResult.structuredPatch as Array<{ lines?: string[] }> | undefined;
+    const patches = toolUseResult.structuredPatch as Array<{ oldStart?: number; lines?: string[] }> | undefined;
     if (patches?.length) {
       let added = 0, removed = 0;
+      const hunkLines: number[] = [];
       for (const patch of patches) {
+        if (typeof patch.oldStart === 'number') hunkLines.push(patch.oldStart);
         if (patch.lines) {
           for (const line of patch.lines) {
             if (line.startsWith('+') && !line.startsWith('+++')) added++;
@@ -1015,6 +1114,7 @@ function extractToolResultStat(toolName: string, content?: string, toolUseResult
         const parts: string[] = [];
         if (added) parts.push(`+${added}`);
         if (removed) parts.push(`-${removed}`);
+        if (hunkLines.length) parts.push(`@L${hunkLines[0]}${hunkLines.length > 1 ? `…L${hunkLines[hunkLines.length - 1]}` : ''}`);
         return parts.join(' / ');
       }
     }
@@ -1058,8 +1158,12 @@ function extractToolResultStat(toolName: string, content?: string, toolUseResult
       return first.length > 60 ? first.slice(0, 60) + '…' : first;
     }
     case 'Read': {
-      const lines = content.split('\n').length;
-      return `${lines} lines`;
+      const lineNums = [...content.matchAll(/^\s*(\d+)[→>]/gm)].map(m => parseInt(m[1], 10));
+      if (lineNums.length >= 2) {
+        const first = lineNums[0], last = lineNums[lineNums.length - 1];
+        return `L${first}–L${last} · ${lineNums.length} lines`;
+      }
+      return `${content.split('\n').length} lines`;
     }
     case 'Search':
     case 'Grep':
@@ -1265,6 +1369,8 @@ export interface SubAgentSender {
 export interface SubAgentTrackerOptions {
   chatId: number | string;
   sender: SubAgentSender;
+  /** Called right before every editMessage — used to detect sealed-bubble violations. */
+  onEditAttempt?: (msgId: number, preview: string) => void;
 }
 
 export interface MailboxMessage {
@@ -1281,6 +1387,7 @@ export type AllAgentsReportedCallback = () => void;
 export class SubAgentTracker {
   private chatId: number | string;
   private sender: SubAgentSender;
+  private onEditAttempt?: (msgId: number, preview: string) => void;
   private agents = new Map<string, SubAgentInfo>();
   private blockToAgent = new Map<number, string>();
   private standaloneMsgId: number | null = null;  // post-turn standalone status bubble
@@ -1299,6 +1406,7 @@ export class SubAgentTracker {
   constructor(options: SubAgentTrackerOptions) {
     this.chatId = options.chatId;
     this.sender = options.sender;
+    this.onEditAttempt = options.onEditAttempt;
   }
 
   get activeAgents(): SubAgentInfo[] {
@@ -1658,6 +1766,8 @@ export class SubAgentTracker {
     const html = this.buildStandaloneHtml();
     this.sendQueue = this.sendQueue.then(async () => {
       try {
+        // Sealed check — lowest level, right before the API call.
+        this.onEditAttempt?.(msgId, html.slice(0, 120));
         await this.sender.editMessage(this.chatId, msgId, html, 'HTML');
       } catch { /* non-critical */ }
     }).catch(() => {});
