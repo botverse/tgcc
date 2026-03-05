@@ -64,6 +64,7 @@ interface AgentInstance {
   typingInterval: ReturnType<typeof setInterval> | null; // single typing interval
   typingChatId: number | null;             // chat currently showing typing indicator
   pendingSessionId: string | null;         // for /resume: sessionId to use on next spawn
+  forceNewSession: boolean;               // /new was used — don't auto-continue on next spawn
   destroyTimer: ReturnType<typeof setTimeout> | null; // auto-destroy for ephemeral
   eventBuffer: EventBuffer;               // ring buffer for observability
 }
@@ -266,6 +267,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
       typingInterval: null,
       typingChatId: null,
       pendingSessionId: null,
+      forceNewSession: false,
       destroyTimer: null,
       eventBuffer: new EventBuffer(),
     };
@@ -592,11 +594,14 @@ export class Bridge extends EventEmitter implements CtlHandler {
     // Determine session ID and whether to continue
     const sessionId = agent.pendingSessionId ?? undefined;
     agent.pendingSessionId = null; // consumed
+    const forceNew = agent.forceNewSession;
+    agent.forceNewSession = false; // consumed
 
     // Auto-continue if no explicit session and last activity was recent (<2h)
+    // forceNew (/new command) overrides the recency check.
     const STALE_THRESHOLD_MS = 2 * 60 * 60 * 1000;
     const lastActivityMs = new Date(agentState.lastActivity).getTime();
-    const continueSession = !!sessionId || (Date.now() - lastActivityMs < STALE_THRESHOLD_MS);
+    const continueSession = !forceNew && (!!sessionId || (Date.now() - lastActivityMs < STALE_THRESHOLD_MS));
 
     // Generate MCP config (use agentId as the "userId" for socket naming)
     const mcpServerPath = resolveMcpServerPath();
@@ -1176,7 +1181,8 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
       case 'new': {
         this.killAgentProcess(agentId);
-        agent.pendingSessionId = null; // next message spawns fresh
+        agent.pendingSessionId = null;
+        agent.forceNewSession = true; // next message spawns fresh regardless of recency
         const newLines = ['Session cleared. Next message starts fresh.'];
         if (agent.repo) newLines.push(`📂 <code>${escapeHtml(shortenRepoPath(agent.repo))}</code>`);
         if (agent.model) newLines.push(`🤖 ${escapeHtml(agent.model)}`);
@@ -1966,6 +1972,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
           typingInterval: null,
           typingChatId: null,
           pendingSessionId: null,
+          forceNewSession: false,
           destroyTimer: null,
           eventBuffer: new EventBuffer(),
         };
@@ -2166,6 +2173,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
         if (!agent) throw new Error(`Unknown agent: ${agentId}`);
         this.killAgentProcess(agentId);
         agent.pendingSessionId = null;
+        agent.forceNewSession = true;
         return { cleared: true };
       }
 
