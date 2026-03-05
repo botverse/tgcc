@@ -16,6 +16,17 @@ import type {
 } from "./client.js";
 
 // ---------------------------------------------------------------------------
+// HTML escaping
+// ---------------------------------------------------------------------------
+
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+// ---------------------------------------------------------------------------
 // Agent cache
 // ---------------------------------------------------------------------------
 
@@ -147,7 +158,7 @@ function formatObservabilityMessage(event: Record<string, unknown>): string | nu
     }
     case "git_commit": {
       const msg = typeof event.message === "string" ? event.message : "?";
-      return `${prefix} Committed: "${msg}"`;
+      return `${prefix} Committed: "${escapeHtml(msg)}"`;
     }
     case "context_pressure": {
       const pct = typeof event.percent === "number" ? event.percent : "?";
@@ -163,12 +174,12 @@ function formatObservabilityMessage(event: Record<string, unknown>): string | nu
     }
     case "task_milestone": {
       const task = typeof event.task === "string" ? event.task : "?";
-      const progress = typeof event.progress === "string" ? `[${event.progress}] ` : "";
-      return `${prefix} ${progress}${task}`;
+      const progress = typeof event.progress === "string" ? `[${escapeHtml(event.progress)}] ` : "";
+      return `${prefix} ${progress}${escapeHtml(task)}`;
     }
     case "cc_message": {
       const text = typeof event.text === "string" ? event.text : "?";
-      return `${prefix} "${text}"`;
+      return `${prefix} "${escapeHtml(text)}"`;
     }
     case "subagent_spawn": {
       const count = typeof event.count === "number" ? event.count : "?";
@@ -248,8 +259,8 @@ export function attachEventHandlers(
     pushRecentEvent("result", event.agentId, event.is_error ? "error" : "ok");
     const icon = event.is_error ? "❌" : "✔";
     const label = event.is_error ? "error" : "done";
-    const preview = event.text ? `\n${event.text.slice(0, 200)}` : "";
-    const tgMsg = `${icon} <b>${event.agentId}</b> ${label}${preview}`;
+    const preview = event.text ? `\n${escapeHtml(event.text.slice(0, 200))}` : "";
+    const tgMsg = `${icon} <b>${escapeHtml(event.agentId)}</b> ${label}${preview}`;
     sendTelegram(tgMsg);
     void wakeAgent(`${icon} ${event.agentId} ${label}${preview}`);
   });
@@ -326,7 +337,7 @@ export function attachEventHandlers(
       log.info(`[tgcc] observability: ${message}`);
       pushRecentEvent("cc_message", agentId, message);
     }
-    sendTelegram(`💬 <b>${agentId}</b>: ${text}`);
+    sendTelegram(`💬 <b>${escapeHtml(agentId)}</b>: ${escapeHtml(text)}`);
     void wakeAgent(`💬 ${agentId}: ${text}`);
   });
 
