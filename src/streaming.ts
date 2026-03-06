@@ -97,12 +97,14 @@ type InternalSegment =
 
 function toolEmoji(toolName: string): string {
   switch (toolName) {
-    case 'Read':                         return '👓';
-    case 'Write':                        return '✏️';
-    case 'Edit': case 'MultiEdit':       return '✏️';
-    case 'Grep': case 'Search': case 'Glob': return '🔍';
-    case 'WebFetch': case 'WebSearch':   return '🌐';
-    default:                             return '⚡';
+    case 'Bash':                                return '⚡';
+    case 'Read':                                return '👓';
+    case 'Write':                               return '✏️';
+    case 'Edit': case 'MultiEdit':              return '✏️';
+    case 'Grep': case 'Search': case 'Glob':    return '🔍';
+    case 'WebFetch': case 'WebSearch':          return '🌐';
+    case 'ExitPlanMode': case 'EnterPlanMode':  return '📋';
+    default:                                    return '🔧';
   }
 }
 
@@ -223,6 +225,11 @@ export class StreamAccumulator {
   // 'bubble-end'= turn ended via reset(); any edit is a violation
   // Never cleared: violations from past turns are still violations.
   private sealedMsgIds = new Map<number, 'writing' | 'thinking' | 'bubble-end'>();
+
+  // Ordered history of all bubble IDs ever sent (never cleared).
+  // Used for sealed-bubble detection: if we try to edit a bubble that's in this list
+  // but is NOT the last entry, we're writing to a sealed (retired) bubble.
+  private allBubbles: number[] = [];
 
   constructor(options: StreamAccumulatorOptions) {
     this.chatId = options.chatId;
@@ -679,20 +686,6 @@ export class StreamAccumulator {
     return parts.join('\n') || '…';
   }
 
-  /** Force any pending timer to fire immediately and await the send queue.
-   *  Bypasses the first-send gate (like finalize). Useful in tests. */
-  async flush(): Promise<void> {
-    this.firstSendReady = true;
-    this.clearFirstSendTimer();
-    if (this.flushTimer) {
-      clearTimeout(this.flushTimer);
-      this.flushTimer = null;
-      this.flushRender();
-    } else if (this.dirty && !this.flushInFlight && !this.sealed) {
-      this.flushRender();
-    }
-    await this.sendQueue;
-  }
 
   /** Mark dirty and schedule a throttled flush. The single entry point for all renders.
    *  Data in → dirty flag → throttled flush → TG edit. One path, no re-entrant loops. */
@@ -915,11 +908,21 @@ export class StreamAccumulator {
       if (!msgId) {
         this.tgMessageId = await this.sender.sendMessage(this.chatId, text, 'HTML');
         this.messageIds.push(this.tgMessageId);
+        this.allBubbles.push(this.tgMessageId);
       } else {
-        // Sealed check — lowest level, right before the API call.
+        // Sealed-bubble check: if this msgId is in allBubbles but NOT the last entry,
+        // we're trying to edit a retired/sealed bubble — log and throw to prevent the write.
+        const bubbleIdx = this.allBubbles.indexOf(msgId);
+        if (bubbleIdx !== -1 && bubbleIdx !== this.allBubbles.length - 1) {
+          const lastBubble = this.allBubbles[this.allBubbles.length - 1];
+          this.logger?.error?.({ msgId, bubbleIdx, totalBubbles: this.allBubbles.length, lastBubble, preview: text.slice(0, 120) }, '[SEALED-BUBBLE] attempted write to sealed bubble');
+          throw new Error(`[SEALED-BUBBLE] msgId=${msgId} is sealed (idx=${bubbleIdx}, last=${lastBubble})`);
+        }
+
+        // Secondary: sealedMsgIds check for thinking/split bubbles.
         // 'writing'    = authorized split final edit in progress — allow, no warning.
-        // 'thinking'   = thinking bubble fully sealed — violation.
-        // 'bubble-end' = turn ended, bubble retired — violation.
+        // 'thinking'   = thinking bubble fully sealed — violation (also caught above).
+        // 'bubble-end' = turn ended, bubble retired — violation (also caught above).
         const sealReason = this.sealedMsgIds.get(msgId);
         if (sealReason === 'thinking') {
           this.logger?.warn?.({ msgId, preview: text.slice(0, 120) }, '[BLOCKQUOTE-REWRITE] editing sealed thinking bubble');
@@ -939,6 +942,7 @@ export class StreamAccumulator {
         return this._doSendOrEdit(text, targetMsgId); // preserve captured id through retry
       }
       if (err instanceof Error && err.message.includes('message is not modified')) return;
+      if (err instanceof Error && err.message.startsWith('[SEALED-BUBBLE]')) return; // already logged above
       this.logger?.error?.({ err, errorCode }, 'Telegram API error in _doSendOrEdit — skipping');
     }
   }
@@ -1010,6 +1014,14 @@ function shortenPath(p: string): string {
 }
 
 function extractToolInputSummary(toolName: string, inputJson: string, maxLen = 120, requireComplete = false): string | null {
+  const nameOverhead = toolName.length + 2; // "Name(" + ")"
+  const argsMax = Math.max(20, maxLen - nameOverhead);
+  const args = _extractToolArgs(toolName, inputJson, argsMax, requireComplete);
+  if (args === null && requireComplete) return null;
+  return `${toolName}(${args ?? ''})`;
+}
+
+function _extractToolArgs(toolName: string, inputJson: string, maxLen = 120, requireComplete = false): string | null {
   if (!inputJson) return null;
 
   const fieldsByTool: Record<string, string[]> = {
@@ -1254,6 +1266,7 @@ export function formatUsageFooter(usage: TurnUsage, _model?: string): string {
 // ── Sub-agent detection patterns ──
 
 const CC_SUB_AGENT_TOOLS = new Set([
+  'Agent',
   'Task',
   'dispatch_agent',
   'create_agent',

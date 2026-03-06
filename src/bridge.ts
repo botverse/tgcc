@@ -28,6 +28,8 @@ import { McpBridgeServer, type McpToolRequest, type McpToolResponse } from './mc
 import {
   SessionStore,
   discoverCCSessions,
+  getSessionJsonlPath,
+  hasIDEContent,
 } from './session.js';
 import {
   CtlServer,
@@ -42,11 +44,24 @@ import { randomUUID } from 'node:crypto';
 
 // ── Types ──
 
+interface AskQuestion {
+  question: string;
+  options?: string[];
+  multiSelect?: boolean;
+}
+
 interface PendingPermission {
   requestId: string;
   userId: string;
   toolName: string;
   input: Record<string, unknown>;
+  /** Set when this came from a regular tool_use (not can_use_tool). Response via sendToolResult. */
+  toolUseId?: string;
+  // AskUserQuestion state
+  questionMsgId?: number;
+  questionChatId?: number;
+  questionAnswers?: Record<string, string[]>;  // qIdx → currently selected options
+  awaitingTextQIdx?: number;                   // set when waiting for free-text "Other" answer
 }
 
 interface AgentInstance {
@@ -65,6 +80,7 @@ interface AgentInstance {
   typingChatId: number | null;             // chat currently showing typing indicator
   pendingSessionId: string | null;         // for /resume: sessionId to use on next spawn
   forceNewSession: boolean;               // /new was used — don't auto-continue on next spawn
+  pendingIdeAwareness: boolean;           // true when resuming a session that was active in an IDE
   destroyTimer: ReturnType<typeof setTimeout> | null; // auto-destroy for ephemeral
   eventBuffer: EventBuffer;               // ring buffer for observability
 }
@@ -268,6 +284,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
       typingChatId: null,
       pendingSessionId: null,
       forceNewSession: false,
+      pendingIdeAwareness: false,
       destroyTimer: null,
       eventBuffer: new EventBuffer(),
     };
@@ -400,6 +417,34 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
     this.logger.debug({ agentId, userId: msg.userId, type: msg.type }, 'TG message received');
 
+    // Check if this text is an "Other" answer for a pending AskUserQuestion
+    if (msg.text) {
+      for (const [reqId, pending] of agent.pendingPermissions) {
+        if (pending.toolName === 'AskUserQuestion' && pending.awaitingTextQIdx !== undefined) {
+          const qi = pending.awaitingTextQIdx;
+          const questions = (pending.input?.questions ?? []) as AskQuestion[];
+          const answers = { ...(pending.questionAnswers ?? {}), [String(qi)]: [msg.text] };
+          const allAnswered = questions.every((_, i) => answers[String(i)]?.length);
+          if (allAnswered) {
+            if (agent.ccProcess) submitAskAnswer(pending, agent.ccProcess, questions, answers);
+            agent.pendingPermissions.delete(reqId);
+            if (pending.questionMsgId && pending.questionChatId) {
+              const summary = questions.map((q, i) => `<b>${escapeHtml(q.question)}</b>\n→ ${escapeHtml(answers[String(i)]?.[0] ?? '')}`).join('\n\n');
+              agent.tgBot?.editText(pending.questionChatId, pending.questionMsgId, `❓ ${summary}`, 'HTML').catch(() => {});
+            }
+          } else {
+            pending.questionAnswers = answers;
+            pending.awaitingTextQIdx = undefined;
+            if (pending.questionMsgId && pending.questionChatId) {
+              const { text: uiText, keyboard } = buildAskUi(reqId, questions, answers);
+              agent.tgBot?.editTextWithKeyboard(pending.questionChatId, pending.questionMsgId, uiText, keyboard, 'HTML').catch(() => {});
+            }
+          }
+          return; // don't forward to CC
+        }
+      }
+    }
+
     // Ensure batcher exists (one per agent, not per user)
     if (!agent.batcher) {
       agent.batcher = new MessageBatcher(2000, (combined) => {
@@ -431,9 +476,15 @@ export class Bridge extends EventEmitter implements CtlHandler {
     if (!agent) return;
 
     // Construct CC message
-    const text = source?.spawnSource === 'supervisor'
+    let text = source?.spawnSource === 'supervisor'
       ? `[Supervisor — BossBot]: ${data.text}`
       : data.text;
+
+    // Prepend IDE awareness context to the first message after an IDE session takeover
+    if (agent.pendingIdeAwareness) {
+      agent.pendingIdeAwareness = false;
+      text = `[Context: This session was recently active in an IDE (VSCode). IDE messages are in your conversation history but may not appear in this Telegram chat.]\n\n${text}`;
+    }
     let ccMsg;
     if (data.imageBase64) {
       ccMsg = createImageMessage(
@@ -483,6 +534,33 @@ export class Bridge extends EventEmitter implements CtlHandler {
           if (staleChatId && agent.tgBot) {
             agent.tgBot.sendText(staleChatId, '<blockquote>Starting a new session. Use /sessions to resume a previous one.</blockquote>', 'HTML', true)
               .catch(err => this.logger.error({ err }, 'Failed to send stale session notification'));
+          }
+        } else if (!isStale && !agent.forceNewSession) {
+          // Auto-continuing a recent session — check if it came from an IDE (e.g. VSCode)
+          const ideChatId = source?.chatId;
+          if (ideChatId && agent.tgBot) {
+            const recent = discoverCCSessions(agent.repo, 1);
+            if (recent.length > 0) {
+              const jsonlPath = getSessionJsonlPath(recent[0].id, agent.repo);
+              if (hasIDEContent(jsonlPath)) {
+                agent.tgBot.sendText(ideChatId, formatSystemMessage('status', 'Resuming a session previously active in VSCode IDE.'), 'HTML', true)
+                  .catch(err => this.logger.error({ err }, 'Failed to send IDE origin notification'));
+                agent.pendingIdeAwareness = true;
+              }
+            }
+          }
+        }
+      }
+
+      // Explicit session resume — also check for IDE origin
+      if (agent.pendingSessionId && !agent.forceNewSession) {
+        const ideChatId = source?.chatId;
+        if (ideChatId && agent.tgBot) {
+          const jsonlPath = getSessionJsonlPath(agent.pendingSessionId, agent.repo);
+          if (hasIDEContent(jsonlPath)) {
+            agent.tgBot.sendText(ideChatId, formatSystemMessage('status', 'Resuming a session previously active in VSCode IDE.'), 'HTML', true)
+              .catch(err => this.logger.error({ err }, 'Failed to send IDE origin notification'));
+            agent.pendingIdeAwareness = true;
           }
         }
       }
@@ -763,19 +841,22 @@ export class Bridge extends EventEmitter implements CtlHandler {
     });
 
     // Media from tool results (images, PDFs, etc.)
-    proc.on('media', (media: { kind: string; media_type: string; data: string }) => {
+    proc.on('media', async (media: { kind: string; media_type: string; data: string }) => {
       const buf = Buffer.from(media.data, 'base64');
       const chatId = this.getAgentChatId(agent);
       if (!chatId || !agent.tgBot) return;
-      if (media.kind === 'image') {
-        agent.tgBot.sendPhotoBuffer(chatId, buf).catch(err => {
-          this.logger.error({ err, agentId }, 'Failed to send tool_result image');
-        });
-      } else if (media.kind === 'document') {
-        const ext = media.media_type === 'application/pdf' ? '.pdf' : '';
-        agent.tgBot.sendDocumentBuffer(chatId, buf, `document${ext}`).catch(err => {
-          this.logger.error({ err, agentId }, 'Failed to send tool_result document');
-        });
+
+      // Seal the current bubble so subsequent text starts a new one below the media
+      if (agent.accumulator) agent.accumulator.reset();
+
+      try {
+        if (media.kind === 'image') {
+          await agent.tgBot.sendPhotoBuffer(chatId, buf);
+        } else if (media.kind === 'document') {
+          await agent.tgBot.sendDocumentBuffer(chatId, buf, `document${media.media_type === 'application/pdf' ? '.pdf' : ''}`);
+        }
+      } catch (err) {
+        this.logger.error({ err, agentId }, 'Failed to send tool_result media');
       }
     });
 
@@ -791,6 +872,46 @@ export class Bridge extends EventEmitter implements CtlHandler {
           } else if (block.type === 'tool_use') {
             const toolBlock = block as { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> };
             this.highSignalDetector.handleAssistantToolUse(agentId, toolBlock.name, toolBlock.id, toolBlock.input);
+
+            if (toolBlock.name === 'AskUserQuestion') {
+              const pending: PendingPermission = {
+                requestId: toolBlock.id,
+                userId: agentId,
+                toolName: 'AskUserQuestion',
+                input: toolBlock.input,
+                toolUseId: toolBlock.id,
+              };
+              agent.pendingPermissions.set(toolBlock.id, pending);
+              const questions = (toolBlock.input.questions ?? []) as AskQuestion[];
+              const { text, keyboard } = buildAskUi(toolBlock.id, questions, {});
+              const chatId = this.getAgentChatId(agent);
+              if (chatId && agent.tgBot) {
+                agent.tgBot.sendTextWithKeyboard(chatId, text, keyboard, 'HTML')
+                  .then(msgId => {
+                    pending.questionMsgId = msgId;
+                    pending.questionChatId = chatId;
+                    pending.questionAnswers = {};
+                  })
+                  .catch(err => this.logger.error({ err }, 'Failed to send AskUserQuestion'));
+              }
+            } else if (toolBlock.name === 'ExitPlanMode') {
+              const pending: PendingPermission = {
+                requestId: toolBlock.id,
+                userId: agentId,
+                toolName: 'ExitPlanMode',
+                input: toolBlock.input,
+                toolUseId: toolBlock.id,
+              };
+              agent.pendingPermissions.set(toolBlock.id, pending);
+              const chatId = this.getAgentChatId(agent);
+              if (chatId && agent.tgBot) {
+                const keyboard = new InlineKeyboard()
+                  .text('✅ Approve', `plan_approve:${toolBlock.id}`)
+                  .text('❌ Reject', `plan_reject:${toolBlock.id}`);
+                agent.tgBot.sendTextWithKeyboard(chatId, '📋 <b>Plan ready for review.</b>', keyboard, 'HTML')
+                  .catch(err => this.logger.error({ err }, 'Failed to send ExitPlanMode prompt'));
+              }
+            }
           }
         }
       }
@@ -836,28 +957,27 @@ export class Bridge extends EventEmitter implements CtlHandler {
       const req = event.request;
       const requestId = event.request_id;
 
-      agent.pendingPermissions.set(requestId, {
+      const pending: PendingPermission = {
         requestId,
         userId: agentId,
         toolName: req.tool_name,
         input: req.input,
-      });
+      };
+      agent.pendingPermissions.set(requestId, pending);
+
+      const permChatId = this.getAgentChatId(agent);
 
       const toolName = escapeHtml(req.tool_name);
       const inputPreview = req.input
         ? escapeHtml(JSON.stringify(req.input).slice(0, 200))
         : '';
-
       const text = inputPreview
         ? `🔐 CC wants to use <code>${toolName}</code>\n<pre>${inputPreview}</pre>`
         : `🔐 CC wants to use <code>${toolName}</code>`;
-
       const keyboard = new InlineKeyboard()
         .text('✅ Allow', `perm_allow:${requestId}`)
         .text('❌ Deny', `perm_deny:${requestId}`)
         .text('✅ Allow All', `perm_allow_all:${agentId}`);
-
-      const permChatId = this.getAgentChatId(agent);
       if (permChatId && agent.tgBot) {
         agent.tgBot.sendTextWithKeyboard(permChatId, text, keyboard, 'HTML')
           .catch(err => this.logger.error({ err }, 'Failed to send permission request'));
@@ -922,12 +1042,9 @@ export class Bridge extends EventEmitter implements CtlHandler {
       this.logger.warn({ agentId }, 'Session takeover detected — keeping session for roaming');
       agent.eventBuffer.push({ ts: Date.now(), type: 'system', text: 'Session takeover detected' });
 
-      // Send TG system message for takeover
-      const takeoverChatId = this.getAgentChatId(agent);
-      if (takeoverChatId && agent.tgBot) {
-        agent.tgBot.sendText(takeoverChatId, '<blockquote>⚠️ Session taken over by another client. Next message will start a new session.</blockquote>', 'HTML', true)
-          .catch(err => this.logger.error({ err, agentId }, 'Failed to send takeover notification'));
-      }
+      // NOTE: No TG message sent for takeover — too noisy on restart races.
+      // Takeover is logged (above) and forwarded to supervisor; user will notice naturally
+      // when their next message starts a new session.
 
       // Notify supervisor and suppress subsequent exit event
       if (this.isSupervisorSubscribed(agentId, proc.sessionId)) {
@@ -1711,6 +1828,134 @@ export class Bridge extends EventEmitter implements CtlHandler {
         break;
       }
 
+      case 'ask_pick': {
+        // Single-select: data = "{requestId}:{qIdx}:{optIdx}"
+        const [askReqId, qIdxStr, optIdxStr] = query.data.split(':');
+        const pending = agent.pendingPermissions.get(askReqId);
+        if (!pending || pending.toolName !== 'AskUserQuestion') {
+          await agent.tgBot.answerCallbackQuery(query.callbackQueryId, 'Question expired');
+          break;
+        }
+        const questions = (pending.input?.questions ?? []) as AskQuestion[];
+        const qi = parseInt(qIdxStr, 10);
+        const oi = parseInt(optIdxStr, 10);
+        const selected = questions[qi]?.options?.[oi] ?? '';
+        const answers = { ...(pending.questionAnswers ?? {}), [String(qi)]: [selected] };
+
+        // Check if all questions are answered
+        const allAnswered = questions.every((_, i) => answers[String(i)]?.length);
+        if (allAnswered) {
+          if (agent.ccProcess) submitAskAnswer(pending, agent.ccProcess, questions, answers);
+          agent.pendingPermissions.delete(askReqId);
+          // Show confirmation on the message
+          if (pending.questionMsgId && pending.questionChatId) {
+            const summary = questions.map((q, i) => `<b>${escapeHtml(q.question)}</b>\n→ ${escapeHtml(answers[String(i)]?.[0] ?? '')}`).join('\n\n');
+            agent.tgBot.editText(pending.questionChatId, pending.questionMsgId, `❓ ${summary}`, 'HTML').catch(() => {});
+          }
+          await agent.tgBot.answerCallbackQuery(query.callbackQueryId, '✅ Answered');
+        } else {
+          // More questions remain — update answers and re-render
+          pending.questionAnswers = answers;
+          if (pending.questionMsgId && pending.questionChatId) {
+            const { text, keyboard } = buildAskUi(askReqId, questions, answers);
+            agent.tgBot.editTextWithKeyboard(pending.questionChatId, pending.questionMsgId, text, keyboard, 'HTML').catch(() => {});
+          }
+          await agent.tgBot.answerCallbackQuery(query.callbackQueryId, '✓ Noted');
+        }
+        break;
+      }
+
+      case 'ask_toggle': {
+        // Multi-select toggle: data = "{requestId}:{qIdx}:{optIdx}"
+        const [askReqId, qIdxStr, optIdxStr] = query.data.split(':');
+        const pending = agent.pendingPermissions.get(askReqId);
+        if (!pending || pending.toolName !== 'AskUserQuestion') {
+          await agent.tgBot.answerCallbackQuery(query.callbackQueryId, 'Question expired');
+          break;
+        }
+        const questions = (pending.input?.questions ?? []) as AskQuestion[];
+        const qi = parseInt(qIdxStr, 10);
+        const oi = parseInt(optIdxStr, 10);
+        const opt = questions[qi]?.options?.[oi] ?? '';
+        const answers = { ...(pending.questionAnswers ?? {}) };
+        const cur = answers[String(qi)] ?? [];
+        answers[String(qi)] = cur.includes(opt) ? cur.filter(o => o !== opt) : [...cur, opt];
+        pending.questionAnswers = answers;
+        if (pending.questionMsgId && pending.questionChatId) {
+          const { text, keyboard } = buildAskUi(askReqId, questions, answers);
+          agent.tgBot.editTextWithKeyboard(pending.questionChatId, pending.questionMsgId, text, keyboard, 'HTML').catch(() => {});
+        }
+        await agent.tgBot.answerCallbackQuery(query.callbackQueryId);
+        break;
+      }
+
+      case 'ask_submit': {
+        // Multi-select submit: data = "{requestId}:{qIdx}"
+        const [askReqId] = query.data.split(':');
+        const pending = agent.pendingPermissions.get(askReqId);
+        if (!pending || pending.toolName !== 'AskUserQuestion') {
+          await agent.tgBot.answerCallbackQuery(query.callbackQueryId, 'Question expired');
+          break;
+        }
+        const questions = (pending.input?.questions ?? []) as AskQuestion[];
+        const answers = pending.questionAnswers ?? {};
+        if (agent.ccProcess) submitAskAnswer(pending, agent.ccProcess, questions, answers);
+        agent.pendingPermissions.delete(askReqId);
+        if (pending.questionMsgId && pending.questionChatId) {
+          const summary = questions.map((q, i) => `<b>${escapeHtml(q.question)}</b>\n→ ${escapeHtml((answers[String(i)] ?? []).join(', ') || '(none)')}`).join('\n\n');
+          agent.tgBot.editText(pending.questionChatId, pending.questionMsgId, `❓ ${summary}`, 'HTML').catch(() => {});
+        }
+        await agent.tgBot.answerCallbackQuery(query.callbackQueryId, '✅ Submitted');
+        break;
+      }
+
+      case 'ask_other': {
+        // "Other" free-text: data = "{requestId}:{qIdx}"
+        const [askReqId, qIdxStr] = query.data.split(':');
+        const pending = agent.pendingPermissions.get(askReqId);
+        if (!pending || pending.toolName !== 'AskUserQuestion') {
+          await agent.tgBot.answerCallbackQuery(query.callbackQueryId, 'Question expired');
+          break;
+        }
+        pending.awaitingTextQIdx = parseInt(qIdxStr, 10);
+        const questions = (pending.input?.questions ?? []) as AskQuestion[];
+        const qText = escapeHtml(questions[pending.awaitingTextQIdx]?.question ?? '');
+        if (pending.questionMsgId && pending.questionChatId) {
+          agent.tgBot.editText(
+            pending.questionChatId, pending.questionMsgId,
+            `❓ <b>${qText}</b>\n\n✏️ <i>Type your answer in the chat…</i>`, 'HTML',
+          ).catch(() => {});
+        }
+        await agent.tgBot.answerCallbackQuery(query.callbackQueryId, 'Type your answer');
+        break;
+      }
+
+      case 'plan_approve': {
+        const toolUseId = query.data;
+        const pending = agent.pendingPermissions.get(toolUseId);
+        if (!pending || pending.toolName !== 'ExitPlanMode') {
+          await agent.tgBot.answerCallbackQuery(query.callbackQueryId, 'Plan request expired');
+          break;
+        }
+        if (agent.ccProcess) agent.ccProcess.sendToolResult(toolUseId, 'approved');
+        agent.pendingPermissions.delete(toolUseId);
+        await agent.tgBot.answerCallbackQuery(query.callbackQueryId, '✅ Plan approved');
+        break;
+      }
+
+      case 'plan_reject': {
+        const toolUseId = query.data;
+        const pending = agent.pendingPermissions.get(toolUseId);
+        if (!pending || pending.toolName !== 'ExitPlanMode') {
+          await agent.tgBot.answerCallbackQuery(query.callbackQueryId, 'Plan request expired');
+          break;
+        }
+        if (agent.ccProcess) agent.ccProcess.sendToolResult(toolUseId, 'rejected');
+        agent.pendingPermissions.delete(toolUseId);
+        await agent.tgBot.answerCallbackQuery(query.callbackQueryId, '❌ Plan rejected');
+        break;
+      }
+
       default:
         await agent.tgBot.answerCallbackQuery(query.callbackQueryId);
     }
@@ -1973,6 +2218,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
           typingChatId: null,
           pendingSessionId: null,
           forceNewSession: false,
+          pendingIdeAwareness: false,
           destroyTimer: null,
           eventBuffer: new EventBuffer(),
         };
@@ -2380,6 +2626,70 @@ export class Bridge extends EventEmitter implements CtlHandler {
     this.ctlServer.closeAll();
     this.removeAllListeners();
     this.logger.info('Bridge stopped');
+  }
+}
+
+// ── AskUserQuestion helpers ──
+
+/** Build Telegram message text + inline keyboard for AskUserQuestion. */
+function buildAskUi(
+  requestId: string,
+  questions: AskQuestion[],
+  answers: Record<string, string[]>,
+): { text: string; keyboard: InlineKeyboard } {
+  const lines: string[] = ['❓'];
+  const kb = new InlineKeyboard();
+
+  for (let qi = 0; qi < questions.length; qi++) {
+    const q = questions[qi];
+    const multi = !!q.multiSelect;
+    const header = multi ? ` <i>(select multiple)</i>` : '';
+    lines.push(`<b>${escapeHtml(q.question)}</b>${header}`);
+
+    const selected = answers[String(qi)] ?? [];
+    for (let oi = 0; oi < (q.options ?? []).length; oi++) {
+      const opt = q.options![oi];
+      const isSelected = selected.includes(opt);
+      const label = multi ? (isSelected ? `✓ ${opt}` : `   ${opt}`) : opt;
+      const action = multi ? 'ask_toggle' : 'ask_pick';
+      kb.text(label, `${action}:${requestId}:${qi}:${oi}`).row();
+    }
+    kb.text('✏️ Other…', `ask_other:${requestId}:${qi}`).row();
+    if (multi) kb.text('✅ Submit', `ask_submit:${requestId}:${qi}`).row();
+
+    if (qi < questions.length - 1) lines.push('');
+  }
+
+  return { text: lines.join('\n'), keyboard: kb };
+}
+
+/** Build updatedInput answers map from selected options. */
+function buildAskAnswers(
+  questions: AskQuestion[],
+  answers: Record<string, string[]>,
+): Record<string, string> {
+  const result: Record<string, string> = {};
+  for (let qi = 0; qi < questions.length; qi++) {
+    const sel = answers[String(qi)];
+    if (sel?.length) result[String(qi)] = sel.join('\n');
+  }
+  return result;
+}
+
+/** Submit answers for AskUserQuestion via the correct mechanism. */
+function submitAskAnswer(
+  pending: PendingPermission,
+  proc: CCProcess,
+  questions: AskQuestion[],
+  answers: Record<string, string[]>,
+): void {
+  const builtAnswers = buildAskAnswers(questions, answers);
+  if (pending.toolUseId) {
+    // Regular tool_use path — inject tool_result
+    proc.sendToolResult(pending.toolUseId, JSON.stringify({ answers: builtAnswers }));
+  } else {
+    // can_use_tool permission path — send control_response
+    proc.respondToPermission(pending.requestId, true, { questions, answers: builtAnswers });
   }
 }
 

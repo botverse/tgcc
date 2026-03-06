@@ -17,6 +17,7 @@ import {
   type ControlResponse,
   parseCCOutputLine,
   serializeMessage,
+  createToolResultMessage,
   createInitializeRequest,
   createPermissionResponse,
 } from './cc-protocol.js';
@@ -124,6 +125,7 @@ export class CCProcess extends EventEmitter {
   private _spawnedAt: Date | null = null;
   private _killedByUs = false;
   private _takenOver = false;
+  private _hadResult = false; // true after a clean result event; reset on each new message sent
 
   constructor(options: CCProcessOptions) {
     super();
@@ -186,11 +188,16 @@ export class CCProcess extends EventEmitter {
     child.on('exit', (code, signal) => {
       this.logger.info({ code, signal, killedByUs: this._killedByUs }, 'CC process exited');
 
-      // Detect session takeover: unexpected exit not initiated by us
-      if (!this._killedByUs && (code !== 0 || signal)) {
-        this._takenOver = true;
-        this.logger.warn({ code, signal }, 'CC exited unexpectedly — possible session takeover');
-        this.emit('takeover', code, signal);
+      // Only treat as takeover if the process had fully initialized (got a sessionId).
+      // Exit before init = old orphaned CC still held the session; not an external takeover.
+      if (!this._killedByUs) {
+        if (this._sessionId) {
+          this._takenOver = true;
+          this.logger.warn({ code, signal }, 'CC exited unexpectedly — possible session takeover');
+          this.emit('takeover', code, signal);
+        } else {
+          this.logger.info({ code, signal }, 'CC exited before init — likely restart race, ignoring');
+        }
       }
 
       this.cleanup();
@@ -373,8 +380,9 @@ export class CCProcess extends EventEmitter {
         break;
 
       case 'result':
-        // Turn complete
+        // Turn complete — mark that CC exited the turn cleanly
         this._ccActivity = 'idle';
+        this._hadResult = true;
         if (event.total_cost_usd) {
           this._totalCostUsd = event.total_cost_usd;
         }
@@ -450,6 +458,7 @@ export class CCProcess extends EventEmitter {
       this.logger.error('Cannot write to CC stdin — process not available');
       return;
     }
+    this._hadResult = false; // reset — waiting for new result
     const line = serializeMessage(msg) + '\n';
     this.process.stdin.write(line);
     this.logger.debug({ uuid: msg.uuid }, 'Wrote message to CC stdin');
@@ -616,13 +625,24 @@ export class CCProcess extends EventEmitter {
     this.process.once('exit', () => this.clearForceKillTimer());
   }
 
+  /** Send a tool_result back to CC for a tool_use it called (AskUserQuestion, ExitPlanMode, etc.) */
+  sendToolResult(toolUseId: string, content: string): void {
+    if (!this.process?.stdin?.writable) {
+      this.logger.error('Cannot send tool result — stdin not writable');
+      return;
+    }
+    const msg = createToolResultMessage(toolUseId, content);
+    this.process.stdin.write(serializeMessage(msg) + '\n');
+    this.logger.info({ toolUseId }, 'Sent tool result');
+  }
+
   /** Respond to a permission request from CC */
-  respondToPermission(requestId: string, allowed: boolean): void {
+  respondToPermission(requestId: string, allowed: boolean, updatedInput?: Record<string, unknown>): void {
     if (!this.process?.stdin?.writable) {
       this.logger.error('Cannot send permission response — stdin not writable');
       return;
     }
-    const resp = createPermissionResponse(requestId, allowed);
+    const resp = createPermissionResponse(requestId, allowed, updatedInput);
     const line = JSON.stringify(resp) + '\n';
     this.process.stdin.write(line);
     this.logger.info({ requestId, allowed }, 'Sent permission response');
@@ -647,6 +667,7 @@ export class CCProcess extends EventEmitter {
     this._state = 'idle';
     this._ccActivity = 'idle';
     this._killedByUs = false;
+    this._hadResult = false;
     this.process = null;
     this.emit('stateChange', 'idle');
   }

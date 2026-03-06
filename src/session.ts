@@ -331,14 +331,40 @@ function extractTitleFromContent(content: unknown): string {
 }
 
 function truncTitle(text: string): string {
-  // Take first line, strip leading whitespace
-  const first = text.split('\n')[0].trim();
-  if (!first) return '';
-  // Skip system/IDE injected messages
-  if (/^<(ide_|system|context|environment_details)/.test(first)) return '';
-  return first.length > 60 ? first.slice(0, 57) + '…' : first;
+  // Scan line-by-line, skipping IDE/system XML blocks to find the actual user text.
+  const IDE_OPEN = /^<(ide_\w+|environment_details|system|context)[\s>]/;
+  const IDE_CLOSE = /^<\/(ide_\w+|environment_details|system|context)>/;
+  let skipDepth = 0;
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    if (IDE_OPEN.test(trimmed)) { skipDepth++; continue; }
+    if (IDE_CLOSE.test(trimmed)) { if (skipDepth > 0) skipDepth--; continue; }
+    if (skipDepth > 0) continue;
+    return trimmed.length > 60 ? trimmed.slice(0, 57) + '…' : trimmed;
+  }
+  return '';
 }
 
+
+/**
+ * Returns true if recent messages in the JSONL contain IDE-injected content
+ * (i.e. the session was recently active in VSCode or another IDE plugin).
+ */
+export function hasIDEContent(jsonlPath: string): boolean {
+  try {
+    const st = statSync(jsonlPath);
+    const readSize = Math.min(8192, st.size);
+    const fd = openSync(jsonlPath, 'r');
+    const buf = Buffer.alloc(readSize);
+    readSync(fd, buf, 0, readSize, Math.max(0, st.size - readSize));
+    closeSync(fd);
+    const text = buf.toString('utf-8');
+    return text.includes('<ide_') || text.includes('<environment_details');
+  } catch {
+    return false;
+  }
+}
 
 function extractContextPct(jsonlPath: string, fileSize: number): number | null {
   try {

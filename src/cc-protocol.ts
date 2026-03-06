@@ -56,6 +56,17 @@ export function createDocumentMessage(text: string, filePath: string, fileName: 
   return createTextMessage(content);
 }
 
+export function createToolResultMessage(toolUseId: string, content: string): UserMessage {
+  return {
+    type: 'user',
+    message: {
+      role: 'user',
+      content: [{ type: 'tool_result', tool_use_id: toolUseId, content } as unknown as ContentBlock],
+    },
+    uuid: uuidv4(),
+  };
+}
+
 export function serializeMessage(msg: UserMessage): string {
   return JSON.stringify(msg);
 }

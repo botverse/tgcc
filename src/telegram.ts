@@ -445,6 +445,15 @@ export class TelegramBot {
     this.trackBotMessage(Number(chatId), messageId, text);
   }
 
+  async editTextWithKeyboard(chatId: number | string, messageId: number, text: string, keyboard: InlineKeyboard, parseMode?: string): Promise<void> {
+    if (this.isSyntheticChat(chatId)) return;
+    await this.bot.api.editMessageText(Number(chatId), messageId, text, {
+      parse_mode: parseMode as 'Markdown' | 'MarkdownV2' | 'HTML' | undefined,
+      reply_markup: keyboard,
+    });
+    this.trackBotMessage(Number(chatId), messageId, text);
+  }
+
   async setReaction(chatId: number | string, messageId: number, emoji: string): Promise<void> {
     // Cast needed because Grammy's emoji type is a fixed union
     await this.bot.api.setMessageReaction(Number(chatId), messageId, [{ type: 'emoji', emoji: emoji as '👍' }]);
