@@ -84,6 +84,28 @@ export function makeMarkdownSafe(text: string): string {
   return makeHtmlSafe(text);
 }
 
+/**
+ * Close any HTML tags left open after truncation.
+ * Scans for open/close tag pairs and appends missing close tags in reverse order.
+ */
+function closeUnclosedTags(html: string): string {
+  const stack: string[] = [];
+  const tagRe = /<(\/?)([a-zA-Z][a-zA-Z0-9-]*)(?:\s[^>]*)?\/?>/g;
+  let m: RegExpExecArray | null;
+  while ((m = tagRe.exec(html)) !== null) {
+    const isClosing = m[1] === '/';
+    const tag = m[2].toLowerCase();
+    if (isClosing) {
+      for (let i = stack.length - 1; i >= 0; i--) {
+        if (stack[i] === tag) { stack.splice(i, 1); break; }
+      }
+    } else {
+      stack.push(tag);
+    }
+  }
+  return stack.length ? html + stack.reverse().map(t => `</${t}>`).join('') : html;
+}
+
 // ── Segment types (internal) ──
 
 type InternalSegment =
@@ -123,7 +145,7 @@ function renderSegment(seg: InternalSegment): string {
       // leaving ~56 chars safety buffer). Remove trailing incomplete tag opener.
       const maxHtml = 4000;
       const content = safeHtml.length > maxHtml
-        ? safeHtml.slice(0, maxHtml).replace(/<[^>]*$/, '') + '…'
+        ? closeUnclosedTags(safeHtml.slice(0, maxHtml).replace(/<[^>]*$/, '')) + '…'
         : safeHtml;
       return `<blockquote expandable>💭 ${content}</blockquote>`;
     }
@@ -133,7 +155,7 @@ function renderSegment(seg: InternalSegment): string {
       const html = makeHtmlSafe(seg.rawText);
       const maxHtml = 4000;
       const truncated = html.length > maxHtml
-        ? html.slice(0, maxHtml).replace(/<[^>]*$/, '') + '…'
+        ? closeUnclosedTags(html.slice(0, maxHtml).replace(/<[^>]*$/, '')) + '…'
         : html;
       return truncated;
     }
