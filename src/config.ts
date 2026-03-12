@@ -10,6 +10,8 @@ export interface GlobalConfig {
   ccBinaryPath: string;
   mediaDir: string;
   socketDir: string;
+  ctlSocketDir: string;
+  mcpConfigDir: string;
   logLevel: string;
   stateFile: string;
 }
@@ -21,6 +23,8 @@ export interface AgentDefaults {
   idleTimeoutMs: number;
   hangTimeoutMs: number;
   permissionMode: 'dangerously-skip' | 'acceptEdits' | 'default' | 'plan';
+  /** Extra CLI arguments appended to the CC command (space-separated, supports quoting). */
+  ccExtraArgs?: string;
 }
 
 export interface AgentUserOverride {
@@ -28,17 +32,54 @@ export interface AgentUserOverride {
   repo?: string;
 }
 
+export type HeartbeatIntervalMins = 5 | 10 | 15 | 30 | 60;
+
+export interface HeartbeatConfig {
+  intervalMins: HeartbeatIntervalMins;
+  prompt: string;
+  /** Skip tick if the agent is mid-turn. Default: true */
+  onlyWhenIdle?: boolean;
+  /** IANA timezone for the cron expression. Default: UTC */
+  tz?: string;
+}
+
+export type CronSessionMode = 'main' | 'isolated';
+
+export interface CronJobConfig {
+  id: string;
+  name?: string;
+  /** Standard cron expression, e.g. "0 8 * * *" */
+  schedule: string;
+  /** IANA timezone. Default: UTC */
+  tz?: string;
+  /** Target agent */
+  agentId: string;
+  message: string;
+  session: CronSessionMode;
+  /** Post a TG status message when the job fires */
+  announce?: boolean;
+  /** Model override for isolated sessions */
+  model?: string;
+  /** Timeout for isolated sessions (ms) */
+  timeoutMs?: number;
+  /** Delete after first run (one-shot) */
+  deleteAfterRun?: boolean;
+}
+
 export interface AgentConfig {
   botToken: string;
   allowedUsers: string[];
   defaults: AgentDefaults;
   users?: Record<string, AgentUserOverride>;
+  heartbeat?: HeartbeatConfig;
 }
 
 export interface TgccConfig {
   global: GlobalConfig;
   repos: Record<string, string>;       // name → absolute path
   agents: Record<string, AgentConfig>;
+  supervisor: string | null;           // agentId of native supervisor (null = disabled)
+  cron?: { jobs: CronJobConfig[] };
 }
 
 // ── Defaults ──
@@ -47,6 +88,8 @@ const DEFAULT_GLOBAL: GlobalConfig = {
   ccBinaryPath: 'claude',
   mediaDir: '/tmp/tgcc/media',
   socketDir: '/tmp/tgcc/sockets',
+  ctlSocketDir: '/tmp/tgcc/ctl',
+  mcpConfigDir: '/tmp/tgcc',
   logLevel: 'info',
   stateFile: join(homedir(), '.tgcc', 'state.json'),
 };
@@ -75,6 +118,8 @@ export function validateConfig(raw: unknown): TgccConfig {
     ccBinaryPath: typeof globalRaw.ccBinaryPath === 'string' ? globalRaw.ccBinaryPath : DEFAULT_GLOBAL.ccBinaryPath,
     mediaDir: typeof globalRaw.mediaDir === 'string' ? globalRaw.mediaDir : DEFAULT_GLOBAL.mediaDir,
     socketDir: typeof globalRaw.socketDir === 'string' ? globalRaw.socketDir : DEFAULT_GLOBAL.socketDir,
+    ctlSocketDir: typeof globalRaw.ctlSocketDir === 'string' ? globalRaw.ctlSocketDir : DEFAULT_GLOBAL.ctlSocketDir,
+    mcpConfigDir: typeof globalRaw.mcpConfigDir === 'string' ? globalRaw.mcpConfigDir : DEFAULT_GLOBAL.mcpConfigDir,
     logLevel: typeof globalRaw.logLevel === 'string' ? globalRaw.logLevel : DEFAULT_GLOBAL.logLevel,
     stateFile: typeof globalRaw.stateFile === 'string' ? globalRaw.stateFile : DEFAULT_GLOBAL.stateFile,
   };
@@ -149,6 +194,7 @@ export function validateConfig(raw: unknown): TgccConfig {
       permissionMode: ['dangerously-skip', 'acceptEdits', 'default', 'plan'].includes(defaultsRaw.permissionMode as string)
         ? (defaultsRaw.permissionMode as AgentDefaults['permissionMode'])
         : DEFAULT_AGENT_DEFAULTS.permissionMode,
+      ...(typeof defaultsRaw.ccExtraArgs === 'string' ? { ccExtraArgs: defaultsRaw.ccExtraArgs } : {}),
     };
 
     const users: Record<string, AgentUserOverride> = {};
@@ -164,11 +210,32 @@ export function validateConfig(raw: unknown): TgccConfig {
       }
     }
 
+    // Heartbeat (optional)
+    let heartbeat: HeartbeatConfig | undefined;
+    if (a.heartbeat && typeof a.heartbeat === 'object') {
+      const hb = a.heartbeat as Record<string, unknown>;
+      const validIntervals: HeartbeatIntervalMins[] = [5, 10, 15, 30, 60];
+      const intervalMins = hb.intervalMins as HeartbeatIntervalMins;
+      if (!validIntervals.includes(intervalMins)) {
+        throw new Error(`Agent "${agentId}" heartbeat.intervalMins must be one of: ${validIntervals.join(', ')}`);
+      }
+      if (typeof hb.prompt !== 'string' || !hb.prompt) {
+        throw new Error(`Agent "${agentId}" heartbeat.prompt must be a non-empty string`);
+      }
+      heartbeat = {
+        intervalMins,
+        prompt: hb.prompt,
+        onlyWhenIdle: hb.onlyWhenIdle !== false,
+        ...(typeof hb.tz === 'string' ? { tz: hb.tz } : {}),
+      };
+    }
+
     agents[agentId] = {
       botToken: a.botToken,
       allowedUsers: a.allowedUsers.map(String),
       defaults,
       users,
+      ...(heartbeat ? { heartbeat } : {}),
     };
   }
 
@@ -176,7 +243,52 @@ export function validateConfig(raw: unknown): TgccConfig {
     throw new Error('Config must have at least one agent');
   }
 
-  return { global, repos, agents };
+  // Supervisor: explicit string, null to disable, or default to first agent
+  let supervisor: string | null;
+  if (obj.supervisor === null) {
+    supervisor = null;
+  } else if (typeof obj.supervisor === 'string') {
+    if (!agents[obj.supervisor]) {
+      throw new Error(`Supervisor agent "${obj.supervisor}" not found in agents`);
+    }
+    supervisor = obj.supervisor;
+  } else {
+    // Default to first agent
+    supervisor = Object.keys(agents)[0] ?? null;
+  }
+
+  // Cron jobs (optional, top-level)
+  let cron: TgccConfig['cron'];
+  const cronRaw = obj.cron as Record<string, unknown> | undefined;
+  if (cronRaw && Array.isArray(cronRaw.jobs)) {
+    const jobs: CronJobConfig[] = [];
+    for (const jobRaw of cronRaw.jobs as unknown[]) {
+      if (!jobRaw || typeof jobRaw !== 'object') continue;
+      const j = jobRaw as Record<string, unknown>;
+      if (typeof j.id !== 'string' || !j.id) throw new Error('Each cron job must have an "id" string');
+      if (typeof j.schedule !== 'string' || !j.schedule) throw new Error(`Cron job "${j.id}" must have a "schedule" cron expression`);
+      if (typeof j.agentId !== 'string' || !j.agentId) throw new Error(`Cron job "${j.id}" must have an "agentId"`);
+      if (!agents[j.agentId as string]) throw new Error(`Cron job "${j.id}" references unknown agent "${j.agentId}"`);
+      if (typeof j.message !== 'string' || !j.message) throw new Error(`Cron job "${j.id}" must have a "message"`);
+      const session = j.session === 'isolated' ? 'isolated' : 'main';
+      jobs.push({
+        id: j.id,
+        ...(typeof j.name === 'string' ? { name: j.name } : {}),
+        schedule: j.schedule,
+        ...(typeof j.tz === 'string' ? { tz: j.tz } : {}),
+        agentId: j.agentId,
+        message: j.message,
+        session,
+        announce: j.announce !== false,
+        ...(typeof j.model === 'string' ? { model: j.model } : {}),
+        ...(typeof j.timeoutMs === 'number' ? { timeoutMs: j.timeoutMs } : {}),
+        deleteAfterRun: j.deleteAfterRun === true,
+      });
+    }
+    cron = { jobs };
+  }
+
+  return { global, repos, agents, supervisor, ...(cron ? { cron } : {}) };
 }
 
 // ── Resolved per-user config ──
@@ -188,6 +300,7 @@ export interface ResolvedUserConfig {
   idleTimeoutMs: number;
   hangTimeoutMs: number;
   permissionMode: AgentDefaults['permissionMode'];
+  ccExtraArgs?: string;
 }
 
 export function resolveUserConfig(agent: AgentConfig, userId: string): ResolvedUserConfig {
@@ -199,6 +312,7 @@ export function resolveUserConfig(agent: AgentConfig, userId: string): ResolvedU
     idleTimeoutMs: agent.defaults.idleTimeoutMs,
     hangTimeoutMs: agent.defaults.hangTimeoutMs,
     permissionMode: agent.defaults.permissionMode,
+    ccExtraArgs: agent.defaults.ccExtraArgs,
   };
 }
 
@@ -278,6 +392,8 @@ export function ensureDirectories(config: TgccConfig): void {
   const dirs = [
     config.global.mediaDir,
     config.global.socketDir,
+    config.global.ctlSocketDir,
+    config.global.mcpConfigDir,
     join(homedir(), '.tgcc'),
   ];
   for (const dir of dirs) {

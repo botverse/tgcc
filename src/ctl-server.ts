@@ -70,10 +70,12 @@ export class CtlServer {
   private supervisorSocket: Socket | null = null;
   private handler: CtlHandler;
   private logger: pino.Logger;
+  private defaultSupervisorId: string | null;
 
-  constructor(handler: CtlHandler, logger: pino.Logger) {
+  constructor(handler: CtlHandler, logger: pino.Logger, defaultSupervisorId: string | null = null) {
     this.handler = handler;
     this.logger = logger;
+    this.defaultSupervisorId = defaultSupervisorId;
   }
 
   /** Start a control socket for a specific agent. */
@@ -167,10 +169,11 @@ export class CtlServer {
         }
         case 'register_supervisor': {
           const regReq = request as unknown as { agentId?: string; capabilities?: string[] };
+          const resolvedId = regReq.agentId ?? this.defaultSupervisorId ?? 'unknown';
           const writeFn = (data: string) => { try { socket.write(data); } catch {} };
-          this.handler.registerSupervisor(regReq.agentId ?? 'openclaw', regReq.capabilities ?? [], writeFn);
+          this.handler.registerSupervisor(resolvedId, regReq.capabilities ?? [], writeFn);
           this.supervisorSocket = socket;
-          socket.write(JSON.stringify({ type: 'registered', agentId: regReq.agentId ?? 'openclaw' }) + '\n');
+          socket.write(JSON.stringify({ type: 'registered', agentId: resolvedId }) + '\n');
           return;
         }
         default:

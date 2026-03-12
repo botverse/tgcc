@@ -12,6 +12,10 @@ export interface HighSignalEvent {
   type: 'event';
   event: string;
   agentId: string;
+  /** Populated by the emitter — emoji for the event type. */
+  emoji?: string;
+  /** Populated by the emitter — human-readable one-line summary. */
+  summary?: string;
   [key: string]: unknown;
 }
 
@@ -47,6 +51,10 @@ interface AgentState {
   // Tool use tracking (tool_use_id → info)
   activeToolUses: Map<string, ToolUseInfo>;
   currentToolBlockId: string | null;
+
+  // Cost tracking (cumulative per session)
+  sessionCostUsd: number;
+  budgetThresholdsHit: Set<number>;
 }
 
 // ── Constants ──
@@ -61,15 +69,18 @@ const CONTEXT_THRESHOLDS = [50, 75, 90];
 const CONTEXT_WINDOW_TOKENS = 200_000;
 const FAILURE_LOOP_THRESHOLD = 3;
 const DEFAULT_STUCK_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+const DEFAULT_BUDGET_THRESHOLDS = [1, 5, 10, 25]; // USD
 
 export class HighSignalDetector {
   private callbacks: HighSignalCallbacks;
   private agentStates = new Map<string, AgentState>();
   private stuckTimeoutMs: number;
+  private budgetThresholds: number[];
 
-  constructor(callbacks: HighSignalCallbacks, stuckTimeoutMs = DEFAULT_STUCK_TIMEOUT_MS) {
+  constructor(callbacks: HighSignalCallbacks, stuckTimeoutMs = DEFAULT_STUCK_TIMEOUT_MS, budgetThresholds = DEFAULT_BUDGET_THRESHOLDS) {
     this.callbacks = callbacks;
     this.stuckTimeoutMs = stuckTimeoutMs;
+    this.budgetThresholds = budgetThresholds;
   }
 
   // ── Public API ──
@@ -97,18 +108,6 @@ export class HighSignalDetector {
         state.activeToolUses.set(block.id, { id: block.id, name: block.name, inputJson: '' });
         state.currentToolBlockId = block.id;
         state.isExecutingTool = true;
-
-        // Sub-agent spawn detection
-        if (SUBAGENT_TOOLS.has(block.name)) {
-          state.spawnCountThisTurn++;
-          this.emit(agentId, {
-            type: 'event',
-            event: 'subagent_spawn',
-            agentId,
-            count: state.spawnCountThisTurn,
-            toolName: block.name,
-          });
-        }
       }
     }
 
@@ -124,6 +123,22 @@ export class HighSignalDetector {
     }
 
     if (event.type === 'content_block_stop') {
+      // Sub-agent spawn detection — emit here so we have the full input JSON (task description)
+      if (state.currentToolBlockId) {
+        const info = state.activeToolUses.get(state.currentToolBlockId);
+        if (info && SUBAGENT_TOOLS.has(info.name)) {
+          state.spawnCountThisTurn++;
+          const label = this.extractTaskLabel(info.inputJson);
+          this.emit(agentId, {
+            type: 'event',
+            event: 'subagent_spawn',
+            agentId,
+            count: state.spawnCountThisTurn,
+            toolName: info.name,
+            label,
+          });
+        }
+      }
       state.currentToolBlockId = null;
       // isExecutingTool stays true until tool_result comes back
     }
@@ -132,6 +147,18 @@ export class HighSignalDetector {
   /**
    * Handle a tool_result event from CC
    */
+  /** Call when a CC turn ends (result event). Cancels the stuck timer so idle agents don't fire false positives. */
+  handleTurnEnd(agentId: string): void {
+    const state = this.agentStates.get(agentId);
+    if (!state) return;
+    if (state.stuckTimer) {
+      clearTimeout(state.stuckTimer);
+      state.stuckTimer = null;
+    }
+    state.isExecutingTool = false;
+    state.activeToolUses.clear();
+  }
+
   handleToolResult(agentId: string, toolUseId: string, content: string, isError: boolean, toolName?: string): void {
     const state = this.getState(agentId);
 
@@ -204,6 +231,36 @@ export class HighSignalDetector {
   }
 
   /**
+   * Update session cost for an agent (called on result event with total_cost_usd).
+   * Emits budget_alert events when configurable thresholds are crossed.
+   */
+  handleCostUpdate(agentId: string, totalCostUsd: number): void {
+    const state = this.getState(agentId);
+    state.sessionCostUsd = totalCostUsd;
+
+    for (const threshold of this.budgetThresholds) {
+      if (totalCostUsd >= threshold && !state.budgetThresholdsHit.has(threshold)) {
+        state.budgetThresholdsHit.add(threshold);
+        this.emit(agentId, {
+          type: 'event',
+          event: 'budget_alert',
+          agentId,
+          threshold,
+          currentCost: totalCostUsd,
+        });
+      }
+    }
+  }
+
+  /**
+   * Get the current session cost for an agent.
+   * Returns 0 if no cost data is available.
+   */
+  getSessionCost(agentId: string): number {
+    return this.agentStates.get(agentId)?.sessionCostUsd ?? 0;
+  }
+
+  /**
    * Clean up state for an agent (on process exit)
    */
   cleanup(agentId: string): void {
@@ -240,6 +297,8 @@ export class HighSignalDetector {
         isExecutingTool: false,
         activeToolUses: new Map(),
         currentToolBlockId: null,
+        sessionCostUsd: 0,
+        budgetThresholdsHit: new Set(),
       };
       this.agentStates.set(agentId, state);
     }
@@ -396,16 +455,19 @@ export class HighSignalDetector {
   // ── Private: Helpers ──
 
   private emit(agentId: string, event: HighSignalEvent): void {
-    // Push to event buffer
     const emoji = this.eventEmoji(event.event);
     const summary = this.eventSummary(event);
+
+    // Attach for consumers (e.g. native supervisor queue)
+    event.emoji = emoji;
+    event.summary = summary;
+
     this.callbacks.pushEventBuffer(agentId, {
       ts: Date.now(),
       type: 'system',
       text: `${emoji} ${summary}`,
     });
 
-    // Emit to supervisor
     this.callbacks.emitSupervisorEvent(event);
   }
 
@@ -418,6 +480,7 @@ export class HighSignalDetector {
       case 'failure_loop': return '🔁';
       case 'task_milestone': return '📋';
       case 'stuck': return '⚠️';
+      case 'budget_alert': return '💰';
       default: return '📡';
     }
   }
@@ -431,15 +494,30 @@ export class HighSignalDetector {
       case 'context_pressure':
         return `Context at ${event.percent}%`;
       case 'subagent_spawn':
-        return `Spawned sub-agent (${event.toolName}, total: ${event.count})`;
+        return event.label
+          ? `Spawned: "${event.label}"`
+          : `Spawned sub-agent (${event.toolName})`;
       case 'failure_loop':
         return `${event.consecutiveFailures} consecutive failures — possibly stuck`;
       case 'task_milestone':
         return `[${event.progress}] ${event.task} (${event.status})`;
       case 'stuck':
         return `No output for ${Math.round((event.silentMs as number) / 60000)}min`;
+      case 'budget_alert':
+        return `Session cost reached $${event.threshold} (current: $${(event.currentCost as number).toFixed(2)})`;
       default:
         return event.event;
+    }
+  }
+
+  private extractTaskLabel(inputJson: string): string {
+    try {
+      const input = JSON.parse(inputJson);
+      const raw = input.description || input.prompt || input.task || input.name || '';
+      const label = String(raw).trim().split('\n')[0].trim();
+      return label.length > 80 ? label.slice(0, 80) + '…' : label;
+    } catch {
+      return '';
     }
   }
 

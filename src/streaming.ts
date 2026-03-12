@@ -264,6 +264,11 @@ export class StreamAccumulator {
 
   get allMessageIds(): number[] { return [...this.messageIds]; }
 
+  /** The ID of the last bubble sent by this accumulator, or null if none yet. */
+  get lastBubbleId(): number | null {
+    return this.allBubbles.length > 0 ? this.allBubbles[this.allBubbles.length - 1] : null;
+  }
+
   /** Check if msgId is sealed and emit a warn log. Used by external callers (e.g. SubAgentTracker). */
   logIfSealed(msgId: number, preview: string): void {
     const reason = this.sealedMsgIds.get(msgId);
@@ -995,6 +1000,22 @@ export class StreamAccumulator {
     this.toolHideTimers.clear();
   }
 
+  /**
+   * If there is pending (dirty) content, do one immediate final render before reset.
+   * Call this before reset() when interrupting a mid-turn stream so the last block isn't lost.
+   */
+  async flushIfDirty(): Promise<void> {
+    if (!this.dirty || this.sealed) return;
+    this.clearFlushTimer();
+    this.firstSendReady = true; // bypass first-send gate
+    this.dirty = false;
+    const html = this.renderHtml();
+    const targetMsgId = this.tgMessageId;
+    if (html && html !== '…') {
+      await this.sendQueue.then(() => this._doSendOrEdit(html, targetMsgId)).catch(() => {});
+    }
+  }
+
   /** Full reset: clear everything for a new turn. */
   reset(): void {
     const prevQueue = this.sendQueue;
@@ -1091,6 +1112,34 @@ function _extractToolArgs(toolName: string, inputJson: string, maxLen = 120, req
         const combined = searchPath ? `${pattern} in ${shortenPath(searchPath)}` : pattern;
         return combined.length > maxLen ? combined.slice(0, maxLen) + '…' : combined;
       }
+    }
+
+    // TGCC supervisor tools (MCP name: mcp__tgcc__tgcc_send, etc.)
+    if (toolName.endsWith('tgcc_send')) {
+      const agentId = (parsed.agentId || '').trim();
+      const text = (parsed.text || '').trim();
+      if (agentId && text) {
+        const textPreview = text.length > 50 ? text.slice(0, 50) + '…' : text;
+        const combined = `${agentId} · "${textPreview}"`;
+        return combined.length > maxLen ? combined.slice(0, maxLen) + '…' : combined;
+      }
+      return agentId || null;
+    }
+    if (toolName.endsWith('tgcc_log')) {
+      const agentId = (parsed.agentId || '').trim();
+      const type = (parsed.type || '').trim();
+      const grep = (parsed.grep || '').trim();
+      const extra = type ? ` type:${type}` : grep ? ` grep:${grep}` : '';
+      return agentId ? `${agentId}${extra}` : null;
+    }
+    if (toolName.endsWith('tgcc_session')) {
+      const agentId = (parsed.agentId || '').trim();
+      const action = (parsed.action || '').trim();
+      return agentId ? `${agentId}${action ? ` ${action}` : ''}` : null;
+    }
+    if (toolName.endsWith('tgcc_status') || toolName.endsWith('tgcc_kill')) {
+      const agentId = (parsed.agentId || '').trim();
+      return agentId || null;
     }
 
     if (fields) {
@@ -1242,21 +1291,28 @@ const MAX_PROGRESS_LINES = 5;
  *  Returns null if the event has no useful display content. */
 export function formatProgressLine(description: string, lastToolName?: string): string | null {
   const desc = description?.trim();
-  if (!desc) return null;
+  const tool = lastToolName?.trim() ?? '';
+  if (!desc && !tool) return null;
 
   const lower = desc.toLowerCase();
-  const tool = lastToolName?.toLowerCase() ?? '';
+  const toolLower = tool.toLowerCase();
 
   let emoji = '📋';
-  if (tool === 'bash' && /build|compile|npm run|pnpm|yarn|make/.test(lower)) {
+  if (toolLower === 'bash' && /build|compile|npm run|pnpm|yarn|make/.test(lower)) {
     emoji = '🔨';
-  } else if (tool === 'bash' && /git commit|git push/.test(lower)) {
+  } else if (toolLower === 'bash' && /git commit|git push/.test(lower)) {
     emoji = '📝';
   } else if (/context.*%|%.*context|\d{2,3}%/.test(lower)) {
     emoji = '🧠';
   }
 
-  const truncated = desc.length > 60 ? desc.slice(0, 60) + '…' : desc;
+  // Tool name is the primary signal; description provides secondary context
+  const parts: string[] = [];
+  if (tool) parts.push(tool);
+  if (desc && desc !== tool) parts.push(desc);
+  const display = parts.join(' · ');
+
+  const truncated = display.length > 70 ? display.slice(0, 70) + '…' : display;
   return `${emoji} ${escapeHtml(truncated)}`;
 }
 
@@ -1406,6 +1462,8 @@ export interface SubAgentTrackerOptions {
   sender: SubAgentSender;
   /** Called right before every editMessage — used to detect sealed-bubble violations. */
   onEditAttempt?: (msgId: number, preview: string) => void;
+  /** Called when all dispatched sub-agents have completed. */
+  onAllDone?: (stats: { count: number; elapsedMs: number }) => void;
 }
 
 export interface MailboxMessage {
@@ -1423,6 +1481,8 @@ export class SubAgentTracker {
   private chatId: number | string;
   private sender: SubAgentSender;
   private onEditAttempt?: (msgId: number, preview: string) => void;
+  private onAllDone?: (stats: { count: number; elapsedMs: number }) => void;
+  private firstDispatchedAt: number | null = null;
   private agents = new Map<string, SubAgentInfo>();
   private blockToAgent = new Map<number, string>();
   private standaloneMsgId: number | null = null;  // post-turn standalone status bubble
@@ -1442,6 +1502,7 @@ export class SubAgentTracker {
     this.chatId = options.chatId;
     this.sender = options.sender;
     this.onEditAttempt = options.onEditAttempt;
+    this.onAllDone = options.onAllDone;
   }
 
   get activeAgents(): SubAgentInfo[] {
@@ -1521,9 +1582,10 @@ export class SubAgentTracker {
     if (!this.inTurn) this.updateStandaloneMessage();
 
     const allDone = ![...this.agents.values()].some(a => a.status === 'dispatched');
-    if (allDone && this.onAllReported) {
-      this.onAllReported();
+    if (allDone) {
+      this.onAllReported?.();
       this.stopMailboxWatch();
+      this.fireAllDone();
     }
   }
 
@@ -1540,6 +1602,7 @@ export class SubAgentTracker {
       if (agentIdMatch && !info.agentName) info.agentName = agentIdMatch[1];
       info.status = 'dispatched';
       info.dispatchedAt = Date.now();
+      if (!this.firstDispatchedAt) this.firstDispatchedAt = info.dispatchedAt;
       if (!this.inTurn) this.updateStandaloneMessage();
       return;
     }
@@ -1768,10 +1831,18 @@ export class SubAgentTracker {
     if (!this.inTurn) this.updateStandaloneMessage();
 
     const allDone = ![...this.agents.values()].some(a => a.status === 'dispatched');
-    if (allDone && this.onAllReported) {
-      this.onAllReported();
+    if (allDone) {
+      this.onAllReported?.();
       this.stopMailboxWatch();
+      this.fireAllDone();
     }
+  }
+
+  private fireAllDone(): void {
+    if (!this.onAllDone) return;
+    const count = this.agents.size;
+    const elapsedMs = this.firstDispatchedAt ? Date.now() - this.firstDispatchedAt : 0;
+    this.onAllDone({ count, elapsedMs });
   }
 
   /** Build the standalone status bubble HTML. */

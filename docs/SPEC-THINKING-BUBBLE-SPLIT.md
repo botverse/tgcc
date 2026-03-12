@@ -1,6 +1,6 @@
 # SPEC: Split Thinking Blocks Into Their Own Bubble
 
-**Status:** Draft  
+**Status:** Implemented
 **Date:** 2026-03-03  
 **Author:** BossBot (Tech Lead)
 
@@ -63,6 +63,32 @@ When `content_block_stop` fires for a `thinking` block AND the next `content_blo
 1. **Freeze the thinking segment** — send/edit the current message with just the thinking content
 2. **Start a new message** — set `tgMessageId = null` so the next render creates a fresh bubble
 3. **Remove the thinking segment from `this.segments`** — the new bubble starts clean
+
+### The `pendingSplit` Flag (streaming.ts:357, 707)
+
+When a thinking block arrives **mid-turn** (i.e., segments already exist from prior text/tool content), the thinking content must not flash briefly inside the existing response bubble before being split out. The `pendingSplit` flag solves this:
+
+1. **Set on creation** (`onContentBlockStart`, streaming.ts:357): When `content_block_start` fires for a `thinking` block and `this.segments.length > 0`, the new thinking segment is created with `pendingSplit: true`. If thinking is the first segment (turn start), `pendingSplit` is `false` — it renders normally in its own bubble from the start.
+
+2. **Checked during render** (`renderHtml`, streaming.ts:707): `renderHtml()` skips any thinking segment where `splitOff` or `pendingSplit` is `true`, returning `''` for it. This means the existing response bubble (MSG_A) is never edited to include thinking content — no visual flash.
+
+3. **Cleared on split**: When `content_block_stop` fires for the thinking block, the split logic removes the segment from `this.segments` entirely and sets `seg.splitOff = true`. At that point `pendingSplit` is no longer relevant since the segment is gone from the array.
+
+```
+Timeline (mid-turn thinking):
+
+  segments = [text, tool]          tgMessageId = MSG_A
+       │
+  cbs: thinking
+       pendingSplit = (segments.length > 0) = TRUE
+       segments = [text, tool, thinking(pendingSplit)]
+       │
+  renderHtml() → skips thinking → MSG_A unchanged ✓
+       │
+  cbs: stop (thinking) → split logic runs
+       segments = [] (or post-thinking only)
+       tgMessageId = null
+```
 
 ### Edge Cases
 

@@ -1,8 +1,8 @@
 # Subagent Observability Spec
 
-**Problem:** When OpenClaw spawns a CC task (via TGCC or directly), the caller agent has zero visibility until the task completes or fails. No progress, no errors, no way to check status. But streaming all events into the caller's context would exhaust it — a single CC task can produce hundreds of events.
+**Problem:** When a supervisor spawns a CC task via TGCC, the caller has zero visibility until the task completes or fails. Streaming all events into the caller's context would exhaust it — a single CC task can produce hundreds of events.
 
-**Goal:** Find the balance between visibility and context efficiency. Push only critical alerts; let the caller pull details on demand.
+**Goal:** Push only high-signal alerts automatically; let the supervisor pull details on demand.
 
 ## Design Principles
 
@@ -11,147 +11,134 @@
 3. **Treat transcripts like files** — offset, limit, grep, just like reading code
 4. **CC can talk back** — give spawned CC an explicit way to message its parent
 
+## Architecture Note
+
+TGCC emits all observability events natively through `pushSupervisorEvent()` in `bridge.ts` and the `HighSignalDetector` class in `high-signal.ts`. Events are routed to:
+
+1. **Native supervisor event queue** — an in-memory queue (`supervisorEventQueue`) drained into the supervisor agent's next message. Any supervisor agent that reads this queue receives the events; there is no dependency on a specific consumer implementation.
+2. **External supervisor protocol** — events are also forwarded via `sendToSupervisor()` to any external consumer connected through the stdin/stdout supervisor wire protocol (subscribe per agent/session).
+3. **Telegram chat** — tracked workers' events are forwarded to the supervisor's TG chat in real time.
+4. **EventBuffer** — per-agent ring buffer for pull-based log access via `tgcc_log`.
+
+The `EventDedup` layer batches and deduplicates noisy events (e.g. consecutive git commits) before they reach the queue.
+
 ---
 
-## 1. Push Notifications (automatic, into caller context)
+## 1. Push Notifications (automatic, into supervisor context)
 
-Only inject into the caller's context when something needs attention:
+Only inject into the supervisor's context when something needs attention:
 
 | Event | When | Context cost |
 |-------|------|-------------|
-| ✅ Completion | Task finished (result text) | ~100-500 tokens |
-| ❌ Error | API error, crash, permission block | ~50-100 tokens |
-| ⚠️ Stuck | No progress for N minutes (configurable) | ~30 tokens |
-| 💰 Budget | Cost exceeded threshold | ~30 tokens |
-| 📋 Task milestone | CC creates/completes a todo item or subtask | ~30-50 tokens |
-| 🔨 Build/test result | Build or test pass/fail (highest signal for "is it done?") | ~30-50 tokens |
-| 📝 Git commit | CC committed — message is a natural progress summary | ~30-50 tokens |
-| 🧠 Context pressure | Context window at 50%, 75%, 90% — quality may degrade | ~20 tokens |
-| 🔄 Sub-agent spawn | CC used Task tool to spawn sub-agents (task is bigger than expected) | ~30 tokens |
-| 🔁 Failure loop | 3+ consecutive tool failures (CC is stuck) | ~50 tokens |
-| 💬 CC message | CC used `notify_parent` MCP tool | Variable |
+| Completion | Task finished (result text) | ~100-500 tokens |
+| Error | API error, crash, permission block | ~50-100 tokens |
+| Stuck | No progress for N minutes (configurable, default 5min) | ~30 tokens |
+| Budget | Cost exceeded threshold ($1, $5, $10, $25) | ~30 tokens |
+| Task milestone | CC creates/completes a todo item (TodoWrite) | ~30-50 tokens |
+| Build/test result | Build or test pass/fail (highest signal for "is it done?") | ~30-50 tokens |
+| Git commit | CC committed — message is a natural progress summary | ~30-50 tokens |
+| Context pressure | Context window at 50%, 75%, 90% — quality may degrade | ~20 tokens |
+| Sub-agent spawn | CC used Task tool to spawn sub-agents | ~30 tokens |
+| Failure loop | 3+ consecutive tool failures (CC is stuck) | ~50 tokens |
+| CC message | CC used `notify_parent` MCP tool | Variable |
 
 **Format:** Short, actionable, one message per event:
 ```
-[subagent:sentinella] ❌ API error: rate limited (retry 2/5)
-[subagent:sentinella] ⚠️ No progress for 5 minutes (last: editing bridge.ts)
-[subagent:sentinella] 💰 $0.50 spent (budget: $1.00)
-[subagent:sentinella] 📋 [2/5] Read specs and source files ✅
-[subagent:sentinella] 📋 [3/5] Implement ring buffer + get_log
-[subagent:sentinella] 🔨 Build passed ✅ (0 errors)
-[subagent:sentinella] 🔨 Build failed: 12 errors in bridge.ts
-[subagent:sentinella] 📝 Committed: "feat: add event ring buffer and get_log command"
-[subagent:sentinella] 🧠 Context at 75% — may compact soon
-[subagent:sentinella] 🔄 Spawned 3 sub-agents (team: refactor-squad)
-[subagent:sentinella] 🔁 3 consecutive Bash failures — possibly stuck
-[subagent:sentinella] 💬 "Build fails — missing dep X. Install it?"
+[worker-id] Build passed
+[worker-id] No output for 5min
+[worker-id] Session cost reached $5 (current: $5.12)
+[worker-id] [2/5] Read specs and source files (completed)
+[worker-id] Build failed: 12 errors
+[worker-id] Committed: "feat: add event ring buffer"
+[worker-id] Context at 75%
+[worker-id] Spawned: "refactor auth module"
+[worker-id] 3 consecutive failures — possibly stuck
+[worker-id] "Build fails — missing dep X. Install it?"
 ```
 
 ### TGCC Implementation
 
-TGCC tracks these conditions per-process and emits supervisor events:
+`HighSignalDetector` (in `high-signal.ts`) watches CC stream events and emits structured events through two callbacks:
+
+- `emitSupervisorEvent(event)` — routes to the supervisor event queue and external supervisor protocol
+- `pushEventBuffer(agentId, line)` — stores in the per-agent EventBuffer ring buffer
+
+Events emitted by the detector:
 
 ```jsonc
-// Error event (already exists, extend with detail)
-{"type":"event", "event":"api_error", "agentId":"sentinella", "message":"rate limited", "retry":"2/5"}
+// Build/test result (Bash tool with build/test command pattern)
+{"type":"event", "event":"build_result", "agentId":"worker-1", "command":"npm run build", "passed":true, "errors":0, "summary":"Build/test passed"}
 
-// Task milestone (from TodoWrite tool use)
-{"type":"event", "event":"task_milestone", "agentId":"sentinella", "task":"Read specs and source files", "status":"completed", "progress":"2/5"}
+// Git commit (Bash tool with git commit command)
+{"type":"event", "event":"git_commit", "agentId":"worker-1", "message":"feat: add event ring buffer"}
 
-// Build/test result (detect from Bash tool output: exit code + "error"/"passed"/"failed" keywords)
-{"type":"event", "event":"build_result", "agentId":"sentinella", "command":"npm run build", "passed":true, "errors":0, "summary":"Build passed"}
-{"type":"event", "event":"build_result", "agentId":"sentinella", "command":"npm run build", "passed":false, "errors":12, "summary":"12 errors in bridge.ts"}
+// Task milestone (TodoWrite tool use)
+{"type":"event", "event":"task_milestone", "agentId":"worker-1", "task":"Read specs and source files", "status":"completed", "progress":"2/5"}
 
-// Git commit (detect from Bash tool: `git commit` command with exit 0)
-{"type":"event", "event":"git_commit", "agentId":"sentinella", "message":"feat: add event ring buffer"}
+// Context pressure (from message_start usage stats)
+{"type":"event", "event":"context_pressure", "agentId":"worker-1", "percent":75, "tokens":150000}
 
-// Context pressure (from stream_event usage stats — track cumulative)
-{"type":"event", "event":"context_pressure", "agentId":"sentinella", "percent":75, "tokens":150000}
+// Sub-agent spawn (Task/dispatch_agent/create_agent/AgentRunner tool use)
+{"type":"event", "event":"subagent_spawn", "agentId":"worker-1", "count":1, "toolName":"Task", "label":"refactor auth module"}
 
-// Sub-agent spawn (detect from Task/dispatch_agent tool use)
-{"type":"event", "event":"subagent_spawn", "agentId":"sentinella", "count":3, "teamName":"refactor-squad"}
+// Failure loop (3+ consecutive tool failures)
+{"type":"event", "event":"failure_loop", "agentId":"worker-1", "consecutiveFailures":3, "lastTool":"Bash", "lastError":"exit code 1"}
 
-// Failure loop (track consecutive tool failures — 3+ triggers alert)
-{"type":"event", "event":"failure_loop", "agentId":"sentinella", "consecutiveFailures":3, "lastTool":"Bash", "lastError":"exit code 1"}
+// Stuck (no output for N minutes, not during tool execution)
+{"type":"event", "event":"stuck", "agentId":"worker-1", "silentMs":300000, "lastActivity":"2026-03-12T10:30:00.000Z"}
 
-// Stuck (no output for N minutes)
-{"type":"event", "event":"stuck", "agentId":"sentinella", "silentMs":300000, "lastActivity":"editing bridge.ts"}
+// Budget alert (configurable thresholds: $1, $5, $10, $25)
+{"type":"event", "event":"budget_alert", "agentId":"worker-1", "threshold":5, "currentCost":5.12}
 
-// Budget event (new)  
-{"type":"event", "event":"budget_alert", "agentId":"sentinella", "costUsd":0.50, "budgetUsd":1.00}
-
-// CC notify_parent (new, via MCP tool → supervisor event)
-{"type":"event", "event":"cc_message", "agentId":"sentinella", "text":"Build fails — missing dep X. Install it?"}
+// CC notify_parent (via MCP tool)
+{"type":"event", "event":"cc_message", "agentId":"worker-1", "text":"Build fails — missing dep X. Install it?", "priority":"question"}
 ```
 
-### OpenClaw Implementation
+Bridge-level events (emitted directly by `bridge.ts`, not through `HighSignalDetector`):
 
-`TgccSupervisorClient` receives events → injects as system messages into the requester's session.
+```jsonc
+// Turn complete
+{"type":"event", "event":"result", "agentId":"worker-1", "result":"...", "is_error":false, "total_cost_usd":0.34}
+
+// Process lifecycle
+{"type":"event", "event":"cc_spawned", "agentId":"worker-1", "sessionId":"abc-123"}
+{"type":"event", "event":"process_exit", "agentId":"worker-1", "sessionId":"abc-123", "exitCode":null}
+{"type":"event", "event":"session_takeover", "agentId":"worker-1", "sessionId":"abc-123"}
+
+// Agent lifecycle
+{"type":"event", "event":"agent_created", "agentId":"worker-1", "agentType":"ephemeral", "repo":"/home/user/project"}
+{"type":"event", "event":"agent_destroyed", "agentId":"worker-1"}
+
+// State changes
+{"type":"event", "event":"state_changed", "agentId":"worker-1", "field":"model", "value":"opus"}
+```
 
 ---
 
-## 2. Pull: `subagents log` (on-demand transcript access)
+## 2. Pull: `tgcc_log` (on-demand transcript access)
 
-Treat the CC transcript as a seekable, filterable file.
+Treat the CC transcript as a seekable, filterable log. Each agent has an `EventBuffer` (ring buffer, configurable max size) that stores all CC output events in memory.
 
-### Tool Interface (OpenClaw)
+### MCP Tool Interface
+
+The `tgcc_log` MCP tool is available to supervisor agents:
 
 ```
-subagents log <target>                              # last 50 lines
-subagents log <target> --offset 100 --limit 20      # specific range  
-subagents log <target> --grep "error|fail"           # filter by pattern
-subagents log <target> --grep "tool_use" --limit 10  # last 10 tool calls
-subagents log <target> --since 5m                    # last 5 minutes
-subagents log <target> --summary                     # compressed summary (cheap model)
+tgcc_log worker-1                              # last 50 entries
+tgcc_log worker-1 --limit 20                   # specific count
+tgcc_log worker-1 --grep "error|fail"          # filter by pattern
+tgcc_log worker-1 --type tool                  # last tool calls
+tgcc_log worker-1 --since 300000               # last 5 minutes (ms)
 ```
 
 Parameters:
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
-| `target` | string | required | Subagent label or run ID |
-| `offset` | number | 0 | Line offset from start (0-indexed) |
-| `limit` | number | 50 | Max lines to return |
+| `agentId` | string | required | Worker agent ID |
+| `limit` | number | 50 | Max entries to return |
 | `grep` | string | none | Regex filter on line content |
-| `since` | string | none | Time filter (e.g. "5m", "1h") |
-| `summary` | boolean | false | Return compressed summary instead of raw lines |
-| `type` | string | none | Filter by event type: "text", "tool", "error", "thinking" |
-
-### TGCC Implementation: `get_log` command
-
-TGCC buffers CC output events in memory (ring buffer, configurable max size). Supervisor can query:
-
-```jsonc
-// Request
-{
-  "type": "command",
-  "requestId": "...",
-  "action": "get_log",
-  "params": {
-    "agentId": "sentinella",
-    "offset": 0,          // optional
-    "limit": 50,           // optional
-    "grep": "error|fail",  // optional, regex
-    "since": 300000,       // optional, ms ago
-    "type": "tool"         // optional, event type filter
-  }
-}
-
-// Response
-{
-  "type": "response",
-  "requestId": "...",
-  "result": {
-    "totalLines": 247,
-    "returnedLines": 12,
-    "offset": 235,
-    "lines": [
-      {"ts": 1772211918087, "type": "tool", "text": "✅ Bash (2.1s)\ncd /home/fonz/Botverse/sentinella && git log --oneline -3"},
-      {"ts": 1772211918282, "type": "text", "text": "Here are the last 3 commits:"},
-      ...
-    ]
-  }
-}
-```
+| `since` | number | none | Only entries from last N milliseconds |
+| `type` | string | none | Filter by entry type |
 
 ### Log Line Types
 
@@ -161,46 +148,41 @@ TGCC buffers CC output events in memory (ring buffer, configurable max size). Su
 | `thinking` | CC thinking blocks | Thinking content (truncated) |
 | `tool` | Tool use + result | Tool name, duration, summary |
 | `error` | API errors, crashes | Error message |
-| `system` | Init, compact, takeover | System event description |
+| `system` | Init, compact, takeover, high-signal events | System event description |
 | `user` | User/supervisor messages sent | The input text + source |
 
 ---
 
-## 3. Pull: `subagents status` (enhanced)
+## 3. Pull: `tgcc_status` (agent status)
 
-Already partially exists. Enhance with more detail:
+The `tgcc_status` MCP tool returns per-agent status. Omit `agentId` to get all workers.
 
 ```jsonc
-// subagents status sentinella
 {
-  "agentId": "sentinella",
+  "agentId": "worker-1",
   "state": "active",
-  "runtime": "12m",
-  "sessionId": "abc-123",
-  "costUsd": 0.34,
-  "tokensIn": 45000,
-  "tokensOut": 12000,
-  "toolsUsed": 8,
-  "lastActivity": "editing src/bridge.ts",
-  "lastActivityAge": "30s ago"
+  "repo": "/home/user/project",
+  "process": {
+    "sessionId": "abc-123",
+    "model": "opus"
+  },
+  "lastActivity": "30s ago",
+  "contextPercent": 42
 }
 ```
 
-### TGCC Implementation
-
-Extend `status` response with per-process stats. TGCC already tracks cost via `result` events — accumulate per-process.
+TGCC tracks cost via `HighSignalDetector.getSessionCost()` and context usage via `message_start` token counts.
 
 ---
 
-## 4. CC → Parent: `notify_parent` MCP Tool
+## 4. CC -> Parent: `notify_parent` MCP Tool
 
-Give CC an explicit way to message the parent agent. This is an MCP tool provided by TGCC's MCP bridge:
+Give CC an explicit way to message the parent agent. This is an MCP tool provided by TGCC to each worker:
 
 ```typescript
-// MCP tool definition
 {
   name: "notify_parent",
-  description: "Send a message to the orchestrator/parent that spawned this task. Use for: asking questions, reporting blockers, progress updates on long tasks, or when you need a decision.",
+  description: "Send a message to the orchestrator/parent that spawned this task.",
   inputSchema: {
     type: "object",
     properties: {
@@ -216,12 +198,13 @@ Give CC an explicit way to message the parent agent. This is an MCP tool provide
 
 ```
 CC uses notify_parent("Build fails, should I install dep X?", priority="question")
-  → MCP bridge receives tool call
-  → TGCC emits supervisor event: {event: "cc_message", agentId, text, priority}
-  → OpenClaw receives event → injects into caller's context
-  → Caller responds via subagents steer
-  → TGCC forwards to CC stdin
-  → CC continues
+  -> MCP bridge receives tool call
+  -> TGCC pushes to supervisorEventQueue (native supervisor)
+  -> TGCC sends to external supervisor protocol (if connected)
+  -> TGCC forwards to supervisor's TG chat (always, for explicit worker messages)
+  -> Supervisor sees event, responds via tgcc_send
+  -> TGCC forwards to CC stdin
+  -> CC continues
 ```
 
 ### When CC Should Use This
@@ -230,52 +213,30 @@ CC uses notify_parent("Build fails, should I install dep X?", priority="question
 - **info** — progress update on long tasks ("Phase 1 done, starting Phase 2")
 
 ### When CC Should NOT Use This
-- Routine progress — handled by pull-based `subagents log`
+- Routine progress — handled by pull-based `tgcc_log`
 - Completion — handled by `result` event
 - Errors — handled by error push notifications
 
 ---
 
-## 5. Implementation Phases
+## 5. Implementation Status
 
-### Phase A: Pull basics
-- TGCC: ring buffer for CC events, `get_log` command with offset/limit/grep
-- OpenClaw: `subagents log` tool with params, `subagents status` enhancement
-
-### Phase B: Push alerts
-- TGCC: stuck detection, budget tracking, emit alert events
-- OpenClaw: event handlers for alerts, inject as system messages
-
-### Phase C: CC → Parent
-- TGCC: `notify_parent` MCP tool, forward as supervisor event
-- OpenClaw: `cc_message` event handler, inject into caller context
-
----
-
-## 6. Inventory
-
-### TGCC
-| What | Phase |
-|------|-------|
-| Event ring buffer (per-process, configurable max) | A |
-| `get_log` supervisor command | A |
-| Enhanced `status` with per-process stats | A |
-| Stuck detection (configurable silence threshold) | B |
-| Budget tracking per-process | B |
-| `stuck` and `budget_alert` supervisor events | B |
-| Build/test result detection (Bash exit code + keyword parsing) | B |
-| Git commit detection (git commit tool use) | B |
-| Context pressure tracking (from usage stats) | B |
-| Sub-agent spawn detection (Task/dispatch_agent tool use) | B |
-| Failure loop detection (3+ consecutive tool failures) | B |
-| Task milestone detection (TodoWrite tool use) | B |
-| `notify_parent` MCP tool | C |
-| `cc_message` supervisor event | C |
-
-### OpenClaw
-| What | Phase |
-|------|-------|
-| `subagents log` tool (offset/limit/grep/since/type) | A |
-| Enhanced `subagents status` display | A |
-| Error/stuck/budget event handlers → system message injection | B |
-| `cc_message` event handler → system message injection | C |
+| Component | Status | Notes |
+|-----------|--------|-------|
+| EventBuffer (per-agent ring buffer) | Done | `event-buffer.ts` |
+| `tgcc_log` MCP tool | Done | `mcp-server.ts` |
+| `tgcc_status` MCP tool | Done | `mcp-server.ts` |
+| HighSignalDetector | Done | `high-signal.ts` — all event types implemented |
+| Native supervisor event queue | Done | `bridge.ts` — `pushSupervisorEvent()` |
+| EventDedup (batching/dedup) | Done | `bridge.ts` |
+| Stuck detection | Done | Configurable silence threshold, skips during tool execution |
+| Budget tracking | Done | Configurable thresholds, per-session cost accumulation |
+| Build/test result detection | Done | Bash exit code + keyword pattern matching |
+| Git commit detection | Done | Bash tool with git commit command |
+| Context pressure tracking | Done | From `message_start` usage stats |
+| Sub-agent spawn detection | Done | Task/dispatch_agent/create_agent/AgentRunner tool use |
+| Failure loop detection | Done | 3+ consecutive tool failures |
+| Task milestone detection | Done | TodoWrite tool use parsing |
+| `notify_parent` MCP tool | Done | Routes to queue + TG chat |
+| `supervisor_notify` MCP tool | Done | Desktop/TG notifications |
+| TG chat forwarding for tracked workers | Done | `trackedWorkers` set in bridge |

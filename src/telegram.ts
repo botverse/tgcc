@@ -49,11 +49,13 @@ export const COMMANDS = [
   { command: 'status', description: 'Process state and session info' },
   { command: 'cost', description: 'Show session cost' },
   { command: 'catchup', description: 'Summarize external CC activity' },
+  { command: 'restart', description: 'Restart the TGCC service' },
   { command: 'cancel', description: 'Abort current CC turn' },
   { command: 'compact', description: 'Compact conversation context' },
   { command: 'model', description: 'Switch model' },
   { command: 'permissions', description: 'Set permission mode' },
   { command: 'repo', description: 'Manage repos & switch working directory' },
+  { command: 'cron', description: 'Manage scheduled cron jobs' },
   { command: 'ping', description: 'Quick liveness check' },
   { command: 'help', description: 'List all commands' },
 ];
@@ -247,7 +249,7 @@ export class TelegramBot {
       const base64 = buffer.toString('base64');
 
       const mediaType = detectImageMediaType(file.file_path ?? 'photo.jpg');
-      const caption = ctx.message?.caption ?? 'What do you see in this image?';
+      const caption = ctx.message?.caption ?? '';
 
       this.onMessage({
         type: 'photo',
@@ -292,7 +294,7 @@ export class TelegramBot {
           type: 'photo',
           chatId: ctx.chat!.id,
           userId: String(userId),
-          text: caption || 'What do you see in this image?',
+          text: caption,
           imageBase64: base64,
           imageMediaType: mediaType,
         });

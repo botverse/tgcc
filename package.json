@@ -83,6 +83,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.26.0",
+    "croner": "^10.0.1",
     "grammy": "^1.40.0",
     "pino": "^10.3.1",
     "remark-gfm": "^4.0.1",

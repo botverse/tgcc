@@ -1,5 +1,6 @@
 import { join } from 'node:path';
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, statSync, mkdirSync } from 'node:fs';
+import { promisify } from 'node:util';
 import { homedir } from 'node:os';
 import { EventEmitter } from 'node:events';
 import pino from 'pino';
@@ -7,6 +8,7 @@ import type {
   TgccConfig,
   AgentConfig,
   ConfigDiff,
+  CronJobConfig,
 } from './config.js';
 import type { ApiErrorEvent, PermissionRequest, ToolResultEvent, TaskStartedEvent, TaskProgressEvent, TaskCompletedEvent, CompactBoundaryEvent } from './cc-protocol.js';
 import { resolveUserConfig, resolveRepoPath, updateConfig, isValidRepoName, findRepoOwner } from './config.js';
@@ -40,13 +42,22 @@ import {
 import { ProcessRegistry, type ClientRef, type ProcessEntry } from './process-registry.js';
 import { EventBuffer } from './event-buffer.js';
 import { HighSignalDetector } from './high-signal.js';
+import { EventDedup } from './event-dedup.js';
+import { Scheduler, computeOneShotSchedule, parseEveryToCron } from './scheduler.js';
 import { randomUUID } from 'node:crypto';
+import { exec as nodeExec } from 'node:child_process';
 
 // ── Types ──
 
+interface AskOption {
+  label: string;
+  description?: string;
+}
+
 interface AskQuestion {
   question: string;
-  options?: string[];
+  header?: string;
+  options?: Array<AskOption | string>;
   multiSelect?: boolean;
 }
 
@@ -55,7 +66,7 @@ interface PendingPermission {
   userId: string;
   toolName: string;
   input: Record<string, unknown>;
-  /** Set when this came from a regular tool_use (not can_use_tool). Response via sendToolResult. */
+  /** Set when this came from a regular tool_use (not can_use_tool). */
   toolUseId?: string;
   // AskUserQuestion state
   questionMsgId?: number;
@@ -83,6 +94,10 @@ interface AgentInstance {
   pendingIdeAwareness: boolean;           // true when resuming a session that was active in an IDE
   destroyTimer: ReturnType<typeof setTimeout> | null; // auto-destroy for ephemeral
   eventBuffer: EventBuffer;               // ring buffer for observability
+  awaitingAskCleanup: boolean;            // true when AskUserQuestion was detected this turn → delete fallback bubble on result
+  deferredSends: Array<{ text: string; fromAgentId: string }>; // queued by waitForIdle sends
+  supervisorWakeOnComplete: boolean; // ping supervisor TG when next turn ends
+  lastSupervisorSentText: string | null; // last text sent by supervisor → include in wake context
 }
 
 interface SupervisorPendingRequest {
@@ -173,6 +188,7 @@ const HELP_TEXT = `<b>TGCC Commands</b>
 /ping — Liveness check
 
 <b>Control</b>
+/restart — Restart the TGCC service
 /cancel — Abort current CC turn
 /compact [instructions] — Compact conversation context
 /model &lt;name&gt; — Switch model
@@ -183,6 +199,12 @@ const HELP_TEXT = `<b>TGCC Commands</b>
 /repo remove &lt;name&gt; — Unregister a repo
 /repo assign &lt;name&gt; — Set as agent default
 /repo clear — Clear agent default
+
+<b>Cron</b>
+/cron list — Show all scheduled jobs
+/cron add — Add a new cron job
+/cron run &lt;id&gt; — Trigger a job now
+/cron remove &lt;id&gt; — Remove a dynamic job
 
 /help — This message`;
 
@@ -200,8 +222,22 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
   // High-signal event detection
   private highSignalDetector: HighSignalDetector;
+  private eventDedup: EventDedup;
 
-  // Supervisor protocol
+  // Heartbeat & cron scheduling
+  private scheduler: Scheduler;
+
+  // Whisper transcription
+  private whisperBin: string | null | undefined; // undefined = not yet resolved
+
+  // Native supervisor (TGCC-internal)
+  private nativeSupervisorId: string | null;
+  private supervisorEventQueue: string[] = [];
+  private static readonly SUPERVISOR_QUEUE_MAX = 20;
+  /** Workers whose high-signal events are forwarded to the supervisor's TG chat in real time. */
+  private trackedWorkers = new Set<string>();
+
+  // External supervisor protocol (OpenClaw plugin)
   private supervisorWrite: ((line: string) => void) | null = null;
   private supervisorAgentId: string | null = null;
   private supervisorSubscriptions = new Set<string>(); // "agentId:sessionId" or "agentId:*"
@@ -211,17 +247,36 @@ export class Bridge extends EventEmitter implements CtlHandler {
   constructor(config: TgccConfig, logger?: pino.Logger) {
     super();
     this.config = config;
+    this.nativeSupervisorId = config.supervisor;
     this.logger = logger ?? pino({ level: config.global.logLevel });
     this.sessionStore = new SessionStore(config.global.stateFile, this.logger);
     this.mcpServer = new McpBridgeServer(
       (req) => this.handleMcpToolRequest(req),
       this.logger,
     );
-    this.ctlServer = new CtlServer(this, this.logger);
+    this.ctlServer = new CtlServer(this, this.logger, config.supervisor ?? Object.keys(config.agents)[0] ?? null);
+    this.scheduler = new Scheduler(this.logger);
+
+    // Route deduped events to supervisor queue and TG chat (used as flush target by EventDedup for batched events like git_commit)
+    const routeDedupedEvent = (event: import('./high-signal.js').HighSignalEvent): void => {
+      if (event.emoji && event.summary) {
+        this.pushSupervisorEvent(event.agentId, `${event.emoji} ${event.summary}`);
+      }
+    };
+    this.eventDedup = new EventDedup(routeDedupedEvent);
+
     this.highSignalDetector = new HighSignalDetector({
       emitSupervisorEvent: (event) => {
+        // External supervisor (OpenClaw plugin) — always forward unfiltered
         if (this.isSupervisorSubscribed(event.agentId, this.agents.get(event.agentId)?.ccProcess?.sessionId ?? null)) {
           this.sendToSupervisor(event);
+        }
+        // Native supervisor queue — tier 1+2 events, filtered through dedup layer
+        const ROUTED_EVENTS = new Set(['failure_loop', 'stuck', 'task_milestone', 'build_result', 'git_commit', 'subagent_spawn', 'budget_alert']);
+        if (ROUTED_EVENTS.has(event.event) && event.emoji && event.summary) {
+          if (this.eventDedup.shouldForward(event)) {
+            this.pushSupervisorEvent(event.agentId, `${event.emoji} ${event.summary}`);
+          }
         }
       },
       pushEventBuffer: (agentId, line) => {
@@ -229,6 +284,152 @@ export class Bridge extends EventEmitter implements CtlHandler {
         if (agent) agent.eventBuffer.push(line);
       },
     });
+  }
+
+  /** Send a silent TG wake ping to the supervisor without adding noise to the event queue.
+   *  Used when a worker turn completes after a supervisor-initiated send. */
+  private wakeSupervisorTg(sourceAgentId: string): void {
+    if (!this.nativeSupervisorId || sourceAgentId === this.nativeSupervisorId) return;
+    const supAgent = this.agents.get(this.nativeSupervisorId);
+    if (supAgent?.tgBot) {
+      const chatId = this.getAgentChatId(supAgent);
+      if (chatId) {
+        const msg = `[${sourceAgentId}] ✅`;
+        supAgent.tgBot.sendText(chatId, `<blockquote>${escapeHtml(msg)}</blockquote>`, 'HTML', true)
+          .catch(err => this.logger.warn({ err }, 'Failed to send wake ping to supervisor TG'));
+      }
+    }
+  }
+
+  /** Push a message from a worker agent into the native supervisor's event queue, and immediately
+   *  post it to the supervisor's Telegram chat (if the worker is tracked or forceTg is set).
+   *  No-op if no native supervisor is configured or the source is the supervisor itself.
+   *  @param notifyTg — whether TG notification is desired at all (false suppresses completely)
+   *  @param forceTg — bypass tracking check (e.g. for explicit notify_parent calls) */
+  private pushSupervisorEvent(sourceAgentId: string, text: string, notifyTg = true, forceTg = false): void {
+    if (!this.nativeSupervisorId || sourceAgentId === this.nativeSupervisorId) return;
+    const line = `🤖 [${sourceAgentId}] ${text}`;
+    this.supervisorEventQueue.push(line);
+    if (this.supervisorEventQueue.length > Bridge.SUPERVISOR_QUEUE_MAX) {
+      this.supervisorEventQueue.shift();
+    }
+    // Only forward to TG in real time if the worker is being tracked (or forceTg)
+    if (!notifyTg || (!forceTg && !this.trackedWorkers.has(sourceAgentId))) return;
+    // Send immediately to supervisor's TG chat
+    const supAgent = this.agents.get(this.nativeSupervisorId);
+    if (supAgent?.tgBot) {
+      const chatId = this.getAgentChatId(supAgent);
+      if (chatId) {
+        supAgent.tgBot.sendText(chatId, `<blockquote>${escapeHtml(line)}</blockquote>`, 'HTML', true)
+          .catch(err => this.logger.warn({ err }, 'Failed to push worker event to supervisor TG'));
+      }
+    }
+  }
+
+  /** Send a supervisor message to an agent and register a wake-on-complete ping. */
+  private sendSupervisorMessage(agentId: string, text: string, fromAgentId: string): void {
+    const agent = this.agents.get(agentId);
+    if (!agent) return;
+    const labeledText = `[From supervisor ${fromAgentId}]: ${text}`;
+    this.sendToCC(agentId, { text: labeledText }, { spawnSource: 'supervisor' });
+    agent.supervisorWakeOnComplete = true;
+    agent.lastSupervisorSentText = text;
+    if (agent.tgBot) {
+      const chatId = this.getAgentChatId(agent);
+      if (chatId) {
+        const label = `🤖 [${fromAgentId}] ${text}`;
+        agent.tgBot.sendText(chatId, `<blockquote>${escapeHtml(label)}</blockquote>`, 'HTML', true)
+          .catch(err => this.logger.warn({ err }, 'Failed to notify TG on supervisor send'));
+      }
+    }
+  }
+
+  /** Drain the deferred-send queue for an agent (fires on turn complete or process exit). */
+  private drainDeferredSends(agentId: string): void {
+    const agent = this.agents.get(agentId);
+    if (!agent || agent.deferredSends.length === 0) return;
+    const queued = agent.deferredSends.splice(0);
+    for (const { text, fromAgentId } of queued) {
+      this.logger.info({ agentId, fromAgentId }, 'Delivering deferred send');
+      this.sendSupervisorMessage(agentId, text, fromAgentId);
+    }
+  }
+
+  // ── Cron isolated spawn ──
+
+  private spawnCronIsolated(job: CronJobConfig): void {
+    const agentConfig = this.config.agents[job.agentId];
+    if (!agentConfig) {
+      this.logger.warn({ jobId: job.id, agentId: job.agentId }, 'Cron job: target agent not found');
+      return;
+    }
+    const cronAgentId = `cron:${job.id}:${Date.now()}`;
+    this.logger.info({ jobId: job.id, cronAgentId }, 'Spawning isolated cron agent');
+    // Reuse ephemeral agent path via MCP spawn
+    const model = job.model ?? agentConfig.defaults.model;
+    const timeoutMs = job.timeoutMs ?? 120_000;
+    // Create an ephemeral agent and immediately send the job message
+    this.handleMcpToolRequest({
+      id: `cron-spawn-${job.id}`,
+      agentId: job.agentId, // source = the target agent's context (repo etc.)
+      userId: 'cron',
+      tool: 'tgcc_spawn',
+      params: {
+        agentId: cronAgentId,
+        model,
+        timeoutMs,
+        repo: agentConfig.defaults.repo,
+        message: job.message,
+      },
+    }).catch(err => this.logger.error({ err, jobId: job.id }, 'Failed to spawn isolated cron agent'));
+  }
+
+  // ── Whisper transcription ──
+
+  private async resolveWhisperBin(): Promise<string | null> {
+    if (this.whisperBin !== undefined) return this.whisperBin;
+    const execAsync = promisify(nodeExec);
+    // Try PATH first, then known Homebrew location
+    const candidates = ['whisper', '/home/linuxbrew/.linuxbrew/bin/whisper'];
+    for (const bin of candidates) {
+      try {
+        await execAsync(`test -x "$(which ${bin} 2>/dev/null || echo ${bin})" 2>/dev/null || test -x "${bin}"`);
+        this.whisperBin = bin;
+        return bin;
+      } catch { /* try next */ }
+    }
+    this.whisperBin = null;
+    return null;
+  }
+
+  private async transcribeVoice(agentId: string, msg: TelegramMessage): Promise<void> {
+    const agent = this.agents.get(agentId);
+    if (!agent || !msg.filePath || !msg.fileName) return;
+
+    const whisper = await this.resolveWhisperBin();
+    if (!whisper) {
+      this.logger.warn({ agentId }, 'Whisper not found — forwarding voice file path to CC');
+      this.sendToCC(agentId, { text: msg.text || '', filePath: msg.filePath, fileName: msg.fileName }, { chatId: msg.chatId, spawnSource: 'telegram' });
+      return;
+    }
+
+    const outDir = '/tmp/tgcc/whisper';
+    mkdirSync(outDir, { recursive: true });
+
+    const execAsync = promisify(nodeExec);
+    this.logger.info({ agentId, filePath: msg.filePath }, 'Transcribing voice message');
+    await execAsync(`"${whisper}" "${msg.filePath}" --language en --model small --output_format txt --output_dir "${outDir}"`);
+
+    const baseName = msg.fileName.replace(/\.[^.]+$/, '');
+    const txtPath = join(outDir, `${baseName}.txt`);
+    if (!existsSync(txtPath)) throw new Error(`Whisper output not found: ${txtPath}`);
+
+    const transcript = readFileSync(txtPath, 'utf-8').trim();
+    const text = msg.text
+      ? `${msg.text}\n\n[Voice message transcription]\n${transcript}`
+      : `[Voice message transcription]\n${transcript}`;
+
+    this.sendToCC(agentId, { text }, { chatId: msg.chatId, spawnSource: 'telegram' });
   }
 
   // ── Startup ──
@@ -239,6 +440,34 @@ export class Bridge extends EventEmitter implements CtlHandler {
     for (const [agentId, agentConfig] of Object.entries(this.config.agents)) {
       await this.startAgent(agentId, agentConfig);
     }
+
+    // Wire up the announce callback for cron TG notifications
+    this.scheduler.setAnnounceFn((annAgentId, annText) => {
+      const annAgent = this.agents.get(annAgentId);
+      if (!annAgent?.tgBot) return;
+      const annChatId = this.getAgentChatId(annAgent);
+      if (annChatId) {
+        annAgent.tgBot.sendText(annChatId, `<blockquote>${annText}</blockquote>`, 'HTML', true)
+          .catch(err => this.logger.warn({ err, agentId: annAgentId }, 'Failed to send cron announce'));
+      }
+    });
+
+    // Start static cron jobs (config-level, shared across agents)
+    if (this.config.cron?.jobs.length) {
+      this.scheduler.startAllCronJobs(
+        this.config.cron.jobs,
+        (agentId, text) => this.sendToCC(agentId, { text }),
+        (job) => this.spawnCronIsolated(job),
+      );
+    }
+
+    // Load persisted dynamic cron jobs
+    const validAgentIds = new Set(Object.keys(this.config.agents));
+    this.scheduler.loadDynamicJobs(
+      (agentId, text) => this.sendToCC(agentId, { text }),
+      (job) => this.spawnCronIsolated(job),
+      validAgentIds,
+    );
 
     this.logger.info({ agents: Object.keys(this.config.agents) }, 'Bridge started');
 
@@ -287,13 +516,27 @@ export class Bridge extends EventEmitter implements CtlHandler {
       pendingIdeAwareness: false,
       destroyTimer: null,
       eventBuffer: new EventBuffer(),
+      awaitingAskCleanup: false,
+      deferredSends: [],
+      supervisorWakeOnComplete: false,
+      lastSupervisorSentText: null,
     };
 
     this.agents.set(agentId, instance);
     await tgBot.start();
 
+    // Start heartbeat if configured
+    if (agentConfig.heartbeat) {
+      this.scheduler.startHeartbeat(
+        agentId,
+        agentConfig.heartbeat,
+        () => this.agents.get(agentId)?.ccProcess?.state === 'idle' || !this.agents.get(agentId)?.ccProcess,
+        (aid, text) => this.sendToCC(aid, { text }),
+      );
+    }
+
     // Start control socket for CLI access
-    const ctlSocketPath = join('/tmp/tgcc/ctl', `${agentId}.sock`);
+    const ctlSocketPath = join(this.config.global.ctlSocketDir, `${agentId}.sock`);
     this.ctlServer.listen(ctlSocketPath);
   }
 
@@ -329,6 +572,38 @@ export class Bridge extends EventEmitter implements CtlHandler {
       }
     }
 
+    // Restart heartbeats for changed agents
+    for (const agentId of diff.changed) {
+      const newAgentConfig = newConfig.agents[agentId];
+      if (!newAgentConfig) continue;
+      this.scheduler.stopHeartbeat(agentId);
+      if (newAgentConfig.heartbeat) {
+        this.scheduler.startHeartbeat(
+          agentId,
+          newAgentConfig.heartbeat,
+          () => this.agents.get(agentId)?.ccProcess?.state === 'idle' || !this.agents.get(agentId)?.ccProcess,
+          (aid, text) => this.sendToCC(aid, { text }),
+        );
+      }
+    }
+
+    // Restart cron jobs if config changed (static only — dynamic are preserved)
+    this.scheduler.stopAllCronJobs();
+    if (newConfig.cron?.jobs.length) {
+      this.scheduler.startAllCronJobs(
+        newConfig.cron.jobs,
+        (agentId, text) => this.sendToCC(agentId, { text }),
+        (job) => this.spawnCronIsolated(job),
+      );
+    }
+    // Re-load dynamic cron jobs (they survive config reload)
+    const reloadValidAgentIds = new Set(Object.keys(newConfig.agents));
+    this.scheduler.loadDynamicJobs(
+      (agentId, text) => this.sendToCC(agentId, { text }),
+      (job) => this.spawnCronIsolated(job),
+      reloadValidAgentIds,
+    );
+
     this.config = newConfig;
   }
 
@@ -337,6 +612,9 @@ export class Bridge extends EventEmitter implements CtlHandler {
     if (!agent) return;
 
     this.logger.info({ agentId, ephemeral: agent.ephemeral }, 'Stopping agent');
+
+    // Stop heartbeat if running
+    this.scheduler.stopHeartbeat(agentId);
 
     // Stop bot (persistent agents only)
     if (agent.tgBot) await agent.tgBot.stop();
@@ -397,13 +675,14 @@ export class Bridge extends EventEmitter implements CtlHandler {
       clearInterval(agent.typingInterval);
       agent.typingInterval = null;
     }
+    agent.typingChatId = null;
 
     agent.pendingPermissions.clear();
     agent.ccProcess = null;
     agent.batcher = null;
 
     // Close control socket
-    const ctlSocketPath = join('/tmp/tgcc/ctl', `${agentId}.sock`);
+    const ctlSocketPath = join(this.config.global.ctlSocketDir, `${agentId}.sock`);
     this.ctlServer.close(ctlSocketPath);
 
     this.agents.delete(agentId);
@@ -445,6 +724,15 @@ export class Bridge extends EventEmitter implements CtlHandler {
       }
     }
 
+    // Voice messages: transcribe with whisper before forwarding
+    if (msg.type === 'voice') {
+      this.transcribeVoice(agentId, msg).catch(err => {
+        this.logger.error({ err, agentId }, 'Voice transcription failed — falling back to file path');
+        this.sendToCC(agentId, { text: msg.text || '', filePath: msg.filePath, fileName: msg.fileName }, { chatId: msg.chatId, spawnSource: 'telegram' });
+      });
+      return;
+    }
+
     // Ensure batcher exists (one per agent, not per user)
     if (!agent.batcher) {
       agent.batcher = new MessageBatcher(2000, (combined) => {
@@ -467,28 +755,34 @@ export class Bridge extends EventEmitter implements CtlHandler {
     });
   }
 
-  private sendToCC(
+  private async sendToCC(
     agentId: string,
     data: { text: string; imageBase64?: string; imageMediaType?: string; filePath?: string; fileName?: string },
     source?: { chatId?: number; spawnSource?: 'telegram' | 'supervisor' | 'cli' }
-  ): void {
+  ): Promise<void> {
     const agent = this.agents.get(agentId);
     if (!agent) return;
 
     // Construct CC message
-    let text = source?.spawnSource === 'supervisor'
-      ? `[Supervisor — BossBot]: ${data.text}`
-      : data.text;
+    let text = data.text;
 
     // Prepend IDE awareness context to the first message after an IDE session takeover
     if (agent.pendingIdeAwareness) {
       agent.pendingIdeAwareness = false;
       text = `[Context: This session was recently active in an IDE (VSCode). IDE messages are in your conversation history but may not appear in this Telegram chat.]\n\n${text}`;
     }
+
+    // Drain queued worker events into the supervisor's message
+    if (agentId === this.nativeSupervisorId && this.supervisorEventQueue.length > 0) {
+      const events = this.supervisorEventQueue.splice(0);
+      const preamble = `[Worker events since last session]\n${events.join('\n')}\n\n`;
+      text = preamble + text;
+    }
+
     let ccMsg;
     if (data.imageBase64) {
       ccMsg = createImageMessage(
-        text || 'What do you see in this image?',
+        text,
         data.imageBase64,
         data.imageMediaType as 'image/jpeg' | undefined,
       );
@@ -590,6 +884,13 @@ export class Bridge extends EventEmitter implements CtlHandler {
     // Log user message in event buffer
     agent.eventBuffer.push({ ts: Date.now(), type: 'user', text: data.text });
 
+    // If CC is mid-turn, flush any pending content first so the last block isn't lost,
+    // then seal the bubble so the next output starts fresh below this user message
+    if (proc.state === 'active' && agent.accumulator) {
+      await agent.accumulator.flushIfDirty();
+      agent.accumulator.reset();
+    }
+
     proc.sendMessage(ccMsg);
   }
 
@@ -638,8 +939,12 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
   private startTypingIndicator(agent: AgentInstance, chatId: number): void {
     // Don't create duplicate intervals
-    if (agent.typingInterval) return;
+    if (agent.typingInterval) {
+      this.logger.info({ agentId: agent.id, chatId }, 'startTypingIndicator: already running, skipping');
+      return;
+    }
     if (!agent.tgBot) return;
+    this.logger.info({ agentId: agent.id, chatId }, 'startTypingIndicator: starting');
     agent.typingChatId = chatId;
     // Send immediately, then repeat every 4s (TG typing badge lasts ~5s)
     agent.tgBot.sendTyping(chatId);
@@ -651,9 +956,12 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
   private stopTypingIndicator(agent: AgentInstance): void {
     if (agent.typingInterval) {
+      this.logger.info({ agentId: agent.id }, 'stopTypingIndicator: stopping');
       clearInterval(agent.typingInterval);
       agent.typingInterval = null;
       agent.typingChatId = null;
+    } else {
+      this.logger.info({ agentId: agent.id }, 'stopTypingIndicator: no interval (already stopped)');
     }
   }
 
@@ -688,6 +996,8 @@ export class Bridge extends EventEmitter implements CtlHandler {
       agentId, // single socket per agent
       this.config.global.socketDir,
       mcpServerPath,
+      agentId === this.nativeSupervisorId,
+      this.config.global.mcpConfigDir,
     );
 
     // Start MCP socket listener for this agent
@@ -874,43 +1184,9 @@ export class Bridge extends EventEmitter implements CtlHandler {
             this.highSignalDetector.handleAssistantToolUse(agentId, toolBlock.name, toolBlock.id, toolBlock.input);
 
             if (toolBlock.name === 'AskUserQuestion') {
-              const pending: PendingPermission = {
-                requestId: toolBlock.id,
-                userId: agentId,
-                toolName: 'AskUserQuestion',
-                input: toolBlock.input,
-                toolUseId: toolBlock.id,
-              };
-              agent.pendingPermissions.set(toolBlock.id, pending);
-              const questions = (toolBlock.input.questions ?? []) as AskQuestion[];
-              const { text, keyboard } = buildAskUi(toolBlock.id, questions, {});
-              const chatId = this.getAgentChatId(agent);
-              if (chatId && agent.tgBot) {
-                agent.tgBot.sendTextWithKeyboard(chatId, text, keyboard, 'HTML')
-                  .then(msgId => {
-                    pending.questionMsgId = msgId;
-                    pending.questionChatId = chatId;
-                    pending.questionAnswers = {};
-                  })
-                  .catch(err => this.logger.error({ err }, 'Failed to send AskUserQuestion'));
-              }
+              // AskUserQuestion is auto-rejected by CC in headless mode — skip keyboard UI entirely.
             } else if (toolBlock.name === 'ExitPlanMode') {
-              const pending: PendingPermission = {
-                requestId: toolBlock.id,
-                userId: agentId,
-                toolName: 'ExitPlanMode',
-                input: toolBlock.input,
-                toolUseId: toolBlock.id,
-              };
-              agent.pendingPermissions.set(toolBlock.id, pending);
-              const chatId = this.getAgentChatId(agent);
-              if (chatId && agent.tgBot) {
-                const keyboard = new InlineKeyboard()
-                  .text('✅ Approve', `plan_approve:${toolBlock.id}`)
-                  .text('❌ Reject', `plan_reject:${toolBlock.id}`);
-                agent.tgBot.sendTextWithKeyboard(chatId, '📋 <b>Plan ready for review.</b>', keyboard, 'HTML')
-                  .catch(err => this.logger.error({ err }, 'Failed to send ExitPlanMode prompt'));
-              }
+              // ExitPlanMode is auto-rejected by CC in headless mode — skip keyboard UI entirely.
             }
           }
         }
@@ -919,6 +1195,11 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
     proc.on('result', (event: ResultEvent) => {
       this.stopTypingIndicator(agent);
+      this.highSignalDetector.handleTurnEnd(agentId);
+      // Track cumulative session cost and check budget thresholds
+      if (event.total_cost_usd != null) {
+        this.highSignalDetector.handleCostUpdate(agentId, event.total_cost_usd);
+      }
       agent.eventBuffer.push({ ts: Date.now(), type: 'system', text: `Turn complete${event.is_error ? ' (error)' : ''}${event.total_cost_usd ? ` · $${event.total_cost_usd.toFixed(4)}` : ''}` });
       void this.handleResult(agentId, event);
 
@@ -1026,6 +1307,11 @@ export class Bridge extends EventEmitter implements CtlHandler {
         agent.tgBot.sendText(idleChatId, '<blockquote>⏸ Session ended. Use /sessions to resume it.</blockquote>', 'HTML', true)
           .catch(err => this.logger.error({ err }, 'Failed to send idle notification'));
       }
+      // Auto-destroy ephemeral agents when their CC session ends naturally
+      if (agent.ephemeral && agent.deferredSends.length === 0) {
+        this.logger.info({ agentId }, 'Ephemeral agent session idle — auto-destroying');
+        this.destroyEphemeralAgent(agentId);
+      }
     });
 
     proc.on('hang', () => {
@@ -1064,6 +1350,12 @@ export class Bridge extends EventEmitter implements CtlHandler {
     proc.on('exit', () => {
       agent.eventBuffer.push({ ts: Date.now(), type: 'system', text: 'Process exited' });
       this.highSignalDetector.cleanup(agentId);
+      this.eventDedup.cleanup(agentId);
+
+      // If the supervisor's session just ended, clear tracked workers
+      if (agentId === this.nativeSupervisorId) {
+        this.trackedWorkers.clear();
+      }
 
       // Forward to supervisor (unless suppressed by takeover)
       if (this.suppressExitForProcess.has(proc.sessionId ?? '')) {
@@ -1088,6 +1380,13 @@ export class Bridge extends EventEmitter implements CtlHandler {
         this.processRegistry.remove(entry.repo, entry.sessionId);
       }
       agent.ccProcess = null;
+      // Process exited — deliver any deferred messages (will spawn a new process)
+      this.drainDeferredSends(agentId);
+      // Auto-destroy ephemeral agents on process exit (if no deferred sends spawned a new process)
+      if (agent.ephemeral && agent.deferredSends.length === 0 && !agent.ccProcess) {
+        this.logger.info({ agentId }, 'Ephemeral agent process exited — auto-destroying');
+        this.destroyEphemeralAgent(agentId);
+      }
     });
 
     proc.on('error', (err: Error) => {
@@ -1148,6 +1447,10 @@ export class Bridge extends EventEmitter implements CtlHandler {
         chatId,
         sender: subAgentSender,
         onEditAttempt: (msgId, preview) => agent.accumulator?.logIfSealed(msgId, preview),
+        onAllDone: ({ count, elapsedMs }) => {
+          const elapsed = elapsedMs > 0 ? ` · ${Math.round(elapsedMs / 1000)}s` : '';
+          this.pushSupervisorEvent(agentId, `✅ Sub-agents done (${count}/${count})${elapsed}`, false);
+        },
       });
     }
 
@@ -1157,6 +1460,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
     if (event.type === 'message_start') {
       if (agent.accumulator?.sealed) {
         // Previous turn is done (result event sealed it) → new bubble
+        agent.awaitingAskCleanup = false;
         agent.accumulator.reset();
         if (agent.subAgentTracker && !agent.subAgentTracker.hasDispatchedAgents) {
           agent.subAgentTracker.reset();
@@ -1197,7 +1501,46 @@ export class Bridge extends EventEmitter implements CtlHandler {
         });
       }
       await acc.finalize();
+
+      // Clean up the fallback bubble CC generates after an AskUserQuestion rejection.
+      // The keyboard message is the real UI; the accumulator bubble is redundant noise.
+      if (agent.awaitingAskCleanup && agent.tgBot) {
+        agent.awaitingAskCleanup = false;
+        const bubbleId = acc.lastBubbleId;
+        const delChatId = this.getAgentChatId(agent);
+        if (bubbleId && delChatId) {
+          agent.tgBot.deleteMessage(delChatId, bubbleId)
+            .catch(err => this.logger.warn({ err, bubbleId }, 'Failed to delete AskUserQuestion fallback bubble'));
+        }
+      }
     }
+
+    // Clear stale ExitPlanMode keyboards — CC may have auto-resolved the tool_use before the
+    // user clicked. If the button fires after the turn ends, sendToolResult creates a duplicate.
+    for (const [id, pending] of agent.pendingPermissions) {
+      if (pending.toolName === 'ExitPlanMode') {
+        agent.pendingPermissions.delete(id);
+      }
+    }
+
+    // Route turn-complete to native supervisor queue
+    const cost = event.total_cost_usd ? ` · $${event.total_cost_usd.toFixed(4)}` : '';
+    this.pushSupervisorEvent(agentId, `${event.is_error ? '❌' : '✅'} Turn complete${cost}`, false);
+
+    // Wake supervisor if it sent a message this turn — enrich queue with sent/reply context
+    if (agent.supervisorWakeOnComplete) {
+      agent.supervisorWakeOnComplete = false;
+      const sentText = agent.lastSupervisorSentText;
+      agent.lastSupervisorSentText = null;
+      const replyText = typeof event.result === 'string' ? event.result.trim() : null;
+      const sentLine = sentText ? `\n  Sent: "${sentText.length > 80 ? sentText.slice(0, 80) + '…' : sentText}"` : '';
+      const replyLine = replyText ? `\n  Reply: "${replyText.length > 120 ? replyText.slice(0, 120) + '…' : replyText}"` : '';
+      this.pushSupervisorEvent(agentId, `💬 Turn complete${cost}${sentLine}${replyLine}`, false);
+      this.wakeSupervisorTg(agentId);
+    }
+
+    // Deliver any waitForIdle-deferred messages now that the turn is done
+    this.drainDeferredSends(agentId);
 
     // Handle errors (only send to TG if bot available)
     if (event.is_error && event.result && chatId && agent.tgBot) {
@@ -1304,6 +1647,17 @@ export class Bridge extends EventEmitter implements CtlHandler {
         if (agent.repo) newLines.push(`📂 <code>${escapeHtml(shortenRepoPath(agent.repo))}</code>`);
         if (agent.model) newLines.push(`🤖 ${escapeHtml(agent.model)}`);
         await agent.tgBot.sendText(cmd.chatId, `<blockquote>${newLines.join('\n')}</blockquote>`, 'HTML');
+        break;
+      }
+
+      case 'restart': {
+        // Restart the TGCC systemd service — this process will die and come back
+        await agent.tgBot.sendText(cmd.chatId, '<blockquote>🔄 Restarting TGCC service...</blockquote>', 'HTML');
+        setTimeout(() => {
+          nodeExec('systemctl --user restart tgcc', err => {
+            if (err) this.logger.error({ err }, '/restart: systemctl failed');
+          });
+        }, 500);
         break;
       }
 
@@ -1667,7 +2021,200 @@ export class Bridge extends EventEmitter implements CtlHandler {
         );
         break;
       }
+
+      case 'cron': {
+        await this.handleCronCommand(agentId, cmd);
+        break;
+      }
     }
+  }
+
+  // ── Cron command handling ──
+
+  private async handleCronCommand(agentId: string, cmd: SlashCommand): Promise<void> {
+    const agent = this.agents.get(agentId);
+    if (!agent?.tgBot) return;
+
+    const parts = (cmd.args ?? '').trim().split(/\s+/);
+    const sub = parts[0] || 'list';
+
+    switch (sub) {
+      case 'list': {
+        const jobs = this.scheduler.listJobs();
+        if (jobs.length === 0) {
+          await agent.tgBot.sendText(cmd.chatId, '<blockquote>No cron jobs configured.</blockquote>', 'HTML');
+          return;
+        }
+
+        const lines: string[] = ['<b>Cron Jobs</b>', ''];
+        for (const job of jobs) {
+          const sourceTag = job.source === 'static' ? '\uD83D\uDCCC' : '\uD83D\uDD04';
+          const nextStr = job.nextRun ? formatAge(job.nextRun) : 'N/A';
+          const oneShotTag = job.deleteAfterRun ? ' \uD83D\uDCA5one-shot' : '';
+          const label = job.name ? `${job.name} (<code>${escapeHtml(job.id)}</code>)` : `<code>${escapeHtml(job.id)}</code>`;
+          lines.push(`${sourceTag} ${label}`);
+          lines.push(`   \u23F0 <code>${escapeHtml(job.schedule)}</code>${job.tz ? ` (${escapeHtml(job.tz)})` : ''}`);
+          lines.push(`   \uD83D\uDCE8 ${escapeHtml(job.message.length > 60 ? job.message.slice(0, 60) + '\u2026' : job.message)}`);
+          lines.push(`   \u27A1\uFE0F ${escapeHtml(job.agentId)} / ${job.session}${oneShotTag}`);
+          lines.push(`   Next: ${nextStr}`);
+          if (job.runCount !== undefined) lines.push(`   Runs: ${job.runCount}`);
+          lines.push('');
+        }
+
+        await agent.tgBot.sendText(cmd.chatId, lines.join('\n'), 'HTML');
+        return;
+      }
+
+      case 'add': {
+        const result = this.parseCronAddArgs(agentId, parts.slice(1));
+        if ('error' in result) {
+          await agent.tgBot.sendText(cmd.chatId, `<blockquote>\u274C ${escapeHtml(result.error)}</blockquote>`, 'HTML');
+          return;
+        }
+
+        this.scheduler.addDynamicJob(
+          result.job,
+          (aid, text) => this.sendToCC(aid, { text }),
+          (job) => this.spawnCronIsolated(job),
+        );
+
+        const nextRun = this.scheduler.listJobs().find(j => j.id === result.job.id)?.nextRun;
+        const nextStr = nextRun ? nextRun.toISOString() : 'N/A';
+        const oneShotLabel = result.job.deleteAfterRun ? ' (one-shot)' : '';
+        await agent.tgBot.sendText(
+          cmd.chatId,
+          `<blockquote>\u2705 Cron job <code>${escapeHtml(result.job.id)}</code> added${oneShotLabel}\nSchedule: <code>${escapeHtml(result.job.schedule)}</code>\nNext run: ${escapeHtml(nextStr)}</blockquote>`,
+          'HTML',
+        );
+        return;
+      }
+
+      case 'run': {
+        const jobId = parts[1];
+        if (!jobId) {
+          await agent.tgBot.sendText(cmd.chatId, '<blockquote>Usage: /cron run &lt;id&gt;</blockquote>', 'HTML');
+          return;
+        }
+        const triggered = this.scheduler.triggerJob(
+          jobId,
+          (aid, text) => this.sendToCC(aid, { text }),
+          (job) => this.spawnCronIsolated(job),
+        );
+        if (triggered) {
+          await agent.tgBot.sendText(cmd.chatId, `<blockquote>\u2705 Cron job <code>${escapeHtml(jobId)}</code> triggered.</blockquote>`, 'HTML');
+        } else {
+          await agent.tgBot.sendText(cmd.chatId, `<blockquote>\u274C Cron job <code>${escapeHtml(jobId)}</code> not found.</blockquote>`, 'HTML');
+        }
+        return;
+      }
+
+      case 'remove': {
+        const jobId = parts[1];
+        if (!jobId) {
+          await agent.tgBot.sendText(cmd.chatId, '<blockquote>Usage: /cron remove &lt;id&gt;</blockquote>', 'HTML');
+          return;
+        }
+        const removed = this.scheduler.removeDynamicJob(jobId);
+        if (removed) {
+          await agent.tgBot.sendText(cmd.chatId, `<blockquote>\u2705 Cron job <code>${escapeHtml(jobId)}</code> removed.</blockquote>`, 'HTML');
+        } else {
+          await agent.tgBot.sendText(cmd.chatId, `<blockquote>\u274C Cron job <code>${escapeHtml(jobId)}</code> not found (only dynamic jobs can be removed).</blockquote>`, 'HTML');
+        }
+        return;
+      }
+
+      default: {
+        const helpText = [
+          '<b>Cron Commands</b>',
+          '',
+          '/cron list \u2014 Show all scheduled jobs',
+          '/cron add --every 4h --message "check infra" --session isolated',
+          '/cron add --at "20m" --message "follow up" --session main',
+          '/cron add --cron "0 9 * * 1-5" --tz Europe/Madrid --message "standup"',
+          '/cron run &lt;id&gt; \u2014 Trigger a job immediately',
+          '/cron remove &lt;id&gt; \u2014 Remove a dynamic job',
+        ].join('\n');
+        await agent.tgBot.sendText(cmd.chatId, helpText, 'HTML');
+        return;
+      }
+    }
+  }
+
+  /**
+   * Parse /cron add arguments into a CronJobConfig.
+   * Supports: --every, --at, --cron, --tz, --message, --session, --name, --announce
+   */
+  private parseCronAddArgs(
+    agentId: string,
+    tokens: string[],
+  ): { job: CronJobConfig } | { error: string } {
+    // Reassemble tokens into a single string for quoted-value parsing
+    const raw = tokens.join(' ');
+
+    // Parse named arguments with support for quoted values
+    const args: Record<string, string> = {};
+    const argPattern = /--(\w+)\s+(?:"([^"]*?)"|'([^']*?)'|(\S+))/g;
+    let match: RegExpExecArray | null;
+    while ((match = argPattern.exec(raw)) !== null) {
+      args[match[1]] = match[2] ?? match[3] ?? match[4];
+    }
+
+    const message = args['message'] || args['msg'];
+    if (!message) return { error: 'Missing --message argument.' };
+
+    const session = (args['session'] ?? 'main') as 'main' | 'isolated';
+    if (session !== 'main' && session !== 'isolated') {
+      return { error: 'Session must be "main" or "isolated".' };
+    }
+
+    const tz = args['tz'];
+    const name = args['name'];
+    const announce = args['announce'] !== 'false'; // default true
+
+    let schedule: string;
+    let deleteAfterRun = false;
+
+    if (args['at']) {
+      // One-shot: compute schedule from relative/absolute time
+      const result = computeOneShotSchedule(args['at']);
+      if (!result) return { error: `Cannot parse --at value: "${args['at']}". Use e.g. "20m", "4h", or an ISO datetime.` };
+      schedule = result.schedule;
+      deleteAfterRun = true;
+    } else if (args['every']) {
+      // Recurring interval
+      const cronExpr = parseEveryToCron(args['every']);
+      if (!cronExpr) return { error: `Cannot parse --every value: "${args['every']}". Use e.g. "30m", "4h".` };
+      schedule = cronExpr;
+    } else if (args['cron']) {
+      // Raw cron expression
+      schedule = args['cron'];
+    } else {
+      return { error: 'Must specify --every, --at, or --cron.' };
+    }
+
+    // Generate a unique ID
+    const id = name
+      ? name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
+      : `dyn-${Date.now().toString(36)}`;
+
+    // Check for ID collisions
+    if (this.scheduler.hasJob(id)) {
+      return { error: `Job ID "${id}" already exists. Use a different --name.` };
+    }
+
+    const job: CronJobConfig = {
+      id,
+      ...(name ? { name } : {}),
+      schedule,
+      ...(tz ? { tz } : {}),
+      agentId,
+      message,
+      session,
+      announce,
+      deleteAfterRun,
+    };
+
+    return { job };
   }
 
   // ── Callback query handling (inline buttons) ──
@@ -1839,7 +2386,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
         const questions = (pending.input?.questions ?? []) as AskQuestion[];
         const qi = parseInt(qIdxStr, 10);
         const oi = parseInt(optIdxStr, 10);
-        const selected = questions[qi]?.options?.[oi] ?? '';
+        const selected = getOptLabel(questions[qi]?.options?.[oi] ?? '');
         const answers = { ...(pending.questionAnswers ?? {}), [String(qi)]: [selected] };
 
         // Check if all questions are answered
@@ -1876,7 +2423,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
         const questions = (pending.input?.questions ?? []) as AskQuestion[];
         const qi = parseInt(qIdxStr, 10);
         const oi = parseInt(optIdxStr, 10);
-        const opt = questions[qi]?.options?.[oi] ?? '';
+        const opt = getOptLabel(questions[qi]?.options?.[oi] ?? '');
         const answers = { ...(pending.questionAnswers ?? {}) };
         const cur = answers[String(qi)] ?? [];
         answers[String(qi)] = cur.includes(opt) ? cur.filter(o => o !== opt) : [...cur, opt];
@@ -2031,16 +2578,23 @@ export class Bridge extends EventEmitter implements CtlHandler {
       // Supervisor-routed tools (don't need TG chatId)
       switch (request.tool) {
         case 'notify_parent': {
-          if (!this.supervisorWrite) {
+          // Route to external supervisor (OpenClaw plugin) if connected
+          if (this.supervisorWrite) {
+            this.sendToSupervisor({
+              type: 'event',
+              event: 'cc_message',
+              agentId: request.agentId,
+              text: request.params.message,
+              priority: request.params.priority || 'info',
+            });
+          }
+          // Route to native supervisor queue (always forward to TG — explicit worker communication)
+          const priority = String(request.params.priority ?? 'info');
+          const emoji = priority === 'blocker' ? '🚨' : priority === 'question' ? '❓' : 'ℹ️';
+          this.pushSupervisorEvent(request.agentId, `${emoji} ${request.params.message as string}`, true, true);
+          if (!this.supervisorWrite && !this.nativeSupervisorId) {
             return { id: request.id, success: false, error: 'No supervisor connected' };
           }
-          this.sendToSupervisor({
-            type: 'event',
-            event: 'cc_message',
-            agentId: request.agentId,
-            text: request.params.message,
-            priority: request.params.priority || 'info',
-          });
           return { id: request.id, success: true };
         }
 
@@ -2063,18 +2617,321 @@ export class Bridge extends EventEmitter implements CtlHandler {
         }
 
         case 'supervisor_notify': {
-          if (!this.supervisorWrite) {
+          const title = String(request.params.title ?? '');
+          const body = String(request.params.body ?? '');
+          const priority = String(request.params.priority ?? 'active');
+
+          // Route to external supervisor (OpenClaw plugin) if connected
+          if (this.supervisorWrite) {
+            this.sendToSupervisor({
+              type: 'event',
+              event: 'notification',
+              agentId: request.agentId,
+              title,
+              body,
+              priority,
+            });
+          }
+
+          // Route to native supervisor's TG chat + event queue
+          const notifyEmoji = priority === 'timeSensitive' ? '🚨' : priority === 'active' ? '🔔' : '📌';
+          const notifyText = title ? `${notifyEmoji} <b>${escapeHtml(title)}</b>\n${escapeHtml(body)}` : `${notifyEmoji} ${escapeHtml(body)}`;
+          if (this.nativeSupervisorId) {
+            // Push to event queue (without TG — we send a richer message below)
+            this.pushSupervisorEvent(request.agentId, `${notifyEmoji} ${title}: ${body}`, false);
+            // Send a nicely formatted TG message to the supervisor's chat
+            const supAgent = this.agents.get(this.nativeSupervisorId);
+            if (supAgent?.tgBot) {
+              const supChatId = this.getAgentChatId(supAgent);
+              if (supChatId) {
+                const silent = priority !== 'timeSensitive';
+                supAgent.tgBot.sendText(
+                  supChatId,
+                  `<blockquote>[${escapeHtml(request.agentId)}] ${notifyText}</blockquote>`,
+                  'HTML',
+                  silent,
+                ).catch(err => this.logger.warn({ err }, 'Failed to send supervisor_notify to supervisor TG'));
+              }
+            }
+          }
+
+          if (!this.supervisorWrite && !this.nativeSupervisorId) {
             return { id: request.id, success: false, error: 'No supervisor connected' };
           }
-          this.sendToSupervisor({
-            type: 'event',
-            event: 'notification',
-            agentId: request.agentId,
-            title: request.params.title,
-            body: request.params.body,
-            priority: request.params.priority || 'active',
-          });
           return { id: request.id, success: true };
+        }
+      }
+
+      // ── Native supervisor tools ──
+
+      if (request.tool === 'tgcc_status' || request.tool === 'tgcc_send' ||
+          request.tool === 'tgcc_kill' || request.tool === 'tgcc_log' || request.tool === 'tgcc_session' ||
+          request.tool === 'tgcc_spawn' || request.tool === 'tgcc_destroy' ||
+          request.tool === 'tgcc_track' || request.tool === 'tgcc_untrack') {
+        // Allow supervisor agent and internal callers (cron, system)
+        const isInternalCaller = request.userId === 'cron' || request.userId === 'system';
+        if (request.agentId !== this.nativeSupervisorId && !isInternalCaller) {
+          return { id: request.id, success: false, error: 'Only the supervisor agent may use tgcc_* tools' };
+        }
+
+        switch (request.tool) {
+          case 'tgcc_status': {
+            const targetId = request.params.agentId as string | undefined;
+            const result: Record<string, unknown> = {};
+            for (const [aid, a] of this.agents) {
+              if (aid === this.nativeSupervisorId) continue;
+              if (targetId && aid !== targetId) continue;
+              const proc = a.ccProcess;
+              const agentState = this.sessionStore.getAgent(aid);
+              const lastLog = a.eventBuffer.query({ limit: 1, offset: Math.max(0, a.eventBuffer.totalLines - 1) }).lines[0];
+              result[aid] = {
+                state: proc?.state ?? 'idle',
+                sessionId: proc?.sessionId ?? null,
+                ephemeral: a.ephemeral,
+                repo: a.repo,
+                model: a.model,
+                lastActivity: agentState.lastActivity,
+                lastActivitySummary: lastLog?.text ?? null,
+                sessionCost: this.highSignalDetector.getSessionCost(aid),
+                tracked: this.trackedWorkers.has(aid),
+              };
+            }
+            return { id: request.id, success: true, result };
+          }
+
+          case 'tgcc_send': {
+            const targetId = request.params.agentId as string;
+            const text = request.params.text as string;
+            const targetAgent = this.agents.get(targetId);
+            if (!targetAgent) return { id: request.id, success: false, error: `Unknown agent: ${targetId}` };
+            // Implicitly track this worker so its high-signal events are forwarded to supervisor TG
+            this.trackedWorkers.add(targetId);
+            if (request.params.newSession) targetAgent.forceNewSession = true;
+            if (request.params.sessionId) targetAgent.pendingSessionId = request.params.sessionId as string;
+            if (request.params.followUp && (!targetAgent.ccProcess || targetAgent.ccProcess.state === 'idle')) {
+              return { id: request.id, success: false, error: `Agent ${targetId} is not active (followUp=true)` };
+            }
+            // waitForIdle: queue if agent is mid-turn, deliver on next turn complete
+            if (request.params.waitForIdle && targetAgent.ccProcess) {
+              targetAgent.deferredSends.push({ text, fromAgentId: request.agentId });
+              targetAgent.supervisorWakeOnComplete = true;
+              return { id: request.id, success: true, result: { agentId: targetId, state: 'deferred' } };
+            }
+            this.sendSupervisorMessage(targetId, text, request.agentId);
+            return { id: request.id, success: true, result: { agentId: targetId, state: targetAgent.ccProcess?.state ?? 'spawning' } };
+          }
+
+          case 'tgcc_kill': {
+            const targetId = request.params.agentId as string;
+            this.killAgentProcess(targetId);
+            return { id: request.id, success: true };
+          }
+
+          case 'tgcc_log': {
+            const targetId = request.params.agentId as string;
+            const targetAgent = this.agents.get(targetId);
+            if (!targetAgent) return { id: request.id, success: false, error: `Unknown agent: ${targetId}` };
+            const result = targetAgent.eventBuffer.query({
+              limit: (request.params.limit as number) ?? 50,
+              since: request.params.since as number | undefined,
+              type: request.params.type as string | undefined,
+              grep: request.params.grep as string | undefined,
+            });
+            return { id: request.id, success: true, result };
+          }
+
+          case 'tgcc_session': {
+            const targetId = request.params.agentId as string;
+            const action = request.params.action as string;
+            const targetAgent = this.agents.get(targetId);
+            if (!targetAgent) return { id: request.id, success: false, error: `Unknown agent: ${targetId}` };
+
+            switch (action) {
+              case 'list': {
+                const sessions = discoverCCSessions(targetAgent.repo, (request.params.limit as number) ?? 10);
+                return { id: request.id, success: true, result: sessions };
+              }
+              case 'new': {
+                targetAgent.forceNewSession = true;
+                return { id: request.id, success: true };
+              }
+              case 'cancel': {
+                targetAgent.ccProcess?.cancel();
+                return { id: request.id, success: true };
+              }
+              case 'set_model': {
+                const model = request.params.model as string;
+                if (!model) return { id: request.id, success: false, error: 'model is required' };
+                const previousModel = targetAgent.model ?? '';
+                targetAgent.model = model;
+                this.sessionStore.setModel(targetId, model);
+                this.killAgentProcess(targetId);
+                return { id: request.id, success: true, result: { model, previousModel } };
+              }
+              case 'continue': {
+                const contSession = targetAgent.ccProcess?.sessionId ?? null;
+                this.killAgentProcess(targetId);
+                let sessionToResume = contSession;
+                if (!sessionToResume && targetAgent.repo) {
+                  const discovered = discoverCCSessions(targetAgent.repo, 1);
+                  if (discovered.length > 0) sessionToResume = discovered[0].id;
+                }
+                if (sessionToResume) {
+                  targetAgent.pendingSessionId = sessionToResume;
+                }
+                return { id: request.id, success: true, result: { sessionId: targetAgent.pendingSessionId ?? null } };
+              }
+              case 'resume': {
+                const sessionId = request.params.sessionId as string;
+                if (!sessionId) return { id: request.id, success: false, error: 'sessionId is required' };
+                this.killAgentProcess(targetId);
+                targetAgent.pendingSessionId = sessionId;
+                return { id: request.id, success: true, result: { pendingSessionId: targetAgent.pendingSessionId } };
+              }
+              case 'compact': {
+                if (!targetAgent.ccProcess || targetAgent.ccProcess.state !== 'active') {
+                  return { id: request.id, success: false, error: 'No active CC process to compact' };
+                }
+                const instructions = request.params.instructions as string | undefined;
+                const compactMsg = instructions ? `/compact ${instructions}` : '/compact';
+                targetAgent.ccProcess.sendMessage(createTextMessage(compactMsg));
+                return { id: request.id, success: true, result: { sent: true } };
+              }
+              case 'set_repo': {
+                const repo = request.params.repo as string;
+                if (!repo) return { id: request.id, success: false, error: 'repo is required' };
+                const previousRepo = targetAgent.repo ?? '';
+                const repoPath = resolveRepoPath(this.config.repos, repo);
+                targetAgent.repo = repoPath;
+                targetAgent.pendingSessionId = null;
+                this.sessionStore.setRepo(targetId, repoPath);
+                this.killAgentProcess(targetId);
+                return { id: request.id, success: true, result: { repo: repoPath, previousRepo } };
+              }
+              case 'set_permissions': {
+                const mode = request.params.mode as string;
+                if (!mode) return { id: request.id, success: false, error: 'mode is required' };
+                const validModes = ['dangerously-skip', 'acceptEdits', 'default', 'plan'];
+                if (!validModes.includes(mode)) {
+                  return { id: request.id, success: false, error: `Invalid mode: ${mode}. Valid: ${validModes.join(', ')}` };
+                }
+                const agentState = this.sessionStore.getAgent(targetId);
+                const previousMode = agentState.permissionMode || targetAgent.config.defaults.permissionMode;
+                this.sessionStore.setPermissionMode(targetId, mode);
+                this.killAgentProcess(targetId);
+                return { id: request.id, success: true, result: { mode, previousMode } };
+              }
+              default:
+                return { id: request.id, success: false, error: `Unknown session action: ${action}` };
+            }
+          }
+
+          case 'tgcc_spawn': {
+            const spawnAgentId = (request.params.agentId as string) || `eph-${randomUUID().slice(0, 8)}`;
+            const repo = request.params.repo as string;
+            if (!repo) return { id: request.id, success: false, error: 'Missing required param: repo' };
+
+            if (this.agents.has(spawnAgentId)) {
+              return { id: request.id, success: false, error: `Agent already exists: ${spawnAgentId}` };
+            }
+
+            // Map permission mode
+            let permMode: 'dangerously-skip' | 'acceptEdits' | 'default' | 'plan' = 'default';
+            const reqPerm = request.params.permissionMode as string | undefined;
+            if (reqPerm === 'bypassPermissions' || reqPerm === 'dangerously-skip') permMode = 'dangerously-skip';
+            else if (reqPerm === 'acceptEdits') permMode = 'acceptEdits';
+            else if (reqPerm === 'plan') permMode = 'plan';
+
+            const ephemeralConfig: AgentConfig = {
+              botToken: '',
+              allowedUsers: [],
+              defaults: {
+                model: (request.params.model as string) || 'sonnet',
+                repo,
+                maxTurns: 200,
+                idleTimeoutMs: 300_000,
+                hangTimeoutMs: 300_000,
+                permissionMode: permMode,
+              },
+            };
+
+            const instance: AgentInstance = {
+              id: spawnAgentId,
+              config: ephemeralConfig,
+              tgBot: null,
+              ephemeral: true,
+              repo,
+              model: ephemeralConfig.defaults.model,
+              ccProcess: null,
+              accumulator: null,
+              subAgentTracker: null,
+              batcher: null,
+              pendingPermissions: new Map(),
+              typingInterval: null,
+              typingChatId: null,
+              pendingSessionId: null,
+              forceNewSession: true,
+              pendingIdeAwareness: false,
+              destroyTimer: null,
+              eventBuffer: new EventBuffer(),
+              awaitingAskCleanup: false,
+              deferredSends: [],
+              supervisorWakeOnComplete: false,
+              lastSupervisorSentText: null,
+            };
+
+            // Auto-destroy timer
+            const timeoutMs = request.params.timeoutMs as number | undefined;
+            if (timeoutMs && timeoutMs > 0) {
+              instance.destroyTimer = setTimeout(() => {
+                this.logger.info({ agentId: spawnAgentId, timeoutMs }, 'Ephemeral agent timeout — auto-destroying');
+                this.destroyEphemeralAgent(spawnAgentId);
+              }, timeoutMs);
+            }
+
+            this.agents.set(spawnAgentId, instance);
+            this.logger.info({ agentId: spawnAgentId, repo, model: instance.model, ephemeral: true }, 'Ephemeral agent spawned via tgcc_spawn');
+
+            // Emit agent_created event (always sent, not subscription-gated)
+            this.sendToSupervisor({ type: 'event', event: 'agent_created', agentId: spawnAgentId, agentType: 'ephemeral', repo });
+
+            // If an initial message was provided, send it immediately
+            const message = request.params.message as string | undefined;
+            if (message) {
+              this.sendSupervisorMessage(spawnAgentId, message, request.agentId);
+            }
+
+            return { id: request.id, success: true, result: { agentId: spawnAgentId, state: message ? 'spawning' : 'idle', repo, model: instance.model } };
+          }
+
+          case 'tgcc_destroy': {
+            const targetId = request.params.agentId as string;
+            if (!targetId) return { id: request.id, success: false, error: 'Missing agentId' };
+
+            const targetAgent = this.agents.get(targetId);
+            if (!targetAgent) return { id: request.id, success: false, error: `Unknown agent: ${targetId}` };
+            if (!targetAgent.ephemeral) return { id: request.id, success: false, error: `Cannot destroy persistent agent: ${targetId}` };
+
+            this.destroyEphemeralAgent(targetId);
+            return { id: request.id, success: true, result: { destroyed: true, agentId: targetId } };
+          }
+
+          case 'tgcc_track': {
+            const targetId = request.params.agentId as string;
+            if (!targetId) return { id: request.id, success: false, error: 'agentId is required' };
+            if (!this.agents.has(targetId)) return { id: request.id, success: false, error: `Unknown agent: ${targetId}` };
+            this.trackedWorkers.add(targetId);
+            this.logger.info({ targetId }, 'Supervisor tracking worker');
+            return { id: request.id, success: true, result: { agentId: targetId, tracked: true } };
+          }
+
+          case 'tgcc_untrack': {
+            const targetId = request.params.agentId as string;
+            if (!targetId) return { id: request.id, success: false, error: 'agentId is required' };
+            const wasTracked = this.trackedWorkers.delete(targetId);
+            this.logger.info({ targetId, wasTracked }, 'Supervisor untracking worker');
+            return { id: request.id, success: true, result: { agentId: targetId, tracked: false, wasTracked } };
+          }
         }
       }
 
@@ -2221,6 +3078,10 @@ export class Bridge extends EventEmitter implements CtlHandler {
           pendingIdeAwareness: false,
           destroyTimer: null,
           eventBuffer: new EventBuffer(),
+          awaitingAskCleanup: false,
+          deferredSends: [],
+          supervisorWakeOnComplete: false,
+      lastSupervisorSentText: null,
         };
 
         // Auto-destroy timer
@@ -2620,8 +3481,10 @@ export class Bridge extends EventEmitter implements CtlHandler {
       await this.stopAgent(agentId);
     }
 
+    this.scheduler.stopAll();
     this.processRegistry.clear();
     this.highSignalDetector.destroy();
+    this.eventDedup.destroy();
     this.mcpServer.closeAll();
     this.ctlServer.closeAll();
     this.removeAllListeners();
@@ -2630,6 +3493,11 @@ export class Bridge extends EventEmitter implements CtlHandler {
 }
 
 // ── AskUserQuestion helpers ──
+
+/** Extract display label from an option (CC sends objects; plain strings also accepted). */
+function getOptLabel(opt: AskOption | string): string {
+  return typeof opt === 'string' ? opt : opt.label;
+}
 
 /** Build Telegram message text + inline keyboard for AskUserQuestion. */
 function buildAskUi(
@@ -2648,9 +3516,9 @@ function buildAskUi(
 
     const selected = answers[String(qi)] ?? [];
     for (let oi = 0; oi < (q.options ?? []).length; oi++) {
-      const opt = q.options![oi];
-      const isSelected = selected.includes(opt);
-      const label = multi ? (isSelected ? `✓ ${opt}` : `   ${opt}`) : opt;
+      const optLabel = getOptLabel(q.options![oi]);
+      const isSelected = selected.includes(optLabel);
+      const label = multi ? (isSelected ? `✓ ${optLabel}` : `   ${optLabel}`) : optLabel;
       const action = multi ? 'ask_toggle' : 'ask_pick';
       kb.text(label, `${action}:${requestId}:${qi}:${oi}`).row();
     }
@@ -2685,8 +3553,19 @@ function submitAskAnswer(
 ): void {
   const builtAnswers = buildAskAnswers(questions, answers);
   if (pending.toolUseId) {
-    // Regular tool_use path — inject tool_result
-    proc.sendToolResult(pending.toolUseId, JSON.stringify({ answers: builtAnswers }));
+    // CC immediately rejects AskUserQuestion in headless mode (requiresUserInteraction=true bypasses
+    // all permission modes and returns an error before the bridge can respond). sendToolResult would
+    // be ignored since CC is no longer waiting. Inject the answer as a new user message turn instead.
+    const answerParts = questions
+      .map((q, i) => {
+        const ans = builtAnswers[String(i)];
+        return ans ? `"${q.question}" → "${ans}"` : null;
+      })
+      .filter((p): p is string => p !== null);
+    const text = answerParts.length > 0
+      ? `User has answered your questions: ${answerParts.join(', ')}. You can now continue with the user's answers in mind.`
+      : 'User declined to answer.';
+    proc.sendMessage(createTextMessage(text));
   } else {
     // can_use_tool permission path — send control_response
     proc.respondToPermission(pending.requestId, true, { questions, answers: builtAnswers });
@@ -2726,6 +3605,17 @@ function formatAge(date: Date): string {
   if (hours < 24) return `${hours}h ago`;
   const days = Math.floor(hours / 24);
   return `${days}d ago`;
+}
+
+function formatTimeUntil(date: Date): string {
+  const diffMs = date.getTime() - Date.now();
+  if (diffMs <= 0) return 'now';
+  const mins = Math.floor(diffMs / 60000);
+  if (mins < 60) return `in ${mins}m`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `in ${hours}h ${mins % 60}m`;
+  const days = Math.floor(hours / 24);
+  return `in ${days}d ${hours % 24}h`;
 }
 
 /** Environment-aware MCP server path resolution */

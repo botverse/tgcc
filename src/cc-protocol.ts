@@ -40,10 +40,9 @@ export function createImageMessage(
   imageBase64: string,
   mediaType: ImageContent['source']['media_type'] = 'image/jpeg'
 ): UserMessage {
-  const content: ContentBlock[] = [
-    { type: 'text', text },
-    { type: 'image', source: { type: 'base64', media_type: mediaType, data: imageBase64 } },
-  ];
+  const content: ContentBlock[] = [];
+  if (text) content.push({ type: 'text', text });
+  content.push({ type: 'image', source: { type: 'base64', media_type: mediaType, data: imageBase64 } });
   return {
     type: 'user',
     message: { role: 'user', content },
@@ -52,7 +51,8 @@ export function createImageMessage(
 }
 
 export function createDocumentMessage(text: string, filePath: string, fileName: string): UserMessage {
-  const content = `${text}\n\nUser sent a document: ${filePath} (${fileName}). Read and process it.`;
+  const fileLine = `[Attached file: ${filePath} (${fileName})]`;
+  const content = text ? `${text}\n\n${fileLine}` : fileLine;
   return createTextMessage(content);
 }
 

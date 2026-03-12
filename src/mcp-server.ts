@@ -10,6 +10,7 @@ import { McpBridgeClient, type McpToolRequest } from './mcp-bridge.js';
 const AGENT_ID = process.env.TGCC_AGENT_ID ?? 'unknown';
 const USER_ID = process.env.TGCC_USER_ID ?? 'unknown';
 const SOCKET_PATH = process.env.TGCC_SOCKET ?? '/tmp/tgcc/sockets/default.sock';
+const IS_SUPERVISOR = process.env.TGCC_IS_SUPERVISOR === '1';
 
 async function main(): Promise<void> {
   const client = new McpBridgeClient(SOCKET_PATH);
@@ -224,6 +225,222 @@ async function main(): Promise<void> {
       }
     }
   );
+
+  // ── Supervisor-only tools ──
+
+  if (IS_SUPERVISOR) {
+
+    server.tool(
+      'tgcc_status',
+      'Get status of worker agents (state, context%, last activity). Omit agentId to get all workers.',
+      {
+        agentId: z.string().optional().describe('Specific worker agent ID, or omit for all'),
+      },
+      async ({ agentId }) => {
+        const request: McpToolRequest = {
+          id: uuidv4(), tool: 'tgcc_status', agentId: AGENT_ID, userId: USER_ID,
+          params: { agentId },
+        };
+        try {
+          const response = await client.sendRequest(request);
+          if (response.success) return { content: [{ type: 'text' as const, text: JSON.stringify(response.result, null, 2) }] };
+          return { content: [{ type: 'text' as const, text: `Failed: ${response.error}` }], isError: true };
+        } catch (err) {
+          return { content: [{ type: 'text' as const, text: `Bridge unavailable: ${err instanceof Error ? err.message : 'unknown error'}` }], isError: true };
+        }
+      }
+    );
+
+    server.tool(
+      'tgcc_send',
+      'Send a message or task to a worker agent. Spawns CC if not running. Always wakes the supervisor when the worker\'s turn completes.',
+      {
+        agentId: z.string().describe('Target worker agent ID'),
+        text: z.string().describe('Message or task to send'),
+        newSession: z.boolean().optional().describe('Clear session before sending'),
+        followUp: z.boolean().optional().describe('Only send if CC is already active (no spawn)'),
+        waitForIdle: z.boolean().optional().describe('Queue message and deliver after the agent finishes its current turn. If already idle, sends immediately.'),
+        sessionId: z.string().optional().describe('Session ID to target'),
+      },
+      async ({ agentId, text, newSession, followUp, waitForIdle, sessionId }) => {
+        const request: McpToolRequest = {
+          id: uuidv4(), tool: 'tgcc_send', agentId: AGENT_ID, userId: USER_ID,
+          params: { agentId, text, newSession, followUp, waitForIdle, sessionId },
+        };
+        try {
+          const response = await client.sendRequest(request, 10000);
+          if (response.success) return { content: [{ type: 'text' as const, text: JSON.stringify(response.result) }] };
+          return { content: [{ type: 'text' as const, text: `Failed: ${response.error}` }], isError: true };
+        } catch (err) {
+          return { content: [{ type: 'text' as const, text: `Bridge unavailable: ${err instanceof Error ? err.message : 'unknown error'}` }], isError: true };
+        }
+      }
+    );
+
+    server.tool(
+      'tgcc_kill',
+      'Kill a worker agent\'s CC process. The agent registration is preserved.',
+      {
+        agentId: z.string().describe('Worker agent ID to kill'),
+      },
+      async ({ agentId }) => {
+        const request: McpToolRequest = {
+          id: uuidv4(), tool: 'tgcc_kill', agentId: AGENT_ID, userId: USER_ID,
+          params: { agentId },
+        };
+        try {
+          const response = await client.sendRequest(request);
+          if (response.success) return { content: [{ type: 'text' as const, text: `Killed ${agentId}` }] };
+          return { content: [{ type: 'text' as const, text: `Failed: ${response.error}` }], isError: true };
+        } catch (err) {
+          return { content: [{ type: 'text' as const, text: `Bridge unavailable: ${err instanceof Error ? err.message : 'unknown error'}` }], isError: true };
+        }
+      }
+    );
+
+    server.tool(
+      'tgcc_log',
+      'Read the event log for a worker agent (tool calls, errors, text output, system events).',
+      {
+        agentId: z.string().describe('Worker agent ID'),
+        limit: z.number().optional().describe('Max entries to return (default 50)'),
+        since: z.number().optional().describe('Only entries from last N milliseconds'),
+        type: z.enum(['text', 'tool', 'system', 'error', 'user']).optional().describe('Filter by entry type'),
+        grep: z.string().optional().describe('Filter by regex pattern'),
+      },
+      async ({ agentId, limit, since, type, grep }) => {
+        const request: McpToolRequest = {
+          id: uuidv4(), tool: 'tgcc_log', agentId: AGENT_ID, userId: USER_ID,
+          params: { agentId, limit, since, type, grep },
+        };
+        try {
+          const response = await client.sendRequest(request);
+          if (response.success) return { content: [{ type: 'text' as const, text: JSON.stringify(response.result, null, 2) }] };
+          return { content: [{ type: 'text' as const, text: `Failed: ${response.error}` }], isError: true };
+        } catch (err) {
+          return { content: [{ type: 'text' as const, text: `Bridge unavailable: ${err instanceof Error ? err.message : 'unknown error'}` }], isError: true };
+        }
+      }
+    );
+
+    server.tool(
+      'tgcc_session',
+      'Manage a worker agent\'s session lifecycle without sending a message.',
+      {
+        agentId: z.string().describe('Worker agent ID'),
+        action: z.enum(['list', 'new', 'cancel', 'set_model', 'continue', 'resume', 'compact', 'set_repo', 'set_permissions']).describe('Action to perform'),
+        sessionId: z.string().optional().describe('For resume action: session ID'),
+        model: z.string().optional().describe('For set_model action: model name'),
+        limit: z.number().optional().describe('For list action: max sessions to return'),
+        repo: z.string().optional().describe('For set_repo action: repository path or alias'),
+        mode: z.string().optional().describe('For set_permissions action: permission mode (dangerously-skip, acceptEdits, default, plan)'),
+        instructions: z.string().optional().describe('For compact action: optional compaction instructions'),
+      },
+      async ({ agentId, action, sessionId, model, limit, repo, mode, instructions }) => {
+        const request: McpToolRequest = {
+          id: uuidv4(), tool: 'tgcc_session', agentId: AGENT_ID, userId: USER_ID,
+          params: { agentId, action, sessionId, model, limit, repo, mode, instructions },
+        };
+        try {
+          const response = await client.sendRequest(request);
+          if (response.success) return { content: [{ type: 'text' as const, text: JSON.stringify(response.result, null, 2) }] };
+          return { content: [{ type: 'text' as const, text: `Failed: ${response.error}` }], isError: true };
+        } catch (err) {
+          return { content: [{ type: 'text' as const, text: `Bridge unavailable: ${err instanceof Error ? err.message : 'unknown error'}` }], isError: true };
+        }
+      }
+    );
+
+    server.tool(
+      'tgcc_spawn',
+      'Spawn a temporary (ephemeral) agent with a CC process. The agent auto-destroys on session end or explicit tgcc_destroy. No Telegram bot — supervisor only.',
+      {
+        agentId: z.string().optional().describe('Agent ID for the ephemeral agent. Auto-generated if omitted.'),
+        repo: z.string().describe('Absolute path to the repository for the CC process'),
+        model: z.string().optional().describe('Model to use (default: sonnet)'),
+        message: z.string().optional().describe('Initial prompt to send immediately after spawning'),
+        timeoutMs: z.number().optional().describe('Auto-destroy after this many milliseconds'),
+        permissionMode: z.string().optional().describe('Permission mode: dangerously-skip, acceptEdits, default, plan'),
+      },
+      async ({ agentId, repo, model, message, timeoutMs, permissionMode }) => {
+        const request: McpToolRequest = {
+          id: uuidv4(), tool: 'tgcc_spawn', agentId: AGENT_ID, userId: USER_ID,
+          params: { agentId, repo, model, message, timeoutMs, permissionMode },
+        };
+        try {
+          const response = await client.sendRequest(request, 15000);
+          if (response.success) return { content: [{ type: 'text' as const, text: JSON.stringify(response.result, null, 2) }] };
+          return { content: [{ type: 'text' as const, text: `Failed: ${response.error}` }], isError: true };
+        } catch (err) {
+          return { content: [{ type: 'text' as const, text: `Bridge unavailable: ${err instanceof Error ? err.message : 'unknown error'}` }], isError: true };
+        }
+      }
+    );
+
+    server.tool(
+      'tgcc_destroy',
+      'Destroy an ephemeral agent. Kills its CC process if running and removes it from the registry. Only works on ephemeral agents.',
+      {
+        agentId: z.string().describe('Ephemeral agent ID to destroy'),
+      },
+      async ({ agentId }) => {
+        const request: McpToolRequest = {
+          id: uuidv4(), tool: 'tgcc_destroy', agentId: AGENT_ID, userId: USER_ID,
+          params: { agentId },
+        };
+        try {
+          const response = await client.sendRequest(request);
+          if (response.success) return { content: [{ type: 'text' as const, text: JSON.stringify(response.result, null, 2) }] };
+          return { content: [{ type: 'text' as const, text: `Failed: ${response.error}` }], isError: true };
+        } catch (err) {
+          return { content: [{ type: 'text' as const, text: `Bridge unavailable: ${err instanceof Error ? err.message : 'unknown error'}` }], isError: true };
+        }
+      }
+    );
+
+    server.tool(
+      'tgcc_track',
+      'Start receiving high-signal events from a worker agent in real time (build results, failures, commits, task progress). Tracking persists until the supervisor session ends or explicit tgcc_untrack. Note: tgcc_send automatically tracks the target worker.',
+      {
+        agentId: z.string().describe('Worker agent ID to track'),
+      },
+      async ({ agentId }) => {
+        const request: McpToolRequest = {
+          id: uuidv4(), tool: 'tgcc_track', agentId: AGENT_ID, userId: USER_ID,
+          params: { agentId },
+        };
+        try {
+          const response = await client.sendRequest(request);
+          if (response.success) return { content: [{ type: 'text' as const, text: JSON.stringify(response.result) }] };
+          return { content: [{ type: 'text' as const, text: `Failed: ${response.error}` }], isError: true };
+        } catch (err) {
+          return { content: [{ type: 'text' as const, text: `Bridge unavailable: ${err instanceof Error ? err.message : 'unknown error'}` }], isError: true };
+        }
+      }
+    );
+
+    server.tool(
+      'tgcc_untrack',
+      'Stop receiving real-time high-signal events from a worker agent. Events are still queued and delivered when the supervisor session starts.',
+      {
+        agentId: z.string().describe('Worker agent ID to stop tracking'),
+      },
+      async ({ agentId }) => {
+        const request: McpToolRequest = {
+          id: uuidv4(), tool: 'tgcc_untrack', agentId: AGENT_ID, userId: USER_ID,
+          params: { agentId },
+        };
+        try {
+          const response = await client.sendRequest(request);
+          if (response.success) return { content: [{ type: 'text' as const, text: JSON.stringify(response.result) }] };
+          return { content: [{ type: 'text' as const, text: `Failed: ${response.error}` }], isError: true };
+        } catch (err) {
+          return { content: [{ type: 'text' as const, text: `Bridge unavailable: ${err instanceof Error ? err.message : 'unknown error'}` }], isError: true };
+        }
+      }
+    );
+
+  }
 
   // Start the MCP server on stdio
   const transport = new StdioServerTransport();

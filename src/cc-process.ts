@@ -31,6 +31,8 @@ export interface CCUserConfig {
   idleTimeoutMs: number;
   hangTimeoutMs: number;
   permissionMode: 'default' | 'plan' | 'acceptEdits' | 'dangerously-skip';
+  /** Extra CLI arguments appended verbatim to the CC command (space-separated, supports quoting). */
+  ccExtraArgs?: string;
 }
 
 // ── Noop logger for library use when no pino logger is provided ──
@@ -79,6 +81,8 @@ export function generateMcpConfig(
   userId: string,
   socketDir: string,
   mcpServerPath: string,
+  isSupervisor = false,
+  mcpConfigDir = '/tmp/tgcc',
 ): string {
   const config = {
     mcpServers: {
@@ -91,16 +95,34 @@ export function generateMcpConfig(
           TGCC_AGENT_ID: agentId,
           TGCC_USER_ID: userId,
           TGCC_SOCKET: join(socketDir, `${agentId}-${userId}.sock`),
+          ...(isSupervisor ? { TGCC_IS_SUPERVISOR: '1' } : {}),
         },
       },
     },
   };
 
-  const dir = '/tmp/tgcc';
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  const configPath = join(dir, `mcp-${agentId}-${userId}.json`);
+  if (!existsSync(mcpConfigDir)) mkdirSync(mcpConfigDir, { recursive: true });
+  const configPath = join(mcpConfigDir, `mcp-${agentId}-${userId}.json`);
   writeFileSync(configPath, JSON.stringify(config));
   return configPath;
+}
+
+// ── Shell arg parser ──
+
+/** Split a shell-style argument string into an array of tokens, respecting single and double quoting. */
+function parseShellArgs(s: string): string[] {
+  const args: string[] = [];
+  let cur = '';
+  let inSingle = false;
+  let inDouble = false;
+  for (const ch of s) {
+    if (ch === "'" && !inDouble) { inSingle = !inSingle; }
+    else if (ch === '"' && !inSingle) { inDouble = !inDouble; }
+    else if (ch === ' ' && !inSingle && !inDouble) { if (cur) { args.push(cur); cur = ''; } }
+    else { cur += ch; }
+  }
+  if (cur) args.push(cur);
+  return args;
 }
 
 // ── CC Process ──
@@ -230,6 +252,7 @@ export class CCProcess extends EventEmitter {
       '--max-turns', String(cfg.maxTurns),
     ];
 
+
     switch (cfg.permissionMode) {
       case 'dangerously-skip':
         args.push('--dangerously-skip-permissions');
@@ -255,6 +278,10 @@ export class CCProcess extends EventEmitter {
 
     if (this.options.mcpConfigPath) {
       args.push('--mcp-config', this.options.mcpConfigPath);
+    }
+
+    if (cfg.ccExtraArgs) {
+      args.push(...parseShellArgs(cfg.ccExtraArgs));
     }
 
     return args;

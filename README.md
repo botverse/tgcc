@@ -40,6 +40,7 @@ TGCC bridges the [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-cod
 - **MCP tools** — CC can send files, images, and voice back via built-in MCP server
 - **Markdown → Telegram HTML** — code blocks, bold, italic, links, tables, all rendered properly
 - **Usage stats** — per-turn token counts and cost
+- **Scheduling** — cron jobs and heartbeats: run prompts on a schedule, one-shot timers, dynamic job management from Telegram
 - **Supervisor protocol** — external orchestrators (e.g. OpenClaw) can send messages, subscribe to events, and share the same CC process via Unix socket
 
 ## Architecture
@@ -100,13 +101,28 @@ TGCC detects high-signal events from CC processes and forwards them to subscribe
 
 Each agent's events are stored in a ring buffer, queryable via `get_log` with offset/limit/grep/since/type filters.
 
-### MCP Tools for CC → Supervisor
+### MCP Tools (CC → Telegram / Supervisor)
 
-CC processes can communicate back to the orchestrator via built-in MCP tools:
+Every CC process gets these built-in MCP tools:
 
-- **`notify_parent`** — send a message to the parent (questions, blockers, progress)
+- **`send_file`** — send a file to the user on Telegram
+- **`send_image`** — send an image with preview to Telegram
+- **`send_voice`** — send a voice message to Telegram
+- **`notify_parent`** — send a message to the parent/orchestrator (questions, blockers, progress)
 - **`supervisor_exec`** — request command execution on the host
-- **`supervisor_notify`** — send a notification to any agent
+- **`supervisor_notify`** — send a notification through the supervisor
+
+The supervisor agent's CC process also gets these additional tools:
+
+- **`tgcc_status`** — get status of worker agents (state, context%, last activity)
+- **`tgcc_send`** — send a message/task to a worker agent (spawns CC if needed)
+- **`tgcc_kill`** — kill a worker agent's CC process
+- **`tgcc_log`** — read the event log for a worker agent
+- **`tgcc_session`** — manage a worker agent's session lifecycle (actions: `list`, `new`, `cancel`, `set_model`, `continue`, `resume`, `compact`, `set_repo`, `set_permissions`)
+- **`tgcc_spawn`** — spawn an ephemeral agent with a CC process (no Telegram bot)
+- **`tgcc_destroy`** — destroy an ephemeral agent
+- **`tgcc_track`** — start receiving high-signal events from a worker in real time
+- **`tgcc_untrack`** — stop receiving real-time events from a worker
 
 See [`docs/SPEC-SUPERVISOR-PROTOCOL.md`](docs/SPEC-SUPERVISOR-PROTOCOL.md) for the full protocol spec.
 See [`docs/SPEC-SUBAGENT-OBSERVABILITY.md`](docs/SPEC-SUBAGENT-OBSERVABILITY.md) for the observability spec.
@@ -218,17 +234,56 @@ tgcc permissions set mybot dangerously-skip
 
 ## Telegram Commands
 
+**Session**
+
 | Command | Description |
 |---------|-------------|
-| `/start` | Welcome message |
+| `/start` | Welcome message & register commands |
 | `/new` | Start a fresh session |
+| `/continue` | Respawn process, keep session |
 | `/sessions` | List recent sessions with resume buttons |
 | `/resume <id>` | Resume a session by ID |
-| `/repo` | Switch repo with inline buttons |
-| `/model <name>` | Switch model |
-| `/permissions` | Set permission mode |
+| `/session` | Current session info |
+
+**Info**
+
+| Command | Description |
+|---------|-------------|
 | `/status` | Process state, model, repo, cost |
+| `/cost` | Show session cost |
+| `/catchup` | Summarize external CC activity |
+| `/ping` | Liveness check |
+
+**Control**
+
+| Command | Description |
+|---------|-------------|
+| `/restart` | Restart the TGCC systemd service |
 | `/cancel` | Abort current CC turn |
+| `/compact [instructions]` | Compact conversation context |
+| `/model <name>` | Switch model |
+| `/permissions [mode]` | Set permission mode (buttons or inline) |
+| `/repo` | Switch repo with inline buttons |
+| `/repo help` | Repo management commands |
+| `/repo add <name> <path>` | Register a repo |
+| `/repo remove <name>` | Unregister a repo |
+| `/repo assign <name>` | Set as agent default |
+| `/repo clear` | Clear agent default |
+
+**Cron**
+
+| Command | Description |
+|---------|-------------|
+| `/cron list` | Show all scheduled jobs |
+| `/cron add` | Add a new cron job (see flags below) |
+| `/cron run <id>` | Trigger a job immediately |
+| `/cron remove <id>` | Remove a dynamic job |
+
+`/cron add` flags: `--every <interval>`, `--at <time>`, `--cron <expr>`, `--tz <zone>`, `--message <text>`, `--session main|isolated`, `--name <label>`, `--announce`
+
+| | |
+|---------|-------------|
+| `/help` | Full command reference |
 
 ## Configuration
 
@@ -237,8 +292,13 @@ Config lives at `~/.tgcc/config.json` (created by `tgcc init`).
 ```jsonc
 {
   "global": {
-    "ccBinaryPath": "claude",
-    "logLevel": "info"
+    "ccBinaryPath": "claude",       // path to claude CLI binary
+    "mediaDir": "/tmp/tgcc/media",  // temp dir for media files
+    "socketDir": "/tmp/tgcc/sockets", // MCP bridge sockets
+    "ctlSocketDir": "/tmp/tgcc/ctl",  // control/supervisor socket
+    "mcpConfigDir": "/tmp/tgcc",      // generated MCP config files
+    "logLevel": "info",
+    "stateFile": "~/.tgcc/state.json" // persisted session state
   },
   "repos": {
     "myproject": "/home/user/myproject"
@@ -248,11 +308,42 @@ Config lives at `~/.tgcc/config.json` (created by `tgcc init`).
       "botToken": "123456:ABC-DEF...",
       "allowedUsers": ["your-telegram-id"],
       "defaults": {
-        "repo": "myproject",
+        "repo": "myproject",                      // key from repos map, or absolute path
         "model": "claude-sonnet-4-20250514",
-        "permissionMode": "bypassPermissions"
+        "permissionMode": "dangerously-skip",     // see modes below
+        "maxTurns": 50,                           // max turns per session
+        "idleTimeoutMs": 7200000,                 // kill idle process after 2h
+        "hangTimeoutMs": 300000,                  // kill hung process after 5m
+        "ccExtraArgs": "--verbose"                // extra CLI args for CC (optional)
+      },
+      "users": {                                  // per-user overrides (optional)
+        "123456789": { "model": "claude-opus-4-20250514" }
+      },
+      "heartbeat": {                              // periodic prompt (optional)
+        "intervalMins": 30,                       // 5, 10, 15, 30, or 60
+        "prompt": "Check on running tasks",
+        "onlyWhenIdle": true,                     // skip if agent is mid-turn
+        "tz": "America/New_York"                  // IANA timezone
       }
     }
+  },
+  "supervisor": "mybot",                          // agent ID for native supervisor (null = disabled)
+  "cron": {                                       // scheduled jobs (optional)
+    "jobs": [
+      {
+        "id": "daily-standup",
+        "name": "Standup",
+        "schedule": "0 9 * * 1-5",               // standard cron expression
+        "tz": "Europe/Madrid",
+        "agentId": "mybot",
+        "message": "Run the daily standup",
+        "session": "main",                        // "main" or "isolated"
+        "announce": true,                         // post TG message on fire
+        "model": "claude-sonnet-4-20250514",      // model override (isolated only)
+        "timeoutMs": 300000,                      // timeout (isolated only)
+        "deleteAfterRun": false                   // one-shot job
+      }
+    ]
   }
 }
 ```
@@ -261,7 +352,7 @@ Config lives at `~/.tgcc/config.json` (created by `tgcc init`).
 
 | Mode | Description |
 |------|-------------|
-| `dangerouslySkipPermissions` | Skip all prompts |
+| `dangerously-skip` | Skip all prompts |
 | `acceptEdits` | Auto-accept edits, prompt for commands |
 | `default` | Full permission flow via inline buttons |
 | `plan` | Plan-only, no tool execution |
