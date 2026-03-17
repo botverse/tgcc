@@ -98,6 +98,7 @@ interface AgentInstance {
   deferredSends: Array<{ text: string; fromAgentId: string }>; // queued by waitForIdle sends
   supervisorWakeOnComplete: boolean; // ping supervisor TG when next turn ends
   lastSupervisorSentText: string | null; // last text sent by supervisor → include in wake context
+  muteOutput: boolean; // suppress TG rendering for wake-triggered supervisor turns
 }
 
 interface SupervisorPendingRequest {
@@ -286,19 +287,20 @@ export class Bridge extends EventEmitter implements CtlHandler {
     });
   }
 
-  /** Send a silent TG wake ping to the supervisor without adding noise to the event queue.
-   *  Used when a worker turn completes after a supervisor-initiated send. */
-  private wakeSupervisorTg(sourceAgentId: string): void {
+  /** Wake the supervisor CC process directly by feeding queued worker events via sendToCC.
+   *  No Telegram round-trip — just pipes the event summary straight into the supervisor's stdin. */
+  private wakeSupervisor(sourceAgentId: string): void {
     if (!this.nativeSupervisorId || sourceAgentId === this.nativeSupervisorId) return;
     const supAgent = this.agents.get(this.nativeSupervisorId);
-    if (supAgent?.tgBot) {
-      const chatId = this.getAgentChatId(supAgent);
-      if (chatId) {
-        const msg = `[${sourceAgentId}] ✅`;
-        supAgent.tgBot.sendText(chatId, `<blockquote>${escapeHtml(msg)}</blockquote>`, 'HTML', true)
-          .catch(err => this.logger.warn({ err }, 'Failed to send wake ping to supervisor TG'));
-      }
-    }
+    if (!supAgent) return;
+    // Mute TG output for this wake turn — supervisor responses to wake pings are internal
+    supAgent.muteOutput = true;
+    // Drain queued events into a single wake message
+    const events = this.supervisorEventQueue.splice(0);
+    const summary = events.length > 0
+      ? events.join('\n')
+      : `[${sourceAgentId}] turn complete`;
+    this.sendToCC(this.nativeSupervisorId, { text: summary }, { spawnSource: 'supervisor' });
   }
 
   /** Push a message from a worker agent into the native supervisor's event queue, and immediately
@@ -520,6 +522,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
       deferredSends: [],
       supervisorWakeOnComplete: false,
       lastSupervisorSentText: null,
+      muteOutput: false,
     };
 
     this.agents.set(agentId, instance);
@@ -531,7 +534,27 @@ export class Bridge extends EventEmitter implements CtlHandler {
         agentId,
         agentConfig.heartbeat,
         () => this.agents.get(agentId)?.ccProcess?.state === 'idle' || !this.agents.get(agentId)?.ccProcess,
-        (aid, text) => this.sendToCC(aid, { text }),
+        (aid) => {
+          const a = this.agents.get(aid);
+          if (!a) return;
+          const repo = a.repo;
+          if (!repo) return;
+          const hbPath = join(repo, 'HEARTBEAT.md');
+          let hbContent: string;
+          try { hbContent = readFileSync(hbPath, 'utf-8').trim(); } catch { return; }
+          if (!hbContent) return;
+          // Always mute TG rendering — CC reports via send_message tool if needed
+          a.muteOutput = true;
+          const text = `<heartbeat_rules>
+This is a background heartbeat. Your normal text output is NOT visible to the user.
+To report something to the user, call the send_message MCP tool.
+Only report if there is something actionable — errors, unanswered messages, alerts.
+If everything is fine, do your work silently and do NOT call send_message.
+</heartbeat_rules>
+
+${hbContent}`;
+          this.sendToCC(aid, { text }, { spawnSource: 'supervisor' });
+        },
       );
     }
 
@@ -582,7 +605,26 @@ export class Bridge extends EventEmitter implements CtlHandler {
           agentId,
           newAgentConfig.heartbeat,
           () => this.agents.get(agentId)?.ccProcess?.state === 'idle' || !this.agents.get(agentId)?.ccProcess,
-          (aid, text) => this.sendToCC(aid, { text }),
+          (aid) => {
+            const a = this.agents.get(aid);
+            if (!a) return;
+            const repo = a.repo;
+            if (!repo) return;
+            const hbPath = join(repo, 'HEARTBEAT.md');
+            let hbContent: string;
+            try { hbContent = readFileSync(hbPath, 'utf-8').trim(); } catch { return; }
+            if (!hbContent) return;
+            a.muteOutput = true;
+            const text = `<heartbeat_rules>
+This is a background heartbeat. Your normal text output is NOT visible to the user.
+To report something to the user, call the send_message MCP tool.
+Only report if there is something actionable — errors, unanswered messages, alerts.
+If everything is fine, do your work silently and do NOT call send_message.
+</heartbeat_rules>
+
+${hbContent}`;
+            this.sendToCC(aid, { text }, { spawnSource: 'supervisor' });
+          },
         );
       }
     }
@@ -763,6 +805,11 @@ export class Bridge extends EventEmitter implements CtlHandler {
     const agent = this.agents.get(agentId);
     if (!agent) return;
 
+    // Clear mute if this is a user-facing send (not a wake ping)
+    if (source?.spawnSource !== 'supervisor') {
+      agent.muteOutput = false;
+    }
+
     // Construct CC message
     let text = data.text;
 
@@ -873,6 +920,10 @@ export class Bridge extends EventEmitter implements CtlHandler {
           sessionId: proc.sessionId,
           source: spawnSource,
         });
+      }
+      // Native supervisor: notify if worker is tracked
+      if (this.trackedWorkers.has(agentId)) {
+        this.pushSupervisorEvent(agentId, `🚀 Spawned (${spawnSource})`);
       }
     }
 
@@ -1302,11 +1353,6 @@ export class Bridge extends EventEmitter implements CtlHandler {
     proc.on('idle', () => {
       agent.pendingSessionId = proc.sessionId ?? null;
       this.stopTypingIndicator(agent);
-      const idleChatId = this.getAgentChatId(agent);
-      if (idleChatId && agent.tgBot) {
-        agent.tgBot.sendText(idleChatId, '<blockquote>⏸ Session ended. Use /sessions to resume it.</blockquote>', 'HTML', true)
-          .catch(err => this.logger.error({ err }, 'Failed to send idle notification'));
-      }
       // Auto-destroy ephemeral agents when their CC session ends naturally
       if (agent.ephemeral && agent.deferredSends.length === 0) {
         this.logger.info({ agentId }, 'Ephemeral agent session idle — auto-destroying');
@@ -1360,8 +1406,14 @@ export class Bridge extends EventEmitter implements CtlHandler {
       // Forward to supervisor (unless suppressed by takeover)
       if (this.suppressExitForProcess.has(proc.sessionId ?? '')) {
         this.suppressExitForProcess.delete(proc.sessionId ?? '');
-      } else if (this.isSupervisorSubscribed(agentId, proc.sessionId)) {
-        this.sendToSupervisor({ type: 'event', event: 'process_exit', agentId, sessionId: proc.sessionId, exitCode: null });
+      } else {
+        if (this.isSupervisorSubscribed(agentId, proc.sessionId)) {
+          this.sendToSupervisor({ type: 'event', event: 'process_exit', agentId, sessionId: proc.sessionId, exitCode: null });
+        }
+        // Native supervisor: notify if worker is tracked
+        if (this.trackedWorkers.has(agentId)) {
+          this.pushSupervisorEvent(agentId, `💀 Process exited`);
+        }
       }
 
       this.stopTypingIndicator(agent);
@@ -1407,6 +1459,9 @@ export class Bridge extends EventEmitter implements CtlHandler {
   private handleStreamEvent(agentId: string, event: StreamInnerEvent): void {
     const agent = this.agents.get(agentId);
     if (!agent) return;
+
+    // Muted turn (heartbeat or supervisor wake) — skip TG rendering
+    if (agent.muteOutput) return;
 
     const chatId = this.getAgentChatId(agent);
     if (!chatId) return;
@@ -1483,6 +1538,20 @@ export class Bridge extends EventEmitter implements CtlHandler {
     const agent = this.agents.get(agentId);
     if (!agent) return;
 
+    // Muted turn (heartbeat or supervisor wake) — skip TG rendering
+    if (agent.muteOutput) {
+      agent.muteOutput = false;
+      const cost = event.total_cost_usd ? ` · $${event.total_cost_usd.toFixed(4)}` : '';
+      this.pushSupervisorEvent(agentId, `${event.is_error ? '❌' : '✅'} Turn complete${cost}`, false);
+      if (agent.supervisorWakeOnComplete) {
+        agent.supervisorWakeOnComplete = false;
+        agent.lastSupervisorSentText = null;
+        this.wakeSupervisor(agentId);
+      }
+      this.drainDeferredSends(agentId);
+      return;
+    }
+
     const chatId = this.getAgentChatId(agent);
 
     // Set usage stats on the accumulator before finalizing
@@ -1536,7 +1605,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
       const sentLine = sentText ? `\n  Sent: "${sentText.length > 80 ? sentText.slice(0, 80) + '…' : sentText}"` : '';
       const replyLine = replyText ? `\n  Reply: "${replyText.length > 120 ? replyText.slice(0, 120) + '…' : replyText}"` : '';
       this.pushSupervisorEvent(agentId, `💬 Turn complete${cost}${sentLine}${replyLine}`, false);
-      this.wakeSupervisorTg(agentId);
+      this.wakeSupervisor(agentId);
     }
 
     // Deliver any waitForIdle-deferred messages now that the turn is done
@@ -1652,7 +1721,14 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
       case 'restart': {
         // Restart the TGCC systemd service — this process will die and come back
-        await agent.tgBot.sendText(cmd.chatId, '<blockquote>🔄 Restarting TGCC service...</blockquote>', 'HTML');
+        // Only notify supervisor chat — workers don't need the restart message
+        if (this.nativeSupervisorId) {
+          const supAgent = this.agents.get(this.nativeSupervisorId);
+          const supChatId = supAgent ? this.getAgentChatId(supAgent) : null;
+          if (supChatId && supAgent?.tgBot) {
+            await supAgent.tgBot.sendText(supChatId, '<blockquote>🔄 Restarting TGCC service...</blockquote>', 'HTML');
+          }
+        }
         setTimeout(() => {
           nodeExec('systemctl --user restart tgcc', err => {
             if (err) this.logger.error({ err }, '/restart: systemctl failed');
@@ -2577,6 +2653,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
     try {
       // Supervisor-routed tools (don't need TG chatId)
       switch (request.tool) {
+        case 'notify_supervisor':
         case 'notify_parent': {
           // Route to external supervisor (OpenClaw plugin) if connected
           if (this.supervisorWrite) {
@@ -2590,8 +2667,10 @@ export class Bridge extends EventEmitter implements CtlHandler {
           }
           // Route to native supervisor queue (always forward to TG — explicit worker communication)
           const priority = String(request.params.priority ?? 'info');
-          const emoji = priority === 'blocker' ? '🚨' : priority === 'question' ? '❓' : 'ℹ️';
+          const emoji = priority === 'blocker' ? '🚨' : 'ℹ️';
           this.pushSupervisorEvent(request.agentId, `${emoji} ${request.params.message as string}`, true, true);
+          // Wake supervisor CC process directly
+          this.wakeSupervisor(request.agentId);
           if (!this.supervisorWrite && !this.nativeSupervisorId) {
             return { id: request.id, success: false, error: 'No supervisor connected' };
           }
@@ -2653,6 +2732,8 @@ export class Bridge extends EventEmitter implements CtlHandler {
                 ).catch(err => this.logger.warn({ err }, 'Failed to send supervisor_notify to supervisor TG'));
               }
             }
+            // Wake supervisor CC process directly
+            this.wakeSupervisor(request.agentId);
           }
 
           if (!this.supervisorWrite && !this.nativeSupervisorId) {
@@ -2878,6 +2959,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
               deferredSends: [],
               supervisorWakeOnComplete: false,
               lastSupervisorSentText: null,
+              muteOutput: false,
             };
 
             // Auto-destroy timer
@@ -2892,8 +2974,9 @@ export class Bridge extends EventEmitter implements CtlHandler {
             this.agents.set(spawnAgentId, instance);
             this.logger.info({ agentId: spawnAgentId, repo, model: instance.model, ephemeral: true }, 'Ephemeral agent spawned via tgcc_spawn');
 
-            // Emit agent_created event (always sent, not subscription-gated)
+            // Emit agent_created event
             this.sendToSupervisor({ type: 'event', event: 'agent_created', agentId: spawnAgentId, agentType: 'ephemeral', repo });
+            this.pushSupervisorEvent(spawnAgentId, `🆕 Ephemeral agent created (${repo})`);
 
             // If an initial message was provided, send it immediately
             const message = request.params.message as string | undefined;
@@ -2919,8 +3002,13 @@ export class Bridge extends EventEmitter implements CtlHandler {
           case 'tgcc_track': {
             const targetId = request.params.agentId as string;
             if (!targetId) return { id: request.id, success: false, error: 'agentId is required' };
-            if (!this.agents.has(targetId)) return { id: request.id, success: false, error: `Unknown agent: ${targetId}` };
+            const targetAgent = this.agents.get(targetId);
+            if (!targetAgent) return { id: request.id, success: false, error: `Unknown agent: ${targetId}` };
             this.trackedWorkers.add(targetId);
+            // If agent is mid-turn, wake supervisor when the turn ends
+            if (targetAgent.ccProcess && targetAgent.ccProcess.state !== 'idle') {
+              targetAgent.supervisorWakeOnComplete = true;
+            }
             this.logger.info({ targetId }, 'Supervisor tracking worker');
             return { id: request.id, success: true, result: { agentId: targetId, tracked: true } };
           }
@@ -2943,14 +3031,21 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
       switch (request.tool) {
         case 'send_file':
+          if (agent.accumulator) { await agent.accumulator.flushIfDirty(); agent.accumulator.reset(); }
           await agent.tgBot.sendFile(chatId, request.params.path, request.params.caption);
           return { id: request.id, success: true };
 
         case 'send_image':
+          if (agent.accumulator) { await agent.accumulator.flushIfDirty(); agent.accumulator.reset(); }
           await agent.tgBot.sendImage(chatId, request.params.path, request.params.caption);
           return { id: request.id, success: true };
 
+        case 'send_message':
+          await agent.tgBot.sendText(chatId, escapeHtml(request.params.text), 'HTML');
+          return { id: request.id, success: true };
+
         case 'send_voice':
+          if (agent.accumulator) { await agent.accumulator.flushIfDirty(); agent.accumulator.reset(); }
           await agent.tgBot.sendVoice(chatId, request.params.path, request.params.caption);
           return { id: request.id, success: true };
 
@@ -3082,6 +3177,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
           deferredSends: [],
           supervisorWakeOnComplete: false,
       lastSupervisorSentText: null,
+      muteOutput: false,
         };
 
         // Auto-destroy timer
@@ -3096,8 +3192,9 @@ export class Bridge extends EventEmitter implements CtlHandler {
         this.agents.set(agentId, instance);
         this.logger.info({ agentId, repo, model: instance.model, ephemeral: true }, 'Ephemeral agent created');
 
-        // Emit agent_created event (always sent, not subscription-gated)
+        // Emit agent_created event
         this.sendToSupervisor({ type: 'event', event: 'agent_created', agentId, agentType: 'ephemeral', repo });
+        this.pushSupervisorEvent(agentId, `🆕 Ephemeral agent created (${repo})`);
 
         return { agentId, state: 'idle' };
       }
@@ -3458,6 +3555,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
     this.agents.delete(agentId);
     this.logger.info({ agentId }, 'Ephemeral agent destroyed');
     this.sendToSupervisor({ type: 'event', event: 'agent_destroyed', agentId });
+    this.pushSupervisorEvent(agentId, `🗑️ Ephemeral agent destroyed`);
   }
 
   // ── Shutdown ──
@@ -3465,17 +3563,15 @@ export class Bridge extends EventEmitter implements CtlHandler {
   async stop(): Promise<void> {
     this.logger.info('Stopping bridge');
 
-    // Notify all active chats before shutting down bots
-    await Promise.allSettled(
-      [...this.agents.values()]
-        .filter(a => a.tgBot)
-        .map(a => {
-          const chatId = this.getAgentChatId(a);
-          if (!chatId) return Promise.resolve();
-          return a.tgBot!.sendText(chatId, '<blockquote>🔄 Restarting… Session will resume on next message.</blockquote>', 'HTML', true)
-            .catch(err => this.logger.warn({ err }, 'Failed to send shutdown notification'));
-        })
-    );
+    // Notify supervisor chat only before shutting down
+    if (this.nativeSupervisorId) {
+      const supAgent = this.agents.get(this.nativeSupervisorId);
+      const chatId = supAgent ? this.getAgentChatId(supAgent) : null;
+      if (chatId && supAgent?.tgBot) {
+        await supAgent.tgBot.sendText(chatId, '<blockquote>🔄 Restarting… Session will resume on next message.</blockquote>', 'HTML', true)
+          .catch(err => this.logger.warn({ err }, 'Failed to send shutdown notification'));
+      }
+    }
 
     for (const agentId of [...this.agents.keys()]) {
       await this.stopAgent(agentId);

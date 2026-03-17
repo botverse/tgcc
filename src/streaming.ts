@@ -106,6 +106,48 @@ function closeUnclosedTags(html: string): string {
   return stack.length ? html + stack.reverse().map(t => `</${t}>`).join('') : html;
 }
 
+/**
+ * Render a thinking rawText into 1+ blockquote HTML strings, each ≤4000 chars of inner HTML.
+ * Splits at paragraph boundaries when the rendered HTML exceeds the Telegram limit.
+ */
+function renderThinkingBubbles(rawText: string): string[] {
+  const maxHtml = 4000;
+  const collapseCode = (h: string) =>
+    h.replace(/<pre><code(?:[^>]*)>([\s\S]*?)<\/code><\/pre>/g, (_, code: string) =>
+      `<code>${code.trim().replace(/\n/g, ' ')}</code>`);
+  const wrap = (h: string) => `<blockquote expandable>💭 ${h}</blockquote>`;
+
+  // Try full render first
+  const fullSafe = collapseCode(markdownToTelegramHtml(rawText));
+  if (fullSafe.length <= maxHtml) return [wrap(fullSafe)];
+
+  // Split rawText at paragraph boundaries
+  const paragraphs = rawText.split(/\n\n+/);
+  const chunks: string[] = [];
+  let current = '';
+
+  for (const para of paragraphs) {
+    const test = current ? current + '\n\n' + para : para;
+    const testSafe = collapseCode(markdownToTelegramHtml(test));
+
+    if (testSafe.length > maxHtml && current) {
+      chunks.push(current);
+      current = para;
+    } else {
+      current = test;
+    }
+  }
+  if (current) chunks.push(current);
+
+  return chunks.map(chunk => {
+    const safe = collapseCode(markdownToTelegramHtml(chunk));
+    const content = safe.length > maxHtml
+      ? closeUnclosedTags(safe.slice(0, maxHtml).replace(/<[^>]*$/, '')) + '…'
+      : safe;
+    return wrap(content);
+  });
+}
+
 // ── Segment types (internal) ──
 
 type InternalSegment =
@@ -152,12 +194,10 @@ function renderSegment(seg: InternalSegment): string {
 
     case 'text': {
       if (!seg.rawText) return '';
-      const html = makeHtmlSafe(seg.rawText);
-      const maxHtml = 4000;
-      const truncated = html.length > maxHtml
-        ? closeUnclosedTags(html.slice(0, maxHtml).replace(/<[^>]*$/, '')) + '…'
-        : html;
-      return truncated;
+      // No per-segment truncation — let splitMessage() handle overflow by creating
+      // continuation bubbles.  Truncating here would prevent splitMessage from ever
+      // being called, silently losing everything past 4000 chars.
+      return makeHtmlSafe(seg.rawText);
     }
 
     case 'tool': {
@@ -518,7 +558,7 @@ export class StreamAccumulator {
         // Thinking appeared mid-turn (after text/tool segments).
         const preHtml = this.segments.slice(0, thinkingIdx).map(s => s.content).filter(Boolean).join('\n');
         const capturedMsgId = this.tgMessageId;
-        const thinkingHtml = seg.content;
+        const thinkingBubbles = renderThinkingBubbles(seg.rawText);
 
         // Mark split-off and remove synchronously — NO awaits.
         seg.splitOff = true;
@@ -529,30 +569,29 @@ export class StreamAccumulator {
         // in the sendQueue sees the 'writing' marker. 'writing' = one authorized final edit pending.
         if (capturedMsgId) this.sealedMsgIds.set(capturedMsgId, 'writing');
 
-        // Capture thinkingMsgId in a local — never read this.tgMessageId across a .then() boundary.
         let capturedThinkingId: number | null = null;
         this.sendQueue = this.sendQueue
           .then(() => this._doSendOrEdit(preHtml || '…', capturedMsgId))
           .then(async () => {
             // Upgrade pre-thinking bubble: 'writing' → 'bubble-end' (no further edits allowed).
             if (capturedMsgId) this.sealedMsgIds.set(capturedMsgId, 'bubble-end');
-            await this._doSendOrEdit(thinkingHtml || '…', null);
-            // Capture thinking ID immediately after send, before the next .then() boundary
-            // (microtasks don't yield to macrotasks between these two lines).
-            capturedThinkingId = this.tgMessageId;
-          })
-          .then(() => {
-            if (capturedThinkingId) this.sealedMsgIds.set(capturedThinkingId, 'thinking');
-            this.tgMessageId = null; // clear so response creates its own bubble
+            for (const bubble of thinkingBubbles) {
+              await this._doSendOrEdit(bubble, null);
+              capturedThinkingId = this.tgMessageId;
+              if (capturedThinkingId) this.sealedMsgIds.set(capturedThinkingId, 'thinking');
+              this.tgMessageId = null;
+            }
+            // Re-gate first send so the post-thinking text bubble doesn't flush a single char
+            this.firstSendReady = false;
+            this.turnStartTime = Date.now();
+            this.clearFirstSendTimer();
           })
           .catch(err => {
             this.logger?.error?.({ err }, 'thinking bubble split send failed');
           });
       } else {
         // Thinking is the first/only segment.
-        // Capture tgMessageId before nulling — flushRender may have already live-edited
-        // this message with thinking content; EDIT it (not create a new one) to avoid duplicates.
-        const thinkingHtml = seg.content;
+        const thinkingBubbles = renderThinkingBubbles(seg.rawText);
         const capturedMsgId = this.tgMessageId;
 
         // Mark split-off and remove synchronously — NO awaits.
@@ -561,23 +600,28 @@ export class StreamAccumulator {
         this.tgMessageId = null;
 
         // Seal capturedMsgId synchronously before the chain. 'writing' = one authorized final edit.
-        // If capturedMsgId is null, the thinking bubble doesn't exist yet (will be sent fresh).
         if (typeof capturedMsgId === 'number') this.sealedMsgIds.set(capturedMsgId, 'writing');
 
-        // Capture thinking ID in a local — if capturedMsgId is a number, it's already known.
-        // If null (send case), capture from this.tgMessageId immediately after the send,
-        // before the next .then() boundary where flushRender could mutate it.
-        let capturedThinkingId: number | null = typeof capturedMsgId === 'number' ? capturedMsgId : null;
+        let capturedThinkingId: number | null = null;
         this.sendQueue = this.sendQueue
           .then(async () => {
-            await this._doSendOrEdit(thinkingHtml || '…', capturedMsgId);
-            // Capture fresh send ID immediately (same microtask continuation — no macrotask gap).
-            if (capturedThinkingId === null) capturedThinkingId = this.tgMessageId;
-          })
-          .then(() => {
-            // Upgrade from 'writing' to 'thinking' (or record the new send ID as 'thinking').
+            // First bubble: edit existing message if present, otherwise send new
+            await this._doSendOrEdit(thinkingBubbles[0] || '…', capturedMsgId);
+            capturedThinkingId = this.tgMessageId;
             if (capturedThinkingId) this.sealedMsgIds.set(capturedThinkingId, 'thinking');
-            this.tgMessageId = null; // clear so response creates its own bubble
+            this.tgMessageId = null;
+
+            // Additional bubbles (if thinking was too long for one)
+            for (let i = 1; i < thinkingBubbles.length; i++) {
+              await this._doSendOrEdit(thinkingBubbles[i], null);
+              capturedThinkingId = this.tgMessageId;
+              if (capturedThinkingId) this.sealedMsgIds.set(capturedThinkingId, 'thinking');
+              this.tgMessageId = null;
+            }
+            // Re-gate first send so the post-thinking text bubble doesn't flush a single char
+            this.firstSendReady = false;
+            this.turnStartTime = Date.now();
+            this.clearFirstSendTimer();
           })
           .catch(err => {
             this.logger?.error?.({ err }, 'thinking bubble send failed');
@@ -780,6 +824,29 @@ export class StreamAccumulator {
 
   /** Split oversized message — called from within the sendQueue chain, uses _doSendOrEdit directly. */
   private async splitMessage(): Promise<void> {
+    // Pre-process: break any single oversized text segment into multiple sub-segments
+    // so the segment-boundary split logic below can handle them naturally.
+    for (let i = 0, iter = 0; i < this.segments.length && iter < 30; i++, iter++) {
+      const seg = this.segments[i];
+      if (seg.type !== 'text' || seg.content.length <= this.splitThreshold) continue;
+      // Split rawText at ~70% of threshold to account for markdown→HTML expansion
+      const rawTarget = Math.floor(this.splitThreshold * 0.7);
+      if (rawTarget < 100 || seg.rawText.length < 200) break;
+      const splitPos = findSplitPoint(seg.rawText, rawTarget);
+      if (splitPos <= 0 || splitPos >= seg.rawText.length - 10) continue;
+
+      const firstRaw = seg.rawText.slice(0, splitPos);
+      const restRaw = seg.rawText.slice(splitPos).replace(/^\n+/, '');
+      const firstSeg: InternalSegment = { type: 'text', rawText: firstRaw, content: '' };
+      firstSeg.content = renderSegment(firstSeg);
+
+      seg.rawText = restRaw;
+      seg.content = renderSegment(seg);
+
+      this.segments.splice(i, 0, firstSeg);
+      // Don't increment i — re-check inserted segment in case it's still oversized
+    }
+
     // Find text segments to split on
     let totalLen = 0;
     let splitSegIdx = -1;
@@ -816,15 +883,22 @@ export class StreamAccumulator {
     // Start a new message for remainder — no captured id, must create fresh
     this.tgMessageId = null;
     const restHtml = this.renderHtml();
-    await this._doSendOrEdit(restHtml);
+    // If remainder is STILL oversized (e.g. many segments), recurse
+    if (restHtml.length > this.splitThreshold) {
+      await this.splitMessage();
+    } else {
+      await this._doSendOrEdit(restHtml);
+    }
   }
 
   private checkFirstSendReady(): boolean {
     if (this.firstSendReady) return true;
-    const textChars = this.segments
-      .filter((s): s is Extract<InternalSegment, { type: 'text' }> => s.type === 'text')
-      .reduce((sum, s) => sum + s.rawText.length, 0);
-    if (textChars >= 200 || Date.now() - this.turnStartTime >= 2000) {
+    const textSegs = this.segments
+      .filter((s): s is Extract<InternalSegment, { type: 'text' }> => s.type === 'text');
+    const textChars = textSegs.reduce((sum, s) => sum + s.rawText.length, 0);
+    const hasNewline = textSegs.some(s => s.rawText.includes('\n'));
+    // Require at least 2 lines (newline) with 80+ chars, OR 200+ chars, OR 2s timeout
+    if ((hasNewline && textChars >= 80) || textChars >= 200 || Date.now() - this.turnStartTime >= 2000) {
       this.firstSendReady = true;
       this.clearFirstSendTimer();
       return true;

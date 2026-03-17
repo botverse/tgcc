@@ -92,6 +92,38 @@ async function main(): Promise<void> {
     }
   );
 
+  // ── send_message tool ──
+
+  server.tool(
+    'send_message',
+    'Send a text message to the user on Telegram. Use this to report findings, alerts, or anything the user should see — especially from background/heartbeat tasks where normal output is suppressed.',
+    {
+      text: z.string().describe('Message text (plain text, no HTML)'),
+    },
+    async ({ text }) => {
+      const request: McpToolRequest = {
+        id: uuidv4(),
+        tool: 'send_message',
+        agentId: AGENT_ID,
+        userId: USER_ID,
+        params: { text },
+      };
+
+      try {
+        const response = await client.sendRequest(request);
+        if (response.success) {
+          return { content: [{ type: 'text' as const, text: 'Message sent to user.' }] };
+        }
+        return { content: [{ type: 'text' as const, text: `Failed to send message: ${response.error}` }], isError: true };
+      } catch (err) {
+        return {
+          content: [{ type: 'text' as const, text: `Bridge unavailable: ${err instanceof Error ? err.message : 'unknown error'}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
   // ── send_voice tool ──
 
   server.tool(
@@ -125,19 +157,19 @@ async function main(): Promise<void> {
     }
   );
 
-  // ── notify_parent tool ──
+  // ── notify_supervisor tool ──
 
   server.tool(
-    'notify_parent',
-    'Send a message to the orchestrator/parent that spawned this task. Use for asking questions, reporting blockers, or progress updates.',
+    'notify_supervisor',
+    'Send a message to the supervisor that manages this agent. Use for asking questions, reporting blockers, or progress updates.',
     {
-      message: z.string().describe('Message to send to the parent'),
+      message: z.string().describe('Message to send to the supervisor'),
       priority: z.enum(['info', 'question', 'blocker']).default('info').describe('Message priority'),
     },
     async ({ message, priority }) => {
       const request: McpToolRequest = {
         id: uuidv4(),
-        tool: 'notify_parent',
+        tool: 'notify_supervisor',
         agentId: AGENT_ID,
         userId: USER_ID,
         params: { message, priority },

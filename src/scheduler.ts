@@ -171,7 +171,7 @@ export class Scheduler {
         return;
       }
       this.logger.info({ agentId }, 'Heartbeat tick firing');
-      send(agentId, config.prompt);
+      send(agentId, '');
     });
 
     this.heartbeats.set(agentId, job);

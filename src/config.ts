@@ -36,7 +36,6 @@ export type HeartbeatIntervalMins = 5 | 10 | 15 | 30 | 60;
 
 export interface HeartbeatConfig {
   intervalMins: HeartbeatIntervalMins;
-  prompt: string;
   /** Skip tick if the agent is mid-turn. Default: true */
   onlyWhenIdle?: boolean;
   /** IANA timezone for the cron expression. Default: UTC */
@@ -219,12 +218,8 @@ export function validateConfig(raw: unknown): TgccConfig {
       if (!validIntervals.includes(intervalMins)) {
         throw new Error(`Agent "${agentId}" heartbeat.intervalMins must be one of: ${validIntervals.join(', ')}`);
       }
-      if (typeof hb.prompt !== 'string' || !hb.prompt) {
-        throw new Error(`Agent "${agentId}" heartbeat.prompt must be a non-empty string`);
-      }
       heartbeat = {
         intervalMins,
-        prompt: hb.prompt,
         onlyWhenIdle: hb.onlyWhenIdle !== false,
         ...(typeof hb.tz === 'string' ? { tz: hb.tz } : {}),
       };
