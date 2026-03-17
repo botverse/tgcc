@@ -547,9 +547,12 @@ export class Bridge extends EventEmitter implements CtlHandler {
           a.muteOutput = true;
           const text = `<heartbeat_rules>
 This is a background heartbeat. Your normal text output is NOT visible to the user.
-To report something to the user, call the send_message MCP tool.
-Only report if there is something actionable — errors, unanswered messages, alerts.
-If everything is fine, do your work silently and do NOT call send_message.
+The ONLY way to communicate with the user is by calling the send_message MCP tool.
+You MUST call send_message if:
+- Any tool call fails or returns an error
+- There are unanswered messages, alerts, or items needing attention
+- Anything unexpected happens
+Only stay silent if every check passes cleanly with no issues.
 </heartbeat_rules>
 
 ${hbContent}`;
@@ -617,9 +620,12 @@ ${hbContent}`;
             a.muteOutput = true;
             const text = `<heartbeat_rules>
 This is a background heartbeat. Your normal text output is NOT visible to the user.
-To report something to the user, call the send_message MCP tool.
-Only report if there is something actionable — errors, unanswered messages, alerts.
-If everything is fine, do your work silently and do NOT call send_message.
+The ONLY way to communicate with the user is by calling the send_message MCP tool.
+You MUST call send_message if:
+- Any tool call fails or returns an error
+- There are unanswered messages, alerts, or items needing attention
+- Anything unexpected happens
+Only stay silent if every check passes cleanly with no issues.
 </heartbeat_rules>
 
 ${hbContent}`;
