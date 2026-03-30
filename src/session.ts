@@ -166,8 +166,8 @@ export function getSessionJsonlPath(sessionId: string, repo: string): string {
 
 export function computeProjectSlug(repoPath: string): string {
   // CC stores at ~/.claude/projects/<slug>/sessions/
-  // Slug is the path with / replaced by - and leading -
-  return repoPath.replace(/\//g, '-');
+  // Slug is the path with / and . replaced by -
+  return repoPath.replace(/[/.]/g, '-');
 }
 
 // ── CC Session Discovery ──
