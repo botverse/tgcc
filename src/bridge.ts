@@ -3133,7 +3133,9 @@ ${hbContent}`;
               }
 
               case 'add': {
-                const targetId = request.params.agentId as string;
+                const rawTargetId = request.params.agentId as string;
+                // "self" resolves to the requesting agent's own ID
+                const targetId = rawTargetId === 'self' ? request.agentId : rawTargetId;
                 if (!targetId) return { id: request.id, success: false, error: 'agentId is required for add' };
                 if (!this.agents.has(targetId)) return { id: request.id, success: false, error: `Unknown agent: ${targetId}` };
                 const message = request.params.message as string;

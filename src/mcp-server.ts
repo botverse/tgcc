@@ -479,7 +479,7 @@ async function main(): Promise<void> {
       'Manage scheduled cron jobs for worker agents. Use to schedule periodic nudges (e.g. "check training status every 30m") or one-shot reminders.',
       {
         action: z.enum(['add', 'list', 'remove', 'trigger']).describe('Action to perform'),
-        agentId: z.string().optional().describe('Target agent ID (required for add)'),
+        agentId: z.string().optional().describe('Target agent ID (required for add). Use "self" to target yourself.'),
         message: z.string().optional().describe('Message to send when job fires (required for add)'),
         every: z.string().optional().describe('Recurring interval, e.g. "30m", "4h"'),
         at: z.string().optional().describe('One-shot delay, e.g. "20m", "2h", or ISO datetime'),
