@@ -39,6 +39,7 @@ interface AgentState {
 
   // Context pressure tracking
   contextThresholdsHit: Set<number>;
+  lastContextPercent: number;
 
   // Sub-agent spawn tracking (per turn)
   spawnCountThisTurn: number;
@@ -261,6 +262,14 @@ export class HighSignalDetector {
   }
 
   /**
+   * Get the last known context usage percentage for an agent (0–100+).
+   * Returns 0 if no usage data has been observed yet.
+   */
+  getContextPercent(agentId: string): number {
+    return this.agentStates.get(agentId)?.lastContextPercent ?? 0;
+  }
+
+  /**
    * Clean up state for an agent (on process exit)
    */
   cleanup(agentId: string): void {
@@ -291,6 +300,7 @@ export class HighSignalDetector {
         lastFailedTool: '',
         lastFailedError: '',
         contextThresholdsHit: new Set(),
+        lastContextPercent: 0,
         spawnCountThisTurn: 0,
         lastOutputTs: Date.now(),
         stuckTimer: null,
@@ -316,6 +326,7 @@ export class HighSignalDetector {
     const cacheCreation = (usage as Record<string, number>).cache_creation_input_tokens ?? 0;
     const totalTokens = inputTokens + cacheRead + cacheCreation;
     const percent = Math.round((totalTokens / CONTEXT_WINDOW_TOKENS) * 100);
+    state.lastContextPercent = percent;
 
     for (const threshold of CONTEXT_THRESHOLDS) {
       if (percent >= threshold && !state.contextThresholdsHit.has(threshold)) {

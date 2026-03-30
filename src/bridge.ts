@@ -237,6 +237,9 @@ export class Bridge extends EventEmitter implements CtlHandler {
   private static readonly SUPERVISOR_QUEUE_MAX = 20;
   /** Workers whose high-signal events are forwarded to the supervisor's TG chat in real time. */
   private trackedWorkers = new Set<string>();
+  /** Periodic heartbeat timer that wakes the supervisor with tracked worker status. */
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  private heartbeatIntervalMs = 0;
 
   // External supervisor protocol (OpenClaw plugin)
   private supervisorWrite: ((line: string) => void) | null = null;
@@ -301,6 +304,61 @@ export class Bridge extends EventEmitter implements CtlHandler {
       ? events.join('\n')
       : `[${sourceAgentId}] turn complete`;
     this.sendToCC(this.nativeSupervisorId, { text: summary }, { spawnSource: 'supervisor' });
+  }
+
+  /** Start or restart the supervisor heartbeat timer. Clears any existing timer first. */
+  private startHeartbeat(intervalMs: number): void {
+    this.stopHeartbeat();
+    if (intervalMs <= 0) return;
+    this.heartbeatIntervalMs = intervalMs;
+    this.heartbeatTimer = setInterval(() => this.heartbeatTick(), intervalMs);
+    this.logger.info({ intervalMs }, 'Supervisor heartbeat started');
+  }
+
+  /** Stop the supervisor heartbeat timer. */
+  private stopHeartbeat(): void {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+      this.heartbeatIntervalMs = 0;
+      this.logger.info('Supervisor heartbeat stopped');
+    }
+  }
+
+  /** Heartbeat tick — gather status for all tracked workers and wake the supervisor. */
+  private heartbeatTick(): void {
+    if (!this.nativeSupervisorId || this.trackedWorkers.size === 0) return;
+    // Don't wake if supervisor is mid-turn (it'll see events when its turn ends)
+    const sup = this.agents.get(this.nativeSupervisorId);
+    if (sup?.ccProcess && sup.ccProcess.state !== 'idle') return;
+
+    const lines: string[] = [];
+    for (const wid of this.trackedWorkers) {
+      const a = this.agents.get(wid);
+      if (!a) continue;
+      const state = a.ccProcess?.state ?? 'idle';
+      const cost = this.highSignalDetector.getSessionCost(wid);
+      const ctxPct = this.highSignalDetector.getContextPercent(wid);
+      const agentState = this.sessionStore.getAgent(wid);
+      const ago = agentState.lastActivity
+        ? this.formatElapsed(Date.now() - new Date(agentState.lastActivity).getTime())
+        : '?';
+      lines.push(`${wid}: ${state}, ${ctxPct}% ctx, $${cost.toFixed(2)}, last activity ${ago}`);
+    }
+    if (lines.length === 0) return;
+
+    const text = `[heartbeat] ${lines.join(' | ')}`;
+    this.pushSupervisorEvent(this.nativeSupervisorId, text, false);
+    this.wakeSupervisor(this.nativeSupervisorId);
+  }
+
+  /** Format milliseconds as a human-readable elapsed string (e.g. "3m", "1h 5m"). */
+  private formatElapsed(ms: number): string {
+    if (ms < 60_000) return `${Math.round(ms / 1000)}s`;
+    const mins = Math.round(ms / 60_000);
+    if (mins < 60) return `${mins}m`;
+    const hours = Math.floor(mins / 60);
+    return `${hours}h ${mins % 60}m`;
   }
 
   /** Push a message from a worker agent into the native supervisor's event queue, and immediately
@@ -882,6 +940,13 @@ ${hbContent}`;
             agent.tgBot.sendText(staleChatId, '<blockquote>Starting a new session. Use /sessions to resume a previous one.</blockquote>', 'HTML', true)
               .catch(err => this.logger.error({ err }, 'Failed to send stale session notification'));
           }
+        } else if (!isStale && agent.forceNewSession) {
+          // Process exited (restart, crash, etc.) — notify that a new session is starting
+          const fsChatId = source?.chatId;
+          if (fsChatId && agent.tgBot) {
+            agent.tgBot.sendText(fsChatId, '<blockquote>Previous session ended. Starting fresh.</blockquote>', 'HTML', true)
+              .catch(err => this.logger.error({ err }, 'Failed to send forceNewSession notification'));
+          }
         } else if (!isStale && !agent.forceNewSession) {
           // Auto-continuing a recent session — check if it came from an IDE (e.g. VSCode)
           const ideChatId = source?.chatId;
@@ -1404,9 +1469,10 @@ ${hbContent}`;
       this.highSignalDetector.cleanup(agentId);
       this.eventDedup.cleanup(agentId);
 
-      // If the supervisor's session just ended, clear tracked workers
+      // If the supervisor's session just ended, clear tracked workers and stop heartbeat
       if (agentId === this.nativeSupervisorId) {
         this.trackedWorkers.clear();
+        this.stopHeartbeat();
       }
 
       // Forward to supervisor (unless suppressed by takeover)
@@ -1438,6 +1504,8 @@ ${hbContent}`;
         this.processRegistry.remove(entry.repo, entry.sessionId);
       }
       agent.ccProcess = null;
+      // Process exited — next message should start a fresh session
+      agent.forceNewSession = true;
       // Process exited — deliver any deferred messages (will spawn a new process)
       this.drainDeferredSends(agentId);
       // Auto-destroy ephemeral agents on process exit (if no deferred sends spawned a new process)
@@ -1718,10 +1786,20 @@ ${hbContent}`;
         this.killAgentProcess(agentId);
         agent.pendingSessionId = null;
         agent.forceNewSession = true; // next message spawns fresh regardless of recency
-        const newLines = ['Session cleared. Next message starts fresh.'];
-        if (agent.repo) newLines.push(`📂 <code>${escapeHtml(shortenRepoPath(agent.repo))}</code>`);
-        if (agent.model) newLines.push(`🤖 ${escapeHtml(agent.model)}`);
-        await agent.tgBot.sendText(cmd.chatId, `<blockquote>${newLines.join('\n')}</blockquote>`, 'HTML');
+        const newPrompt = cmd.args?.trim();
+        if (newPrompt) {
+          // Immediately send the prompt — spawns a fresh session
+          this.sendToCC(agentId, { text: newPrompt });
+          const newLines = ['Session cleared. Sending prompt...'];
+          if (agent.repo) newLines.push(`📂 <code>${escapeHtml(shortenRepoPath(agent.repo))}</code>`);
+          if (agent.model) newLines.push(`🤖 ${escapeHtml(agent.model)}`);
+          await agent.tgBot.sendText(cmd.chatId, `<blockquote>${newLines.join('\n')}</blockquote>`, 'HTML');
+        } else {
+          const newLines = ['Session cleared. Next message starts fresh.'];
+          if (agent.repo) newLines.push(`📂 <code>${escapeHtml(shortenRepoPath(agent.repo))}</code>`);
+          if (agent.model) newLines.push(`🤖 ${escapeHtml(agent.model)}`);
+          await agent.tgBot.sendText(cmd.chatId, `<blockquote>${newLines.join('\n')}</blockquote>`, 'HTML');
+        }
         break;
       }
 
@@ -2754,7 +2832,8 @@ ${hbContent}`;
       if (request.tool === 'tgcc_status' || request.tool === 'tgcc_send' ||
           request.tool === 'tgcc_kill' || request.tool === 'tgcc_log' || request.tool === 'tgcc_session' ||
           request.tool === 'tgcc_spawn' || request.tool === 'tgcc_destroy' ||
-          request.tool === 'tgcc_track' || request.tool === 'tgcc_untrack') {
+          request.tool === 'tgcc_track' || request.tool === 'tgcc_untrack' ||
+          request.tool === 'tgcc_cron') {
         // Allow supervisor agent and internal callers (cron, system)
         const isInternalCaller = request.userId === 'cron' || request.userId === 'system';
         if (request.agentId !== this.nativeSupervisorId && !isInternalCaller) {
@@ -2780,6 +2859,7 @@ ${hbContent}`;
                 lastActivity: agentState.lastActivity,
                 lastActivitySummary: lastLog?.text ?? null,
                 sessionCost: this.highSignalDetector.getSessionCost(aid),
+                contextPct: this.highSignalDetector.getContextPercent(aid),
                 tracked: this.trackedWorkers.has(aid),
               };
             }
@@ -2839,8 +2919,14 @@ ${hbContent}`;
                 return { id: request.id, success: true, result: sessions };
               }
               case 'new': {
+                this.killAgentProcess(targetId);
+                targetAgent.pendingSessionId = null;
                 targetAgent.forceNewSession = true;
-                return { id: request.id, success: true };
+                const prompt = request.params.prompt as string | undefined;
+                if (prompt) {
+                  this.sendToCC(targetId, { text: prompt });
+                }
+                return { id: request.id, success: true, result: { prompt: prompt ?? null } };
               }
               case 'cancel': {
                 targetAgent.ccProcess?.cancel();
@@ -3015,16 +3101,122 @@ ${hbContent}`;
             if (targetAgent.ccProcess && targetAgent.ccProcess.state !== 'idle') {
               targetAgent.supervisorWakeOnComplete = true;
             }
-            this.logger.info({ targetId }, 'Supervisor tracking worker');
-            return { id: request.id, success: true, result: { agentId: targetId, tracked: true } };
+            // Start/update heartbeat if requested
+            const heartbeatMs = request.params.heartbeatMs as number | undefined;
+            if (heartbeatMs && heartbeatMs >= 30_000) {
+              this.startHeartbeat(heartbeatMs);
+            }
+            this.logger.info({ targetId, heartbeatMs }, 'Supervisor tracking worker');
+            return {
+              id: request.id, success: true,
+              result: { agentId: targetId, tracked: true, heartbeatMs: this.heartbeatIntervalMs || null },
+            };
           }
 
           case 'tgcc_untrack': {
             const targetId = request.params.agentId as string;
             if (!targetId) return { id: request.id, success: false, error: 'agentId is required' };
             const wasTracked = this.trackedWorkers.delete(targetId);
+            // Stop heartbeat if no more tracked workers
+            if (this.trackedWorkers.size === 0) this.stopHeartbeat();
             this.logger.info({ targetId, wasTracked }, 'Supervisor untracking worker');
             return { id: request.id, success: true, result: { agentId: targetId, tracked: false, wasTracked } };
+          }
+
+          case 'tgcc_cron': {
+            const action = request.params.action as string;
+
+            switch (action) {
+              case 'list': {
+                const jobs = this.scheduler.listJobs();
+                return { id: request.id, success: true, result: jobs };
+              }
+
+              case 'add': {
+                const targetId = request.params.agentId as string;
+                if (!targetId) return { id: request.id, success: false, error: 'agentId is required for add' };
+                if (!this.agents.has(targetId)) return { id: request.id, success: false, error: `Unknown agent: ${targetId}` };
+                const message = request.params.message as string;
+                if (!message) return { id: request.id, success: false, error: 'message is required for add' };
+
+                const session = (request.params.session as string) ?? 'main';
+                const tz = request.params.tz as string | undefined;
+                const name = request.params.name as string | undefined;
+
+                let schedule: string;
+                let deleteAfterRun = false;
+
+                if (request.params.at) {
+                  const result = computeOneShotSchedule(request.params.at as string);
+                  if (!result) return { id: request.id, success: false, error: `Cannot parse --at value: "${request.params.at}"` };
+                  schedule = result.schedule;
+                  deleteAfterRun = true;
+                } else if (request.params.every) {
+                  const cronExpr = parseEveryToCron(request.params.every as string);
+                  if (!cronExpr) return { id: request.id, success: false, error: `Cannot parse --every value: "${request.params.every}"` };
+                  schedule = cronExpr;
+                } else if (request.params.cron) {
+                  schedule = request.params.cron as string;
+                } else {
+                  return { id: request.id, success: false, error: 'Must specify every, at, or cron' };
+                }
+
+                const jobId = name
+                  ? name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
+                  : `dyn-${Date.now().toString(36)}`;
+
+                if (this.scheduler.hasJob(jobId)) {
+                  return { id: request.id, success: false, error: `Job ID "${jobId}" already exists` };
+                }
+
+                const job: CronJobConfig = {
+                  id: jobId,
+                  ...(name ? { name } : {}),
+                  schedule,
+                  ...(tz ? { tz } : {}),
+                  agentId: targetId,
+                  message,
+                  session: session as 'main' | 'isolated',
+                  announce: true,
+                  deleteAfterRun,
+                };
+
+                this.scheduler.addDynamicJob(
+                  job,
+                  (aid, text) => this.sendToCC(aid, { text }),
+                  (j) => this.spawnCronIsolated(j),
+                );
+
+                const nextRun = this.scheduler.listJobs().find(j => j.id === jobId)?.nextRun;
+                return {
+                  id: request.id, success: true,
+                  result: { jobId, schedule, deleteAfterRun, nextRun: nextRun?.toISOString() ?? null },
+                };
+              }
+
+              case 'remove': {
+                const jobId = request.params.jobId as string;
+                if (!jobId) return { id: request.id, success: false, error: 'jobId is required for remove' };
+                const removed = this.scheduler.removeDynamicJob(jobId);
+                if (!removed) return { id: request.id, success: false, error: `Job "${jobId}" not found (only dynamic jobs can be removed)` };
+                return { id: request.id, success: true, result: { removed: true, jobId } };
+              }
+
+              case 'trigger': {
+                const jobId = request.params.jobId as string;
+                if (!jobId) return { id: request.id, success: false, error: 'jobId is required for trigger' };
+                const triggered = this.scheduler.triggerJob(
+                  jobId,
+                  (aid, text) => this.sendToCC(aid, { text }),
+                  (j) => this.spawnCronIsolated(j),
+                );
+                if (!triggered) return { id: request.id, success: false, error: `Job "${jobId}" not found` };
+                return { id: request.id, success: true, result: { triggered: true, jobId } };
+              }
+
+              default:
+                return { id: request.id, success: false, error: `Unknown cron action: ${action}` };
+            }
           }
         }
       }

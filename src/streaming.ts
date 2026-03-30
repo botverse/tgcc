@@ -486,7 +486,7 @@ export class StreamAccumulator {
         const seg = this.currentSegment;
         if (seg && (seg.type === 'tool' || seg.type === 'subagent')) {
           const toolName = seg.type === 'tool' ? seg.toolName : seg.toolName;
-          const summary = extractToolInputSummary(toolName, next, 80, true);
+          const summary = extractToolInputSummary(toolName, next, 200, true);
           if (summary) {
             (seg as any).inputPreview = summary;
           }
@@ -536,7 +536,7 @@ export class StreamAccumulator {
         this.requestRender();
       } else if (seg.type === 'tool') {
         // Finalize preview from complete input
-        const summary = extractToolInputSummary(seg.toolName, inputJson, 80);
+        const summary = extractToolInputSummary(seg.toolName, inputJson, 200);
         if (summary) seg.inputPreview = summary;
         seg.content = renderSegment(seg);
         this.requestRender();
@@ -686,7 +686,7 @@ export class StreamAccumulator {
         // Finalize input preview from buffer if not set
         const inputJson = this.toolInputBuffers.get(blockId) ?? '';
         if (!seg.inputPreview) {
-          const summary = extractToolInputSummary(seg.toolName, inputJson);
+          const summary = extractToolInputSummary(seg.toolName, inputJson, 200);
           if (summary) seg.inputPreview = summary;
         }
         // Compute result stat

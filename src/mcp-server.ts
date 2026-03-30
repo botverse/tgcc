@@ -367,15 +367,16 @@ async function main(): Promise<void> {
         repo: z.string().optional().describe('For set_repo action: repository path or alias'),
         mode: z.string().optional().describe('For set_permissions action: permission mode (dangerously-skip, acceptEdits, default, plan)'),
         instructions: z.string().optional().describe('For compact action: optional compaction instructions'),
+        prompt: z.string().optional().describe('For new action: initial prompt to send immediately after creating the fresh session'),
       },
-      async ({ agentId, action, sessionId, model, limit, repo, mode, instructions }) => {
+      async ({ agentId, action, sessionId, model, limit, repo, mode, instructions, prompt }) => {
         const request: McpToolRequest = {
           id: uuidv4(), tool: 'tgcc_session', agentId: AGENT_ID, userId: USER_ID,
-          params: { agentId, action, sessionId, model, limit, repo, mode, instructions },
+          params: { agentId, action, sessionId, model, limit, repo, mode, instructions, prompt },
         };
         try {
           const response = await client.sendRequest(request);
-          if (response.success) return { content: [{ type: 'text' as const, text: JSON.stringify(response.result, null, 2) }] };
+          if (response.success) return { content: [{ type: 'text' as const, text: JSON.stringify(response.result ?? { ok: true }, null, 2) }] };
           return { content: [{ type: 'text' as const, text: `Failed: ${response.error}` }], isError: true };
         } catch (err) {
           return { content: [{ type: 'text' as const, text: `Bridge unavailable: ${err instanceof Error ? err.message : 'unknown error'}` }], isError: true };
@@ -435,11 +436,12 @@ async function main(): Promise<void> {
       'Start receiving high-signal events from a worker agent in real time (build results, failures, commits, task progress). Tracking persists until the supervisor session ends or explicit tgcc_untrack. Note: tgcc_send automatically tracks the target worker.',
       {
         agentId: z.string().describe('Worker agent ID to track'),
+        heartbeatMs: z.number().optional().describe('Periodic heartbeat interval in milliseconds (min 30000). Wakes the supervisor with tracked worker status (state, context%, cost). Omit to keep current heartbeat or disable.'),
       },
-      async ({ agentId }) => {
+      async ({ agentId, heartbeatMs }) => {
         const request: McpToolRequest = {
           id: uuidv4(), tool: 'tgcc_track', agentId: AGENT_ID, userId: USER_ID,
-          params: { agentId },
+          params: { agentId, heartbeatMs },
         };
         try {
           const response = await client.sendRequest(request);
@@ -465,6 +467,36 @@ async function main(): Promise<void> {
         try {
           const response = await client.sendRequest(request);
           if (response.success) return { content: [{ type: 'text' as const, text: JSON.stringify(response.result) }] };
+          return { content: [{ type: 'text' as const, text: `Failed: ${response.error}` }], isError: true };
+        } catch (err) {
+          return { content: [{ type: 'text' as const, text: `Bridge unavailable: ${err instanceof Error ? err.message : 'unknown error'}` }], isError: true };
+        }
+      }
+    );
+
+    server.tool(
+      'tgcc_cron',
+      'Manage scheduled cron jobs for worker agents. Use to schedule periodic nudges (e.g. "check training status every 30m") or one-shot reminders.',
+      {
+        action: z.enum(['add', 'list', 'remove', 'trigger']).describe('Action to perform'),
+        agentId: z.string().optional().describe('Target agent ID (required for add)'),
+        message: z.string().optional().describe('Message to send when job fires (required for add)'),
+        every: z.string().optional().describe('Recurring interval, e.g. "30m", "4h"'),
+        at: z.string().optional().describe('One-shot delay, e.g. "20m", "2h", or ISO datetime'),
+        cron: z.string().optional().describe('Raw cron expression, e.g. "*/30 * * * *"'),
+        tz: z.string().optional().describe('IANA timezone, e.g. "America/New_York"'),
+        name: z.string().optional().describe('Human-readable job name (also used as ID slug)'),
+        session: z.enum(['main', 'isolated']).optional().describe('Execution mode (default: main)'),
+        jobId: z.string().optional().describe('Job ID (required for remove/trigger)'),
+      },
+      async ({ action, agentId, message, every, at, cron, tz, name, session, jobId }) => {
+        const request: McpToolRequest = {
+          id: uuidv4(), tool: 'tgcc_cron', agentId: AGENT_ID, userId: USER_ID,
+          params: { action, agentId, message, every, at, cron, tz, name, session, jobId },
+        };
+        try {
+          const response = await client.sendRequest(request);
+          if (response.success) return { content: [{ type: 'text' as const, text: JSON.stringify(response.result, null, 2) }] };
           return { content: [{ type: 'text' as const, text: `Failed: ${response.error}` }], isError: true };
         } catch (err) {
           return { content: [{ type: 'text' as const, text: `Bridge unavailable: ${err instanceof Error ? err.message : 'unknown error'}` }], isError: true };
