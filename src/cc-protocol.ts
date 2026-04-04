@@ -135,7 +135,7 @@ export function createPermissionResponse(
         request_id: requestId,
         response: {
           behavior: 'allow',
-          updatedInput,
+          updatedInput: updatedInput ?? {},
         },
       },
     };
@@ -182,7 +182,17 @@ export interface AssistantThinkingBlock {
   thinking: string;
 }
 
-export type AssistantContentBlock = AssistantTextBlock | AssistantToolUseBlock | AssistantThinkingBlock;
+export interface AssistantRedactedThinkingBlock {
+  type: 'redacted_thinking';
+  redacted_thinking: string;
+}
+
+export interface AssistantSignatureBlock {
+  type: 'signature';
+  signature: string;
+}
+
+export type AssistantContentBlock = AssistantTextBlock | AssistantToolUseBlock | AssistantThinkingBlock | AssistantRedactedThinkingBlock | AssistantSignatureBlock;
 
 export interface AssistantMessage {
   type: 'assistant';
@@ -197,6 +207,7 @@ export interface AssistantMessage {
       output_tokens: number;
       cache_read_input_tokens?: number;
       cache_creation_input_tokens?: number;
+      web_search_requests?: number;
     };
   };
   session_id?: string;
@@ -224,7 +235,7 @@ export interface ToolResultEvent {
 
 export interface ResultEvent {
   type: 'result';
-  subtype: 'success' | 'error' | 'error_max_turns' | 'error_input';
+  subtype: 'success' | 'error' | 'error_max_turns' | 'error_input' | 'error_during_execution';
   is_error: boolean;
   duration_ms?: number;
   duration_api_ms?: number;
@@ -232,6 +243,10 @@ export interface ResultEvent {
   result?: string;
   session_id?: string;
   total_cost_usd?: number;
+  stop_reason?: string | null;
+  errors?: string[];
+  permission_denials?: unknown[];
+  model_usage?: Record<string, unknown>;
   usage?: {
     input_tokens: number;
     output_tokens: number;
@@ -274,10 +289,24 @@ export interface StreamContentBlockStartToolUse {
   content_block: { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> };
 }
 
+export interface StreamContentBlockStartRedactedThinking {
+  type: 'content_block_start';
+  index: number;
+  content_block: { type: 'redacted_thinking'; redacted_thinking: string };
+}
+
+export interface StreamContentBlockStartSignature {
+  type: 'content_block_start';
+  index: number;
+  content_block: { type: 'signature'; signature: string };
+}
+
 export type StreamContentBlockStart =
   | StreamContentBlockStartText
   | StreamContentBlockStartThinking
-  | StreamContentBlockStartToolUse;
+  | StreamContentBlockStartToolUse
+  | StreamContentBlockStartRedactedThinking
+  | StreamContentBlockStartSignature;
 
 export interface StreamTextDelta {
   type: 'content_block_delta';
@@ -297,7 +326,19 @@ export interface StreamInputJsonDelta {
   delta: { type: 'input_json_delta'; partial_json: string };
 }
 
-export type StreamContentBlockDelta = StreamTextDelta | StreamThinkingDelta | StreamInputJsonDelta;
+export interface StreamRedactedThinkingDelta {
+  type: 'content_block_delta';
+  index: number;
+  delta: { type: 'redacted_thinking_delta'; redacted_thinking: string };
+}
+
+export interface StreamSignatureDelta {
+  type: 'content_block_delta';
+  index: number;
+  delta: { type: 'signature_delta'; signature: string };
+}
+
+export type StreamContentBlockDelta = StreamTextDelta | StreamThinkingDelta | StreamInputJsonDelta | StreamRedactedThinkingDelta | StreamSignatureDelta;
 
 export interface StreamContentBlockStop {
   type: 'content_block_stop';
@@ -334,6 +375,16 @@ export interface ApiErrorEvent {
   retryInMs?: number;
   retryAttempt?: number;
   maxRetries?: number;
+  timestamp?: string;
+  uuid?: string;
+}
+
+export interface ApiRetryEvent {
+  type: 'system';
+  subtype: 'api_retry';
+  attempt?: number;
+  max_retries?: number;
+  retry_delay_ms?: number;
   timestamp?: string;
   uuid?: string;
 }
@@ -418,6 +469,7 @@ export type CCOutputEvent =
   | StreamEvent
   | ControlResponse
   | ApiErrorEvent
+  | ApiRetryEvent
   | TaskStartedEvent
   | TaskProgressEvent
   | TaskCompletedEvent

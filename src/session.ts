@@ -1,6 +1,7 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
+import { createHash } from 'node:crypto';
 import type pino from 'pino';
 
 // ── Types ──
@@ -164,13 +165,19 @@ export function getSessionJsonlPath(sessionId: string, repo: string): string {
   return join(homedir(), '.claude', 'projects', slug, `${sessionId}.jsonl`);
 }
 
+const MAX_SLUG_LENGTH = 50;
+
 export function computeProjectSlug(repoPath: string): string {
-  // CC stores at ~/.claude/projects/<slug>/sessions/
-  // Slug is the path with / and . replaced by -
-  return repoPath.replace(/[/.]/g, '-');
+  // Match CC's sanitizePath logic: replace / and . with -, truncate long paths with hash suffix
+  const base = repoPath.replace(/[/.]/g, '-');
+  if (base.length <= MAX_SLUG_LENGTH) return base;
+  const hash = createHash('sha256').update(repoPath).digest('hex').slice(0, 8);
+  return base.slice(0, MAX_SLUG_LENGTH - 9) + '-' + hash;
 }
 
 // ── CC Session Discovery ──
+
+export type SessionEndState = 'completed' | 'interrupted' | 'unknown';
 
 export interface DiscoveredSession {
   id: string;
@@ -179,6 +186,7 @@ export interface DiscoveredSession {
   mtime: Date;
   lineCount: number;
   contextPct: number | null; // percentage of 200k context used
+  endState: SessionEndState;
 }
 
 /**
@@ -203,10 +211,16 @@ export function discoverCCSessions(repo: string, limit = 10): DiscoveredSession[
   const now = Date.now();
   const maxAgeMs = 30 * 24 * 60 * 60 * 1000; // 30 days
 
+  const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
   for (const entry of entries) {
     if (!entry.endsWith('.jsonl')) continue;
     // Skip agent-* sessions (sub-agents)
     if (entry.startsWith('agent-')) continue;
+
+    const id = entry.replace('.jsonl', '');
+    // Validate UUID format (CC only accepts valid UUIDs)
+    if (!UUID_RE.test(id)) continue;
 
     const fullPath = join(projectDir, entry);
     try {
@@ -215,13 +229,16 @@ export function discoverCCSessions(repo: string, limit = 10): DiscoveredSession[
       // Skip too old
       if (now - st.mtimeMs > maxAgeMs) continue;
 
-      const id = entry.replace('.jsonl', '');
+      // Skip sidechain sessions (sub-agent transcript forks)
+      if (isSidechainSession(fullPath)) continue;
+
       const { title, model } = extractSessionMeta(fullPath, st.size);
 
       // Skip sessions with no real user messages
       if (title === 'untitled') continue;
 
       const contextPct = extractContextPct(fullPath, st.size);
+      const endState = getSessionEndState(fullPath, st.size);
 
       results.push({
         id,
@@ -230,6 +247,7 @@ export function discoverCCSessions(repo: string, limit = 10): DiscoveredSession[
         mtime: st.mtime,
         lineCount: countLines(fullPath),
         contextPct,
+        endState,
       });
     } catch {
       continue;
@@ -240,6 +258,20 @@ export function discoverCCSessions(repo: string, limit = 10): DiscoveredSession[
   return results
     .sort((a, b) => b.mtime.getTime() - a.mtime.getTime())
     .slice(0, limit);
+}
+
+function isSidechainSession(jsonlPath: string): boolean {
+  try {
+    const fd = openSync(jsonlPath, 'r');
+    const buf = Buffer.alloc(512);
+    const bytesRead = readSync(fd, buf, 0, 512, 0);
+    closeSync(fd);
+    if (bytesRead === 0) return false;
+    const firstLine = buf.subarray(0, bytesRead).toString('utf-8').split('\n')[0];
+    return firstLine.includes('"isSidechain":true') || firstLine.includes('"isSidechain": true');
+  } catch {
+    return false;
+  }
 }
 
 function extractSessionMeta(jsonlPath: string, fileSize: number): { title: string; model: string | null } {
@@ -331,16 +363,22 @@ function extractTitleFromContent(content: unknown): string {
 }
 
 function truncTitle(text: string): string {
-  // Scan line-by-line, skipping IDE/system XML blocks to find the actual user text.
-  const IDE_OPEN = /^<(ide_\w+|environment_details|system|context)[\s>]/;
-  const IDE_CLOSE = /^<\/(ide_\w+|environment_details|system|context)>/;
+  // Scan line-by-line, skipping IDE/system XML blocks and TGCC-injected preambles
+  // to find the actual user text.
+  const IDE_OPEN = /^<(ide_\w+|environment_details|system|context|system-reminder|heartbeat_rules)[\s>]/;
+  const IDE_CLOSE = /^<\/(ide_\w+|environment_details|system|context|system-reminder|heartbeat_rules)>/;
+  // System-injected bracket preambles from TGCC (worker events, context notices, etc.)
+  const SYSTEM_PREAMBLE = /^\[(Worker events|Context:|From supervisor|From agent )/;
   let skipDepth = 0;
+  let inPreamble = false;
   for (const line of text.split('\n')) {
     const trimmed = line.trim();
-    if (!trimmed) continue;
+    if (!trimmed) { inPreamble = false; continue; } // blank line ends preamble block
     if (IDE_OPEN.test(trimmed)) { skipDepth++; continue; }
     if (IDE_CLOSE.test(trimmed)) { if (skipDepth > 0) skipDepth--; continue; }
     if (skipDepth > 0) continue;
+    if (SYSTEM_PREAMBLE.test(trimmed)) { inPreamble = true; continue; }
+    if (inPreamble) continue; // skip continuation lines of preamble until blank line
     return trimmed.length > 60 ? trimmed.slice(0, 57) + '…' : trimmed;
   }
   return '';
@@ -387,7 +425,10 @@ function extractContextPct(jsonlPath: string, fileSize: number): number | null {
         const model: string = parsed?.message?.model ?? '';
         if (!usage) continue;
         const input = (usage.input_tokens || 0) + (usage.cache_creation_input_tokens || 0) + (usage.cache_read_input_tokens || 0);
-        if (input > 0) return Math.round(input / 200_000 * 100);
+        if (input > 0) {
+          const contextWindow = getModelContextWindow(model);
+          return Math.round(input / contextWindow * 100);
+        }
       } catch {
         continue;
       }
@@ -404,4 +445,44 @@ function countLines(filePath: string): number {
   } catch {
     return 0;
   }
+}
+
+export function getSessionEndState(jsonlPath: string, fileSize: number): SessionEndState {
+  try {
+    const fd = openSync(jsonlPath, 'r');
+    const readSize = Math.min(8192, fileSize);
+    const buf = Buffer.alloc(readSize);
+    readSync(fd, buf, 0, readSize, Math.max(0, fileSize - readSize));
+    closeSync(fd);
+
+    const lines = buf.toString('utf-8').split('\n').filter(l => l.trim());
+    // Walk backwards to find the last user or assistant entry
+    for (let i = lines.length - 1; i >= 0; i--) {
+      try {
+        const start = lines[i].indexOf('{');
+        if (start < 0) continue;
+        const parsed = JSON.parse(lines[i].slice(start));
+        const type = parsed.type;
+        const role = parsed.message?.role;
+
+        if (type === 'assistant' || role === 'assistant') {
+          const stopReason = parsed.message?.stop_reason;
+          return stopReason === 'end_turn' ? 'completed' : 'interrupted';
+        }
+        if (type === 'user' || role === 'user') {
+          return 'interrupted'; // CC never responded
+        }
+      } catch { continue; }
+    }
+  } catch {}
+  return 'unknown';
+}
+
+function getModelContextWindow(model: string): number {
+  if (!model) return 200_000;
+  const m = model.toLowerCase();
+  if (m.includes('opus')) return 200_000;
+  if (m.includes('sonnet')) return 200_000;
+  if (m.includes('haiku')) return 200_000;
+  return 200_000; // Safe default
 }

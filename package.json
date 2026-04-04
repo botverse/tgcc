@@ -48,7 +48,7 @@
     }
   },
   "scripts": {
-    "build": "tsc && tsc -p plugin/tsconfig.json && cp plugin/package.json plugin/openclaw.plugin.json dist/plugin/ && cp -r plugin/skills dist/plugin/",
+    "build": "tsc",
     "dev": "tsx src/service.ts",
     "start": "node dist/service.js",
     "test": "vitest run",
@@ -102,9 +102,7 @@
   },
   "files": [
     "dist",
-    "plugin/openclaw.plugin.json",
-    "README.md",
-    "plugin/skills"
+    "README.md"
   ],
   "publishConfig": {
     "access": "public"

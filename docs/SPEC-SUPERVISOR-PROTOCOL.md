@@ -67,7 +67,13 @@ The supervisor's CC process communicates with the bridge via Unix socket MCP (sa
 
 The supervisor agent's CC instance receives additional MCP tools beyond the standard set. These are registered conditionally in `src/mcp-server.ts` when `TGCC_IS_SUPERVISOR=1`.
 
-### 4.1 Worker Management
+### 4.1 Agent Discovery
+
+#### `tgcc_agents()`
+
+List all registered agents with IDs, repos, models, and current state. Available to all agents — use this to discover available agents before using `tgcc_send` or `tgcc_spawn`.
+
+### 4.2 Worker Management
 
 #### `tgcc_status([agentId])`
 
@@ -110,7 +116,7 @@ Options:
 - `type: 'text' | 'tool' | 'system' | 'error' | 'user'` -- filter by entry type
 - `grep: string` -- filter by regex pattern
 
-### 4.2 Session Management
+### 4.3 Session Management
 
 #### `tgcc_session(agentId, action, [options])`
 
@@ -128,21 +134,27 @@ Manage a worker's session lifecycle without sending a message.
 | `set_repo` | Change the worker's repo and restart | `repo: string` |
 | `set_permissions` | Change permission mode and restart | `mode: 'dangerously-skip' \| 'acceptEdits' \| 'default' \| 'plan'` |
 
-### 4.3 Ephemeral Agents
+### 4.4 Ephemeral Agents
 
 #### `tgcc_spawn([agentId], repo, [options])`
 
 Spawn a temporary agent with a CC process. No Telegram bot -- supervisor only. The agent auto-destroys when its CC session ends or on explicit `tgcc_destroy`.
 
+Three modes:
+1. **Fire & forget**: set `message` — returns immediately, agent runs in background
+2. **Async wake**: use `tgcc_send` after spawn — you get woken when the agent's turn completes with reply context
+3. **Sync (`waitForResult`)**: set `message` + `waitForResult: true` — blocks until agent completes, returns its text output, auto-destroys
+
 Params:
-- `agentId?: string` -- ID for the agent (auto-generated as `eph-<uuid8>` if omitted)
+- `agentId?: string` -- ID for the agent (auto-generated if omitted)
 - `repo: string` -- absolute path to the repository (required)
 - `model?: string` -- model to use (default: sonnet)
 - `message?: string` -- initial prompt sent immediately after spawning
-- `timeoutMs?: number` -- auto-destroy after this many milliseconds
+- `waitForResult?: boolean` -- block until agent completes and return text output (default timeout 120s)
+- `timeoutMs?: number` -- auto-destroy timeout (default 120s for waitForResult)
 - `permissionMode?: string` -- `dangerously-skip`, `acceptEdits`, `default`, or `plan`
 
-Returns: `{ agentId, state: 'spawning' | 'idle', repo, model }`
+Returns: `{ agentId, state: 'spawning' | 'idle', repo, model }` (or text output string if `waitForResult`)
 
 Ephemeral agents:
 - Have no TG bot (`tgBot: null`)
@@ -154,19 +166,46 @@ Ephemeral agents:
 
 Destroy an ephemeral agent. Kills its CC process if running and removes it from the agent registry. Only works on ephemeral agents -- persistent agents cannot be destroyed via this tool.
 
-### 4.4 Worker Tracking
+### 4.5 Worker Tracking
 
-#### `tgcc_track(agentId)`
+#### `tgcc_track(agentId, [heartbeatMs])`
 
 Start receiving high-signal events from a worker in real time via the supervisor's TG chat. Tracking persists until the supervisor session ends or explicit `tgcc_untrack`.
+
+Optional `heartbeatMs` (minimum 30000) enables periodic status snapshots of all tracked workers:
+```
+[heartbeat] saemem: busy, 42% ctx, $7.86, last activity 12s | linds: idle, 18% ctx, $0.18, last activity 3m
+```
+
+Heartbeat ticks are suppressed when the supervisor is mid-turn to avoid stale queued snapshots.
 
 Note: `tgcc_send` automatically tracks the target worker. `tgcc_track` is for passive observation without sending a message.
 
 #### `tgcc_untrack(agentId)`
 
-Stop receiving real-time TG notifications for a worker. Events are still queued in the supervisor event queue and delivered when the supervisor's next CC turn starts.
+Stop receiving real-time TG notifications for a worker. Events are still queued in the supervisor event queue and delivered when the supervisor's next CC turn starts. If this was the last tracked worker, heartbeat is stopped.
 
-### 4.5 Common Tools (Available to All Agents)
+### 4.6 Scheduling
+
+#### `tgcc_cron(action, [options])`
+
+Manage cron jobs at runtime. Jobs persist to `~/.config/tgcc/cron-jobs.json`.
+
+| Action | Description | Required params |
+|--------|-------------|-----------------|
+| `add` | Create a new job | `agentId`, `message`, one of: `every`, `at`, `cron` |
+| `list` | List all jobs (static + dynamic) sorted by next run | -- |
+| `remove` | Remove a dynamic job | `jobId` |
+| `trigger` | Fire a job immediately | `jobId` |
+
+Schedule params (mutually exclusive for `add`):
+- `every: string` — recurring interval (e.g. `"30m"`, `"4h"`)
+- `at: string` — one-shot delay or datetime (e.g. `"20m"`, `"2h"`, ISO string). Sets `deleteAfterRun: true`.
+- `cron: string` — raw cron expression (e.g. `"*/30 * * * *"`)
+
+Optional: `name` (slugified to job ID), `tz` (IANA timezone), `session` (`main` | `isolated`), `announce` (TG message on fire, default true).
+
+### 4.7 Common Tools (Available to All Agents)
 
 These are not supervisor-specific but are part of the protocol:
 
@@ -185,7 +224,7 @@ The `HighSignalDetector` (in `src/high-signal.ts`) watches CC stream events and 
 | `build_result` | Build/test command completes (npm, tsc, jest, etc.) | `🔨` |
 | `git_commit` | `git commit` detected in Bash output | `📝` |
 | `context_pressure` | Token usage crosses 50/75/90% of 200k window | `🧠` |
-| `subagent_spawn` | CC uses Task/dispatch_agent/create_agent tool | `🔄` |
+| `subagent_spawn` | CC uses Agent/Task/SendMessage/TeamCreate tool | `🔄` |
 | `failure_loop` | 3+ consecutive tool failures | `🔁` |
 | `task_milestone` | TodoWrite call with progress update | `📋` |
 | `stuck` | No CC output for 5 minutes | `⚠️` |
@@ -203,8 +242,6 @@ HighSignalDetector.handleToolResult()
     ├── pushEventBuffer() → per-agent EventBuffer (ring buffer)
     │
     └── emitSupervisorEvent()
-            │
-            ├── External supervisor (OpenClaw) → sendToSupervisor() [if subscribed]
             │
             └── Native supervisor queue
                     │
@@ -261,31 +298,35 @@ The supervisor does not receive events about itself. `pushSupervisorEvent` is a 
 
 ## 6. Access Control
 
-All `tgcc_*` tools are gated in `handleMcpToolRequest`:
+`tgcc_*` tools use a two-tier permission model in `handleMcpToolRequest`:
 
-```typescript
-if (request.agentId !== this.nativeSupervisorId && !isInternalCaller) {
-  return { error: 'Only the supervisor agent may use tgcc_* tools' };
-}
-```
+### Tier 1: All agents (workers + supervisor)
 
-Internal callers (`userId === 'cron'` or `userId === 'system'`) bypass this check, allowing cron jobs and system-level operations to use supervisor tools.
+These tools are available to every CC process, allowing workers to discover agents, check status, communicate, and spawn ephemeral sub-agents:
 
-Workers cannot call `tgcc_*` tools. They can only communicate upward via `notify_parent`.
+- `tgcc_agents` — list registered agents
+- `tgcc_status` — get worker status
+- `tgcc_send` — send messages to other agents
+- `tgcc_log` — read event logs
+- `tgcc_spawn` — spawn ephemeral agents (supports `waitForResult` for synchronous delegation)
+- `tgcc_destroy` — destroy own ephemeral spawns
 
-## 7. External Supervisor (Legacy)
+### Tier 2: Supervisor only
 
-The bridge also supports an external supervisor protocol for OpenClaw integration. This uses a Unix socket connection where an external process registers as supervisor and exchanges NDJSON commands/events. Both native and external supervisors can coexist: events are routed to both when active.
+These tools are restricted to the supervisor agent ID and internal callers (`userId === 'cron'` or `userId === 'system'`):
 
-The external supervisor path uses `this.supervisorWrite`, `supervisorSubscriptions`, and `supervisorPendingRequests` -- separate from the native supervisor machinery. This is a legacy path; the native supervisor model described in this document is the primary architecture.
+- `tgcc_kill` — kill any agent's CC process
+- `tgcc_session` — session lifecycle management
+- `tgcc_cron` — scheduling (add/list/remove/trigger)
+- `tgcc_track` / `tgcc_untrack` — real-time event tracking with optional heartbeat
 
-## 8. Key Implementation Files
+## 7. Key Implementation Files
 
 | File | Role |
 |------|------|
 | `src/config.ts` | `TgccConfig.supervisor` field, validation |
-| `src/mcp-server.ts` | MCP tool definitions, `IS_SUPERVISOR` conditional registration |
-| `src/bridge.ts` | `handleMcpToolRequest` routing, `pushSupervisorEvent`, `sendSupervisorMessage`, event queue, tracked workers |
+| `src/mcp-server.ts` | MCP tool definitions, two-tier registration (all-agent + supervisor-only) |
+| `src/bridge.ts` | `handleMcpToolRequest` routing, `pushSupervisorEvent`, event queue, tracked workers |
 | `src/high-signal.ts` | `HighSignalDetector` -- stream event analysis, structured event emission |
 | `src/event-dedup.ts` | `EventDedup` -- batching and deduplication before supervisor queue |
 | `src/cc-process.ts` | MCP config generation, `TGCC_IS_SUPERVISOR` env var injection |

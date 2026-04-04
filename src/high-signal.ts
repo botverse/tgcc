@@ -62,7 +62,7 @@ interface AgentState {
 
 const BUILD_TEST_PATTERNS = /\b(npm run build|npm run test|npx tsc|tsc\b|jest\b|vitest\b|pytest\b|cargo test|go test|make\b|npm test|yarn build|yarn test|pnpm build|pnpm test)\b/i;
 const GIT_COMMIT_PATTERN = /\bgit commit\b/i;
-const SUBAGENT_TOOLS = new Set(['Task', 'dispatch_agent', 'create_agent', 'AgentRunner']);
+const SUBAGENT_TOOLS = new Set(['Agent', 'Task', 'SendMessage', 'TeamCreate']);
 const TODO_TOOLS = new Set(['TodoWrite', 'TodoRead']);
 const BASH_TOOLS = new Set(['Bash', 'shell']);
 

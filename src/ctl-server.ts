@@ -169,7 +169,11 @@ export class CtlServer {
         }
         case 'register_supervisor': {
           const regReq = request as unknown as { agentId?: string; capabilities?: string[] };
-          const resolvedId = regReq.agentId ?? this.defaultSupervisorId ?? 'unknown';
+          const resolvedId = regReq.agentId ?? this.defaultSupervisorId;
+          if (!resolvedId) {
+            socket.write(JSON.stringify({ type: 'error', message: 'No agentId provided and no default supervisor configured' } satisfies CtlErrorResponse) + '\n');
+            return;
+          }
           const writeFn = (data: string) => { try { socket.write(data); } catch {} };
           this.handler.registerSupervisor(resolvedId, regReq.capabilities ?? [], writeFn);
           this.supervisorSocket = socket;

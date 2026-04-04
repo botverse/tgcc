@@ -15,10 +15,9 @@
 
 TGCC emits all observability events natively through `pushSupervisorEvent()` in `bridge.ts` and the `HighSignalDetector` class in `high-signal.ts`. Events are routed to:
 
-1. **Native supervisor event queue** — an in-memory queue (`supervisorEventQueue`) drained into the supervisor agent's next message. Any supervisor agent that reads this queue receives the events; there is no dependency on a specific consumer implementation.
-2. **External supervisor protocol** — events are also forwarded via `sendToSupervisor()` to any external consumer connected through the stdin/stdout supervisor wire protocol (subscribe per agent/session).
-3. **Telegram chat** — tracked workers' events are forwarded to the supervisor's TG chat in real time.
-4. **EventBuffer** — per-agent ring buffer for pull-based log access via `tgcc_log`.
+1. **Native supervisor event queue** — an in-memory queue (`supervisorEventQueue`) drained into the supervisor agent's next message. Any supervisor agent that reads this queue receives the events.
+2. **Telegram chat** — tracked workers' events are forwarded to the supervisor's TG chat in real time.
+3. **EventBuffer** — per-agent ring buffer for pull-based log access via `tgcc_log`.
 
 The `EventDedup` layer batches and deduplicates noisy events (e.g. consecutive git commits) before they reach the queue.
 
@@ -38,7 +37,7 @@ Only inject into the supervisor's context when something needs attention:
 | Build/test result | Build or test pass/fail (highest signal for "is it done?") | ~30-50 tokens |
 | Git commit | CC committed — message is a natural progress summary | ~30-50 tokens |
 | Context pressure | Context window at 50%, 75%, 90% — quality may degrade | ~20 tokens |
-| Sub-agent spawn | CC used Task tool to spawn sub-agents | ~30 tokens |
+| Sub-agent spawn | CC used Agent/Task/SendMessage/TeamCreate tool | ~30 tokens |
 | Failure loop | 3+ consecutive tool failures (CC is stuck) | ~50 tokens |
 | CC message | CC used `notify_parent` MCP tool | Variable |
 
@@ -78,8 +77,8 @@ Events emitted by the detector:
 // Context pressure (from message_start usage stats)
 {"type":"event", "event":"context_pressure", "agentId":"worker-1", "percent":75, "tokens":150000}
 
-// Sub-agent spawn (Task/dispatch_agent/create_agent/AgentRunner tool use)
-{"type":"event", "event":"subagent_spawn", "agentId":"worker-1", "count":1, "toolName":"Task", "label":"refactor auth module"}
+// Sub-agent spawn (Agent/Task/SendMessage/TeamCreate tool use)
+{"type":"event", "event":"subagent_spawn", "agentId":"worker-1", "count":1, "toolName":"Agent", "label":"refactor auth module"}
 
 // Failure loop (3+ consecutive tool failures)
 {"type":"event", "event":"failure_loop", "agentId":"worker-1", "consecutiveFailures":3, "lastTool":"Bash", "lastError":"exit code 1"}
@@ -234,7 +233,7 @@ CC uses notify_parent("Build fails, should I install dep X?", priority="question
 | Build/test result detection | Done | Bash exit code + keyword pattern matching |
 | Git commit detection | Done | Bash tool with git commit command |
 | Context pressure tracking | Done | From `message_start` usage stats |
-| Sub-agent spawn detection | Done | Task/dispatch_agent/create_agent/AgentRunner tool use |
+| Sub-agent spawn detection | Done | Agent/Task/SendMessage/TeamCreate tool use |
 | Failure loop detection | Done | 3+ consecutive tool failures |
 | Task milestone detection | Done | TodoWrite tool use parsing |
 | `notify_parent` MCP tool | Done | Routes to queue + TG chat |

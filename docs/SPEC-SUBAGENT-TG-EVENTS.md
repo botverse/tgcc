@@ -66,7 +66,7 @@ Target:
 
 ### 1. Fix `formatProgressLine` — show tool name
 
-`streaming.ts:1292` — **DONE**: now falls through to `lastToolName` when `description` is empty:
+`streaming.ts:1381` — **DONE**: now falls through to `lastToolName` when `description` is empty:
 
 ```ts
 // Current implementation (streaming.ts:1292)
@@ -91,11 +91,11 @@ export function formatProgressLine(description: string, lastToolName?: string): 
 }
 ```
 
-This also affects the `appendSubAgentProgress` path in `StreamAccumulator` (`streaming.ts:688`, same function).
+This also affects the `appendSubAgentProgress` path in `StreamAccumulator` (`streaming.ts:749`, same function).
 
 ### 2. Route `subagent_spawn` to supervisor — DONE
 
-`bridge.ts:256` — `subagent_spawn` is now included in `ROUTED_EVENTS`:
+`bridge.ts:283` — `subagent_spawn` is now included in `ROUTED_EVENTS`:
 ```ts
 const ROUTED_EVENTS = new Set([
   'failure_loop', 'stuck', 'task_milestone', 'build_result', 'git_commit',

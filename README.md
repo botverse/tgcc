@@ -10,10 +10,10 @@ Claude Code is powerful but lives in a terminal. TGCC gives it a **shared, visib
 
 **What TGCC does**: Each CC session gets a Telegram bot that streams output in real-time — thinking, tool use, code edits — all in a single updating message. Multiple sources can share the same CC process:
 
-- Your **OpenClaw agent** delegates a coding task via the supervisor protocol
+- A **supervisor agent** delegates tasks to workers via MCP tools
 - **You** watch it work in Telegram from your phone
 - You can **jump in** mid-session to steer, approve permissions, or add context
-- The agent gets the **result back** automatically when CC finishes
+- Workers can **spawn ephemeral sub-agents** and get results back synchronously
 
 This turns Claude Code from a black-box subprocess into a **collaborative workspace** between humans and AI agents.
 
@@ -41,7 +41,7 @@ TGCC bridges the [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-cod
 - **Markdown → Telegram HTML** — code blocks, bold, italic, links, tables, all rendered properly
 - **Usage stats** — per-turn token counts and cost
 - **Scheduling** — cron jobs and heartbeats: run prompts on a schedule, one-shot timers, dynamic job management from Telegram
-- **Supervisor protocol** — external orchestrators (e.g. OpenClaw) can send messages, subscribe to events, and share the same CC process via Unix socket
+- **Supervisor protocol** — a designated supervisor agent manages workers via MCP tools, receives high-signal events, and coordinates multi-agent workflows
 
 ## Architecture
 
@@ -50,7 +50,7 @@ Telegram ──► TGCC Bridge ──► Claude Code CLI (stream-json)
                  │
 CLI (ctl) ───────┤
                  │
-Supervisor ──────┘ (Unix socket, NDJSON)
+MCP Server ──────┘ (Unix socket, per-agent)
 ```
 
 ### Agent Model
@@ -66,26 +66,27 @@ Agents don't know about users. `allowedUsers` is a system-level ACL that gates w
 
 ### Supervisor Protocol
 
-External systems connect to TGCC's control socket (`/tmp/tgcc/ctl/tgcc.sock`) and register as a supervisor. They can then:
+One agent is designated as the **supervisor** via config. It gets additional MCP tools to manage workers:
 
-- **`send_message`** — send a message to any agent's CC process (spawns if needed)
-- **`send_to_cc`** — write directly to an active CC process's stdin
-- **`subscribe`** / **`unsubscribe`** — observe an agent's events
-- **`status`** — list all agents, their state, and active processes
-- **`kill_cc`** — terminate an agent's CC process
+- **`tgcc_agents`** — discover all registered agents
+- **`tgcc_send`** — send a message/task to any worker (spawns CC if needed, auto-tracks)
+- **`tgcc_status`** — get worker state, context %, cost, last activity
+- **`tgcc_kill`** — terminate a worker's CC process
+- **`tgcc_session`** — full session lifecycle (list, new, resume, compact, set_model, set_repo, set_permissions)
+- **`tgcc_track`** / **`tgcc_untrack`** — real-time event notifications with optional heartbeat
+- **`tgcc_cron`** — runtime cron job management (add/list/remove/trigger)
 
-Events forwarded to subscribers: `result`, `session_takeover`, `process_exit`, `cc_spawned`, `state_changed`, `bridge_started`, plus all observability events.
-
-When a supervisor sends a message to a persistent agent, a system notification (`🦞 OpenClaw: ...`) appears in the Telegram chat.
+All agents (not just supervisor) can use `tgcc_agents`, `tgcc_status`, `tgcc_send`, `tgcc_log`, `tgcc_spawn`, and `tgcc_destroy` — enabling workers to spawn ephemeral sub-agents and coordinate with each other.
 
 ### Ephemeral Agents
 
-Supervisors can create temporary agents for one-off tasks — no Telegram bot needed:
+Any agent can spawn temporary agents via `tgcc_spawn` — no Telegram bot needed:
 
-- **`create_agent`** — create an in-memory agent with a repo and model
-- **`destroy_agent`** — tear down when the task is done
+- **Fire & forget** — spawn with a message, returns immediately
+- **Async wake** — use `tgcc_send` after spawn, get woken when the agent's turn completes
+- **Sync (`waitForResult`)** — blocks until the ephemeral agent finishes, returns text output, auto-destroys
 
-Ephemeral agents auto-destroy on timeout. Only the supervisor can interact with them.
+Ephemeral agents auto-destroy on timeout or session end.
 
 ### Observability
 
@@ -112,82 +113,22 @@ Every CC process gets these built-in MCP tools:
 - **`supervisor_exec`** — request command execution on the host
 - **`supervisor_notify`** — send a notification through the supervisor
 
-The supervisor agent's CC process also gets these additional tools:
+All agents also get these coordination tools:
 
-- **`tgcc_status`** — get status of worker agents (state, context%, last activity)
+- **`tgcc_agents`** — list all registered agents with IDs, repos, models, state
+- **`tgcc_status`** — get status of worker agents (state, context%, cost, last activity)
 - **`tgcc_send`** — send a message/task to a worker agent (spawns CC if needed)
-- **`tgcc_kill`** — kill a worker agent's CC process
 - **`tgcc_log`** — read the event log for a worker agent
-- **`tgcc_session`** — manage a worker agent's session lifecycle (actions: `list`, `new`, `cancel`, `set_model`, `continue`, `resume`, `compact`, `set_repo`, `set_permissions`)
-- **`tgcc_spawn`** — spawn an ephemeral agent with a CC process (no Telegram bot)
+- **`tgcc_spawn`** — spawn an ephemeral agent (supports fire-and-forget, async wake, and sync `waitForResult`)
 - **`tgcc_destroy`** — destroy an ephemeral agent
-- **`tgcc_track`** — start receiving high-signal events from a worker in real time
-- **`tgcc_untrack`** — stop receiving real-time events from a worker
 
-See [`docs/SPEC-SUPERVISOR-PROTOCOL.md`](docs/SPEC-SUPERVISOR-PROTOCOL.md) for the full protocol spec.
-See [`docs/SPEC-SUBAGENT-OBSERVABILITY.md`](docs/SPEC-SUBAGENT-OBSERVABILITY.md) for the observability spec.
+The supervisor agent additionally gets:
 
+- **`tgcc_kill`** — kill a worker agent's CC process
+- **`tgcc_session`** — manage session lifecycle (`list`, `new`, `cancel`, `set_model`, `continue`, `resume`, `compact`, `set_repo`, `set_permissions`)
+- **`tgcc_track`** / **`tgcc_untrack`** — real-time high-signal event tracking with optional heartbeat
+- **`tgcc_cron`** — runtime cron job management (add/list/remove/trigger)
 
-## OpenClaw Plugin
-
-TGCC ships an **OpenClaw community plugin** that gives your OpenClaw agents direct access to TGCC-managed Claude Code sessions.
-
-### Install
-
-```bash
-openclaw plugins install @fonz/tgcc
-```
-
-### Configure
-
-Add to your OpenClaw config (`~/.openclaw/openclaw.json`):
-
-```json
-{
-  "plugins": {
-    "entries": {
-      "tgcc": {
-        "enabled": true,
-        "config": {
-          "socketDir": "/tmp/tgcc/ctl",
-          "defaultAgent": "tgcc",
-          "telegramChatId": "your-chat-id"
-        }
-      }
-    }
-  }
-}
-```
-
-### Tools
-
-The plugin registers four agent tools:
-
-| Tool | Description |
-|------|-------------|
-| `tgcc_status` | List agents, check state, view pending results and events |
-| `tgcc_spawn` | Start a CC session (existing or ephemeral agent) |
-| `tgcc_send` | Send a message to an active agent |
-| `tgcc_kill` | Kill a CC process or destroy an ephemeral agent |
-
-### Example
-
-```
-# From your OpenClaw agent:
-tgcc_spawn agentId="tgcc" task="Fix the render pipeline"
-tgcc_status                    # check progress
-tgcc_send agentId="tgcc" text="Also run the tests"
-tgcc_kill agentId="tgcc"      # done
-```
-
-Ephemeral agents for isolated work:
-
-```
-tgcc_spawn agentId="pr-42" repo="/tmp/pr-42" task="Review this PR" model="opus"
-tgcc_kill agentId="pr-42" destroy=true
-```
-
-The plugin also ships a **skill** (`tgcc-agents`) that teaches OpenClaw agents how to use these tools effectively.
 
 ## Service Management
 

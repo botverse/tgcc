@@ -237,6 +237,10 @@ export class Bridge extends EventEmitter implements CtlHandler {
   private static readonly SUPERVISOR_QUEUE_MAX = 20;
   /** Workers whose high-signal events are forwarded to the supervisor's TG chat in real time. */
   private trackedWorkers = new Set<string>();
+  private pendingWaitForResult = new Map<string, {
+    resolve: (response: McpToolResponse) => void;
+    timer: ReturnType<typeof setTimeout>;
+  }>();
   /** Periodic heartbeat timer that wakes the supervisor with tracked worker status. */
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private heartbeatIntervalMs = 0;
@@ -390,7 +394,10 @@ export class Bridge extends EventEmitter implements CtlHandler {
   private sendSupervisorMessage(agentId: string, text: string, fromAgentId: string): void {
     const agent = this.agents.get(agentId);
     if (!agent) return;
-    const labeledText = `[From supervisor ${fromAgentId}]: ${text}`;
+    const label = fromAgentId === this.nativeSupervisorId
+      ? `[From supervisor]`
+      : `[From agent ${fromAgentId}]`;
+    const labeledText = `${label}: ${text}`;
     this.sendToCC(agentId, { text: labeledText }, { spawnSource: 'supervisor' });
     agent.supervisorWakeOnComplete = true;
     agent.lastSupervisorSentText = text;
@@ -538,6 +545,52 @@ export class Bridge extends EventEmitter implements CtlHandler {
       agents: Object.keys(this.config.agents),
       uptime: 0,
     });
+
+    // Auto-resume sessions from before the restart
+    this.autoResumeSessions();
+  }
+
+  /**
+   * Auto-resume sessions for all agents after a TGCC restart.
+   * For each agent, finds the most recent session and:
+   * - If it ended cleanly: sets pendingSessionId so next interaction resumes it
+   * - If it was interrupted mid-turn: sets pendingSessionId AND sends a nudge to continue
+   */
+  private autoResumeSessions(): void {
+    const STALE_MS = 2 * 60 * 60 * 1000; // 2 hours — same as spawn logic
+    const now = Date.now();
+
+    for (const [agentId, agent] of this.agents) {
+      if (agent.ephemeral) continue;
+      if (!agent.repo) continue;
+
+      try {
+        const sessions = discoverCCSessions(agent.repo, 1);
+        if (sessions.length === 0) continue;
+
+        const session = sessions[0];
+        const ageMs = now - session.mtime.getTime();
+        if (ageMs > STALE_MS) {
+          this.logger.info({ agentId, sessionId: session.id, ageMs }, 'Skipping auto-resume — session too old');
+          continue;
+        }
+
+        // Set up session resume for next interaction
+        agent.pendingSessionId = session.id;
+        agent.forceNewSession = false;
+
+        this.logger.info({ agentId, sessionId: session.id, endState: session.endState, ageMs }, 'Auto-resume: session prepared');
+
+        if (session.endState === 'interrupted') {
+          this.logger.info({ agentId, sessionId: session.id }, 'Auto-resume: sending nudge for interrupted session');
+          this.sendToCC(agentId, {
+            text: '[System] TGCC restarted while you were mid-turn. Your previous session has been resumed. Continue where you left off.',
+          });
+        }
+      } catch (err) {
+        this.logger.error({ err, agentId }, 'Auto-resume failed for agent');
+      }
+    }
   }
 
   private async startAgent(agentId: string, agentConfig: AgentConfig): Promise<void> {
@@ -1305,11 +1358,8 @@ ${hbContent}`;
             const toolBlock = block as { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> };
             this.highSignalDetector.handleAssistantToolUse(agentId, toolBlock.name, toolBlock.id, toolBlock.input);
 
-            if (toolBlock.name === 'AskUserQuestion') {
-              // AskUserQuestion is auto-rejected by CC in headless mode — skip keyboard UI entirely.
-            } else if (toolBlock.name === 'ExitPlanMode') {
-              // ExitPlanMode is auto-rejected by CC in headless mode — skip keyboard UI entirely.
-            }
+            // AskUserQuestion and ExitPlanMode are handled via can_use_tool control_request
+            // (--permission-prompt-tool stdio), not here in the tool_use block.
           }
         }
       }
@@ -1370,18 +1420,49 @@ ${hbContent}`;
 
       const permChatId = this.getAgentChatId(agent);
 
-      const toolName = escapeHtml(req.tool_name);
-      const inputPreview = req.input
-        ? escapeHtml(JSON.stringify(req.input).slice(0, 200))
-        : '';
-      const text = inputPreview
-        ? `🔐 CC wants to use <code>${toolName}</code>\n<pre>${inputPreview}</pre>`
-        : `🔐 CC wants to use <code>${toolName}</code>`;
-      const keyboard = new InlineKeyboard()
-        .text('✅ Allow', `perm_allow:${requestId}`)
-        .text('❌ Deny', `perm_deny:${requestId}`)
-        .text('✅ Allow All', `perm_allow_all:${agentId}`);
-      if (permChatId && agent.tgBot) {
+      if (req.tool_name === 'AskUserQuestion' && permChatId && agent.tgBot) {
+        // Show interactive question UI instead of generic Allow/Deny
+        // Flush current bubble first so the question appears after the assistant text
+        const flushAndSend = async () => {
+          if (agent.accumulator) {
+            await agent.accumulator.flushIfDirty();
+            agent.accumulator.reset();
+          }
+          const questions = (req.input?.questions ?? []) as AskQuestion[];
+          pending.questionAnswers = {};
+          const { text, keyboard } = buildAskUi(requestId, questions, {});
+          const msgId = await agent.tgBot!.sendTextWithKeyboard(permChatId, text, keyboard, 'HTML');
+          pending.questionMsgId = msgId;
+          pending.questionChatId = permChatId;
+        };
+        flushAndSend().catch(err => this.logger.error({ err }, 'Failed to send AskUserQuestion UI'));
+      } else if (req.tool_name === 'ExitPlanMode' && permChatId && agent.tgBot) {
+        // Show plan approval UI — flush current bubble first so it appears in correct order
+        const flushAndSendPlan = async () => {
+          if (agent.accumulator) {
+            await agent.accumulator.flushIfDirty();
+            agent.accumulator.reset();
+          }
+          const planText = '📋 CC wants to exit plan mode and start implementing.';
+          const keyboard = new InlineKeyboard()
+            .text('✅ Approve', `perm_allow:${requestId}`)
+            .text('❌ Reject', `perm_deny:${requestId}`);
+          await agent.tgBot!.sendTextWithKeyboard(permChatId, planText, keyboard, 'HTML');
+        };
+        flushAndSendPlan().catch(err => this.logger.error({ err }, 'Failed to send ExitPlanMode UI'));
+      } else if (permChatId && agent.tgBot) {
+        // Generic permission prompt
+        const toolName = escapeHtml(req.tool_name);
+        const inputPreview = req.input
+          ? escapeHtml(JSON.stringify(req.input).slice(0, 200))
+          : '';
+        const text = inputPreview
+          ? `🔐 CC wants to use <code>${toolName}</code>\n<pre>${inputPreview}</pre>`
+          : `🔐 CC wants to use <code>${toolName}</code>`;
+        const keyboard = new InlineKeyboard()
+          .text('✅ Allow', `perm_allow:${requestId}`)
+          .text('❌ Deny', `perm_deny:${requestId}`)
+          .text('✅ Allow All', `perm_allow_all:${agentId}`);
         agent.tgBot.sendTextWithKeyboard(permChatId, text, keyboard, 'HTML')
           .catch(err => this.logger.error({ err }, 'Failed to send permission request'));
       }
@@ -1465,7 +1546,9 @@ ${hbContent}`;
     });
 
     proc.on('exit', () => {
-      agent.eventBuffer.push({ ts: Date.now(), type: 'system', text: 'Process exited' });
+      const wasActive = proc.stateBeforeExit === 'active';
+      const wasKilledByUs = proc.killedBeforeExit;
+      agent.eventBuffer.push({ ts: Date.now(), type: 'system', text: wasActive ? 'Process died mid-turn' : 'Process exited' });
       this.highSignalDetector.cleanup(agentId);
       this.eventDedup.cleanup(agentId);
 
@@ -1473,6 +1556,17 @@ ${hbContent}`;
       if (agentId === this.nativeSupervisorId) {
         this.trackedWorkers.clear();
         this.stopHeartbeat();
+      }
+
+      // Notify TG about process exit (skip ephemeral agents and user-initiated kills like /new)
+      const chatId = this.getAgentChatId(agent);
+      if (chatId && agent.tgBot && !agent.ephemeral && !wasKilledByUs) {
+        const msg = wasActive
+          ? 'Session ended unexpectedly (process exited mid-turn). Next message starts a new session.'
+          : 'Session ended. Next message starts a new session — use /sessions to resume a previous one.';
+        const msgType = wasActive ? 'error' : 'status';
+        agent.tgBot.sendText(chatId, formatSystemMessage(msgType, msg), 'HTML', true)
+          .catch(err => this.logger.error({ err }, 'Failed to send process exit notification'));
       }
 
       // Forward to supervisor (unless suppressed by takeover)
@@ -1484,7 +1578,7 @@ ${hbContent}`;
         }
         // Native supervisor: notify if worker is tracked
         if (this.trackedWorkers.has(agentId)) {
-          this.pushSupervisorEvent(agentId, `💀 Process exited`);
+          this.pushSupervisorEvent(agentId, wasActive ? `💀 Process died mid-turn` : `💀 Process exited`);
         }
       }
 
@@ -1612,6 +1706,22 @@ ${hbContent}`;
     const agent = this.agents.get(agentId);
     if (!agent) return;
 
+    // waitForResult: resolve the pending promise and auto-destroy
+    const pendingWait = this.pendingWaitForResult.get(agentId);
+    if (pendingWait) {
+      this.pendingWaitForResult.delete(agentId);
+      clearTimeout(pendingWait.timer);
+      const resultText = typeof event.result === 'string' ? event.result : null;
+      pendingWait.resolve({
+        id: '',
+        success: !event.is_error,
+        result: { agentId, result: resultText },
+        ...(event.is_error ? { error: resultText || 'Agent returned an error' } : {}),
+      });
+      this.destroyEphemeralAgent(agentId);
+      return;
+    }
+
     // Muted turn (heartbeat or supervisor wake) — skip TG rendering
     if (agent.muteOutput) {
       agent.muteOutput = false;
@@ -1686,8 +1796,12 @@ ${hbContent}`;
     this.drainDeferredSends(agentId);
 
     // Handle errors (only send to TG if bot available)
-    if (event.is_error && event.result && chatId && agent.tgBot) {
-      agent.tgBot!.sendText(chatId, formatSystemMessage('error', escapeHtml(String(event.result))), 'HTML', true) // silent
+    if (event.is_error && chatId && agent.tgBot) {
+      // Capture diagnostic errors from error_during_execution subtype
+      const errorDetails = event.errors?.length
+        ? event.errors.join('\n')
+        : String(event.result || 'Unknown error');
+      agent.tgBot!.sendText(chatId, formatSystemMessage('error', escapeHtml(errorDetails)), 'HTML', true) // silent
         .catch(err => this.logger.error({ err }, 'Failed to send result error notification'));
     }
 
@@ -2827,20 +2941,44 @@ ${hbContent}`;
         }
       }
 
-      // ── Native supervisor tools ──
+      // ── Agent orchestration tools (two-tier permissions) ──
 
-      if (request.tool === 'tgcc_status' || request.tool === 'tgcc_send' ||
-          request.tool === 'tgcc_kill' || request.tool === 'tgcc_log' || request.tool === 'tgcc_session' ||
-          request.tool === 'tgcc_spawn' || request.tool === 'tgcc_destroy' ||
-          request.tool === 'tgcc_track' || request.tool === 'tgcc_untrack' ||
-          request.tool === 'tgcc_cron') {
-        // Allow supervisor agent and internal callers (cron, system)
+      const workerAllowedTools = new Set([
+        'tgcc_agents', 'tgcc_spawn', 'tgcc_send', 'tgcc_status', 'tgcc_log', 'tgcc_destroy',
+      ]);
+      const supervisorOnlyTools = new Set([
+        'tgcc_kill', 'tgcc_session', 'tgcc_cron', 'tgcc_track', 'tgcc_untrack',
+      ]);
+
+      if (workerAllowedTools.has(request.tool) || supervisorOnlyTools.has(request.tool)) {
         const isInternalCaller = request.userId === 'cron' || request.userId === 'system';
-        if (request.agentId !== this.nativeSupervisorId && !isInternalCaller) {
-          return { id: request.id, success: false, error: 'Only the supervisor agent may use tgcc_* tools' };
+        // Supervisor-only tools: reject non-supervisor callers
+        if (supervisorOnlyTools.has(request.tool) &&
+            request.agentId !== this.nativeSupervisorId && !isInternalCaller) {
+          return { id: request.id, success: false, error: 'Only the supervisor may use this tool' };
+        }
+        // Worker-allowed tools: verify calling agent exists
+        if (workerAllowedTools.has(request.tool) &&
+            !this.agents.has(request.agentId) && !isInternalCaller) {
+          return { id: request.id, success: false, error: 'Unknown calling agent' };
         }
 
         switch (request.tool) {
+          case 'tgcc_agents': {
+            const agents = [];
+            for (const [aid, a] of this.agents) {
+              agents.push({
+                id: aid,
+                repo: a.repo,
+                model: a.model,
+                state: a.ccProcess?.state ?? 'idle',
+                ephemeral: a.ephemeral,
+                isSupervisor: aid === this.nativeSupervisorId,
+              });
+            }
+            return { id: request.id, success: true, result: agents };
+          }
+
           case 'tgcc_status': {
             const targetId = request.params.agentId as string | undefined;
             const result: Record<string, unknown> = {};
@@ -3072,6 +3210,39 @@ ${hbContent}`;
 
             // If an initial message was provided, send it immediately
             const message = request.params.message as string | undefined;
+            const waitForResult = request.params.waitForResult as boolean | undefined;
+
+            if (waitForResult) {
+              if (!message) {
+                this.destroyEphemeralAgent(spawnAgentId);
+                return { id: request.id, success: false, error: 'waitForResult requires a message' };
+              }
+
+              // Mute TG output — result goes to caller, not Telegram
+              instance.muteOutput = true;
+
+              // Clear auto-destroy timer — waitForResult timer handles lifecycle
+              if (instance.destroyTimer) { clearTimeout(instance.destroyTimer); instance.destroyTimer = null; }
+
+              const effectiveTimeout = timeoutMs || 120_000;
+
+              // Send the message to start the agent
+              this.sendSupervisorMessage(spawnAgentId, message, request.agentId);
+
+              return new Promise<McpToolResponse>((resolve) => {
+                const timer = setTimeout(() => {
+                  this.pendingWaitForResult.delete(spawnAgentId);
+                  this.destroyEphemeralAgent(spawnAgentId);
+                  resolve({ id: request.id, success: false, error: `waitForResult timed out after ${effectiveTimeout}ms` });
+                }, effectiveTimeout);
+
+                this.pendingWaitForResult.set(spawnAgentId, {
+                  resolve: (response) => resolve({ ...response, id: request.id }),
+                  timer,
+                });
+              });
+            }
+
             if (message) {
               this.sendSupervisorMessage(spawnAgentId, message, request.agentId);
             }
@@ -3801,7 +3972,7 @@ function buildAskUi(
   questions: AskQuestion[],
   answers: Record<string, string[]>,
 ): { text: string; keyboard: InlineKeyboard } {
-  const lines: string[] = ['❓'];
+  const lines: string[] = [];
   const kb = new InlineKeyboard();
 
   for (let qi = 0; qi < questions.length; qi++) {
@@ -3824,7 +3995,8 @@ function buildAskUi(
     if (qi < questions.length - 1) lines.push('');
   }
 
-  return { text: lines.join('\n'), keyboard: kb };
+  const body = lines.join('\n');
+  return { text: `🤖 ${body}`, keyboard: kb };
 }
 
 /** Build updatedInput answers map from selected options. */

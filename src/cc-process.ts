@@ -147,6 +147,8 @@ export class CCProcess extends EventEmitter {
   private _spawnedAt: Date | null = null;
   private _killedByUs = false;
   private _takenOver = false;
+  private _stateBeforeExit: ProcessState = 'idle';
+  private _killedBeforeExit = false;
   private _hadResult = false; // true after a clean result event; reset on each new message sent
 
   constructor(options: CCProcessOptions) {
@@ -167,6 +169,8 @@ export class CCProcess extends EventEmitter {
   get pid(): number | undefined { return this.process?.pid; }
   get hasBackgroundTasks(): boolean { return this._activeBackgroundTasks.size > 0; }
   get takenOver(): boolean { return this._takenOver; }
+  get stateBeforeExit(): ProcessState { return this._stateBeforeExit; }
+  get killedBeforeExit(): boolean { return this._killedBeforeExit; }
 
   // ── Spawn ──
 
@@ -249,6 +253,7 @@ export class CCProcess extends EventEmitter {
       '--output-format', 'stream-json',
       '--verbose',
       '--include-partial-messages',
+      '--permission-prompt-tool', 'stdio',
       '--max-turns', String(cfg.maxTurns),
     ];
 
@@ -691,6 +696,8 @@ export class CCProcess extends EventEmitter {
     this.clearForceKillTimer();
     this.stopBackgroundTaskCheck();
     this._activeBackgroundTasks.clear();
+    this._stateBeforeExit = this._state;
+    this._killedBeforeExit = this._killedByUs;
     this._state = 'idle';
     this._ccActivity = 'idle';
     this._killedByUs = false;

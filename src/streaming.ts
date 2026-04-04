@@ -258,7 +258,7 @@ export class StreamAccumulator {
   private _lastMsgStartCtx: { input: number; cacheRead: number; cacheCreation: number } | null = null;
 
   // Per-block streaming state
-  private currentBlockType: 'text' | 'thinking' | 'tool_use' | 'image' | null = null;
+  private currentBlockType: 'text' | 'thinking' | 'redacted_thinking' | 'tool_use' | 'image' | 'signature' | null = null;
   private currentBlockId: string | null = null;
   private currentSegment: InternalSegment | null = null;  // direct ref to currently-building block
 
@@ -390,11 +390,19 @@ export class StreamAccumulator {
   }
 
   private onContentBlockStart(event: StreamContentBlockStart): void {
-    const blockType = event.content_block.type;
+    const blockType = event.content_block.type as string;
     this.currentBlockType = blockType as typeof this.currentBlockType;
 
     if (blockType === 'thinking') {
       const seg: InternalSegment = { type: 'thinking', rawText: '', content: '', pendingSplit: this.segments.length > 0 };
+      seg.content = renderSegment(seg);
+      this.segments.push(seg);
+      this.currentSegment = seg;
+      this.requestRender();
+
+    } else if (blockType === 'redacted_thinking') {
+      // Enterprise-redacted thinking — show placeholder
+      const seg: InternalSegment = { type: 'thinking', rawText: '[Thinking redacted by policy]', content: '', pendingSplit: this.segments.length > 0 };
       seg.content = renderSegment(seg);
       this.segments.push(seg);
       this.currentSegment = seg;
@@ -448,6 +456,8 @@ export class StreamAccumulator {
 
     } else if (blockType === 'image') {
       this.imageBase64Buffer = '';
+    } else if (blockType === 'signature') {
+      // Cryptographic signature block — metadata only, silently skip
     }
   }
 
@@ -501,6 +511,10 @@ export class StreamAccumulator {
           this.requestRender();
         }
       }
+    } else if (this.currentBlockType === 'redacted_thinking' && 'delta' in event) {
+      // Redacted thinking deltas — nothing to accumulate, placeholder already set
+    } else if (this.currentBlockType === 'signature' && 'delta' in event) {
+      // Signature deltas — metadata only, silently ignore
     } else if (this.currentBlockType === 'image' && 'delta' in event) {
       const delta = (event as any).delta;
       if (delta?.type === 'image_delta' && delta.data) {
@@ -778,10 +792,10 @@ export class StreamAccumulator {
     this.flushTimer = null;
     if (!this.dirty || this.sealed) return;
 
-    // Gate: delay first TG message until real text content arrives or 2s have passed.
+    // Gate: delay first TG message until real text content arrives or 4s have passed.
     if (!this.tgMessageId && !this.checkFirstSendReady()) {
       if (!this.firstSendTimer) {
-        const remaining = Math.max(0, 2000 - (Date.now() - this.turnStartTime));
+        const remaining = Math.max(0, 4000 - (Date.now() - this.turnStartTime));
         this.firstSendTimer = setTimeout(() => {
           this.firstSendTimer = null;
           this.firstSendReady = true;
@@ -897,8 +911,9 @@ export class StreamAccumulator {
       .filter((s): s is Extract<InternalSegment, { type: 'text' }> => s.type === 'text');
     const textChars = textSegs.reduce((sum, s) => sum + s.rawText.length, 0);
     const hasNewline = textSegs.some(s => s.rawText.includes('\n'));
-    // Require at least 2 lines (newline) with 80+ chars, OR 200+ chars, OR 2s timeout
-    if ((hasNewline && textChars >= 80) || textChars >= 200 || Date.now() - this.turnStartTime >= 2000) {
+    // Require at least 2 lines (newline) with 80+ chars, OR 200+ chars, OR 4s timeout
+    // This prevents tiny bubbles ("Hey", "…") from being flushed too early
+    if ((hasNewline && textChars >= 80) || textChars >= 200 || Date.now() - this.turnStartTime >= 4000) {
       this.firstSendReady = true;
       this.clearFirstSendTimer();
       return true;
@@ -1419,10 +1434,9 @@ export function formatUsageFooter(usage: TurnUsage, _model?: string): string {
 
 const CC_SUB_AGENT_TOOLS = new Set([
   'Agent',
-  'Task',
-  'dispatch_agent',
-  'create_agent',
-  'AgentRunner'
+  'Task',        // Legacy name for Agent
+  'SendMessage',
+  'TeamCreate',
 ]);
 
 export function isSubAgentTool(toolName: string): boolean {
