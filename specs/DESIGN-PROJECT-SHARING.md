@@ -1,153 +1,251 @@
-# Project Sharing via Containerized Dev Environments
+# Project Sharing via Isolated CC Instances
 
 ## Concept
 
 Share a project with someone by giving them access to:
 1. A **Telegram agent** (TGCC worker) scoped to the project
-2. A **VS Code Remote** IDE connected to the project repo
-3. A **Tailscale hostname** for SSH access — no port forwarding or VPN
+2. A **VS Code Remote** IDE connected to the project repo (via Tailscale SSH)
+3. A **Tailscale hostname** for direct SSH access — no port forwarding or VPN
 
-All running in an isolated Docker container.
+The shared CC instance runs **inside a Docker container** alongside the project. This gives CC full access to the project's runtime environment — system libraries, Python packages, CLI tools — while isolating it from the host.
+
+## Key Design Decisions
+
+### Session Isolation via `CLAUDE_CONFIG_DIR`
+
+CC supports overriding its entire config directory via `CLAUDE_CONFIG_DIR`. Each shared agent gets its own config dir under `~/.tgcc/`, following the existing TGCC directory structure:
+
+```
+~/.tgcc/
+├── config.json          # existing TGCC config
+├── state.json           # existing TGCC state
+└── agents/
+    └── <agentId>/
+        └── repos/
+            └── <repo-slug>/
+                └── .claude/
+                    ├── projects/
+                    │   └── <sanitized-project-path>/
+                    │       ├── {sessionId}.jsonl
+                    │       └── memory/
+                    │           └── MEMORY.md
+                    ├── settings.json
+                    └── CLAUDE.md
+```
+
+`repo-slug` uses the same algorithm as `computeProjectSlug()` — replace `/` and `.` with `-`, truncate with hash suffix if > 50 chars. Example: `/home/fonz/Botverse/sentinella` → `-home-fonz-Botverse-sentinella`.
+
+For normal (non-shared) agents, `CLAUDE_CONFIG_DIR` is not set — CC uses the default `~/.claude/` as usual. Only shared instances get the override.
+
+In Docker mode, the host-side `.claude/` dir is bind-mounted into the container so CC inside the container reads/writes sessions to the host filesystem. This means sessions persist across container restarts.
+
+### CC Runs Inside Docker
+
+CC must run inside the container because:
+- The guest's project may need system libraries (GDAL, CUDA, etc.) that aren't on the host
+- CC's bash tool needs to execute in the project's runtime environment (`pip install`, `npm test`, etc.)
+- File paths must match — CC's cwd and the guest's SSH cwd are the same filesystem
+
+TGCC communicates with CC inside the container via a **Unix domain socket** relay — same protocol as the existing MCP bridge, but for the CC process stdio.
+
+### CC Native Sandboxing
+
+CC provides process-level sandboxing via `@anthropic-ai/sandbox-runtime`:
+
+| Feature | Mechanism |
+|---------|-----------|
+| Filesystem isolation | bubblewrap namespaces — `allowWrite[]`, `denyWrite[]`, `allowRead[]`, `denyRead[]` |
+| Network restrictions | Domain allowlists/blocklists, SSRF guard (blocks private ranges) |
+| System call filtering | seccomp profiles — blocks dangerous syscalls |
+| Settings protection | Hardcoded blocks on `.claude/settings.json`, `.claude/skills/`, git internals |
+| Command validation | Bash tool validates commands against read-only allowlists |
+
+CC's sandbox runs *inside* the container — defense in depth. Docker provides the outer ring (host protection), CC provides the inner ring (project protection within the container).
 
 ## Architecture
+
+### Docker Mode (Primary)
 
 ```
 Guest (Telegram / VS Code / SSH)
     │
     ├─ Tailscale ──► Container [project-name.ts.net]
     │                  ├── CC CLI process
-    │                  ├── VS Code Remote Server (sshd)
-    │                  ├── Project deps (AWS CLI, GEE, GDAL, etc.)
-    │                  └── /home/project (bind-mount, only visible dir)
+    │                  ├── tgcc-relay (socket ↔ CC stdio)
+    │                  ├── sshd (port 22)
+    │                  ├── Project deps (.local/)
+    │                  └── /home/project (bind-mount)
     │
     └─ Telegram ──► TGCC server (host)
                        │
-                       └── Unix socket ──► CC process inside container
+                       └── Unix socket ──► tgcc-relay ──► CC process
+                                           (inside container)
 ```
 
-### Communication: Unix Socket
+### Local Mode (Lightweight)
 
-TGCC server (host) ↔ CC process (container) communicate via a **Unix domain socket** bind-mounted into the container.
-
-- Path on host: `/run/tgcc/sockets/<project-name>.sock`
-- Path in container: `/run/tgcc/bridge.sock`
-- No network exposure, lowest latency, simplest setup
-- TGCC sends commands (spawn CC, send prompt, kill) over the socket
-- CC process streams events back over the same socket
-
-### Container Internals
-
-A thin daemon inside the container listens on the socket and:
-- Spawns/manages the CC CLI process on demand
-- Relays stdin/stdout between the socket and CC
-- Reports health/status back to TGCC
-
-This makes the container self-contained — TGCC just sends messages, doesn't need Docker exec access.
-
-### Tailscale Networking
-
-- Each container gets an **ephemeral Tailscale auth key** with tag `tag:tgcc-project`
-- ACL: guests with `tag:tgcc-guest` can access `tag:tgcc-project` on port 22 only
-- Container appears as `<project-name>.ts.net` in the tailnet
-- Guest SSHs to `<project-name>.ts.net` → lands in `/home/project`
-- VS Code Remote connects to the same hostname
-- Revoking access = stop container + expire Tailscale key
-
-## Project Dependencies
-
-**One generic container for all projects.** Dependencies are installed into the project directory under `.local/`, not baked into the image. This keeps the image small and reusable, and makes deps portable and git-excludable.
-
-### Project Directory Layout
+For trusted collaborators who don't need SSH/IDE access and where the host already has the project's dependencies:
 
 ```
-project/
-├── .tgcc/
-│   ├── setup.sh          # idempotent dep install script (committed to git)
-│   ├── config.json        # project sharing settings (permissions, resource limits)
-│   └── env                # non-secret env vars for the container
-├── .local/
-│   ├── bin/              # executables (aws, gdalinfo, python, etc.)
-│   ├── lib/              # shared libraries, Python site-packages
-│   ├── include/          # headers (for native extension builds)
-│   ├── share/            # data files, man pages
-│   └── conda/            # conda environment (if used)
-├── .gitignore            # includes .local/
-└── ... project files ...
+Guest (Telegram only)
+    │
+    └─ Telegram ──► TGCC server
+                       │
+                       └── CC process (local, sandboxed)
+                           ├── CLAUDE_CONFIG_DIR=~/.tgcc/agents/<id>/repos/<slug>/.claude/
+                           ├── cwd = /path/to/project
+                           └── --permission-mode plan
 ```
 
-**`.tgcc/`** — project config, committed to git. Setup script, sharing settings, env vars.
-**`.local/`** — installed prefix tree, gitignored. Pure output of `setup.sh`.
+No container. TGCC spawns CC directly with isolated config dir. Same as a normal agent but with separate sessions/memory.
 
-The container sets `PATH`, `LD_LIBRARY_PATH`, `PYTHONPATH`, etc. to resolve `.local/` first. From the project's perspective, deps just work — `aws`, `python`, `gdalinfo` are all on PATH.
+## Socket Relay Protocol
 
-### `.tgcc/setup.sh`
+### `tgcc-relay` (runs inside container)
 
-Idempotent script that installs everything into `.local/`:
+A thin daemon that bridges the Unix socket to CC's stdio:
 
-```bash
-#!/bin/bash
-set -euo pipefail
-LOCAL="$(pwd)/.local"
-mkdir -p "$LOCAL"/{bin,lib,include,share}
+- Listens on `/run/tgcc/bridge.sock` (bind-mounted from host)
+- Spawns and manages the CC CLI process on command
+- Relays CC's stdout (NDJSON stream events) back over the socket
+- Forwards user messages from the socket to CC's stdin
+- Reports process lifecycle events (spawned, exited, error)
 
-# Python packages → .local/lib/python3.x/site-packages/
-pip install --prefix="$LOCAL" -r requirements.txt
+### Wire Protocol
 
-# Node packages → .local/lib/node_modules/ + .local/bin/
-npm install --prefix="$LOCAL"
+JSON-over-newline on the Unix socket. Same structure as CC's stdin/stdout protocol, wrapped in envelope messages:
 
-# Static binaries → .local/bin/
-curl -fsSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/aws.zip
-unzip -qo /tmp/aws.zip -d /tmp && /tmp/aws/install -i "$LOCAL" -b "$LOCAL/bin"
+```
+Host → Container:
+  {"type":"spawn","args":["--model","sonnet","--permission-mode","plan"]}
+  {"type":"message","content":{"type":"human","message":"Fix the bug"}}
+  {"type":"kill"}
+  {"type":"cancel"}
+  {"type":"tool_result","tool_use_id":"abc","content":"approved"}
 
-# System libraries that aren't in the base image
-# Option A: conda/mamba into .local/conda/
-# Option B: download pre-built .so files into .local/lib/
+Container → Host:
+  {"type":"spawned","pid":1234,"session_id":"abc-123"}
+  {"type":"stream","event":{...CC NDJSON stream event...}}
+  {"type":"exited","code":0}
+  {"type":"error","message":"spawn failed: ..."}
 ```
 
-The container's entrypoint runs `.tgcc/setup.sh` on first boot (if `.local/` is empty or `setup.sh` is newer than `.local/`).
+### `ContainerCCProcess` (in TGCC)
 
-### `.tgcc/config.json`
+A new class in `cc-process.ts` that implements the same `CCProcess` event interface but connects via Unix socket instead of spawning locally:
 
-```json
-{
-  "name": "sentinella",
-  "permissions": "plan",
-  "resources": { "cpus": 2, "memory": "4g" },
-  "env_file": ".tgcc/env",
-  "idle_timeout": "24h"
+```typescript
+class ContainerCCProcess extends EventEmitter {
+  private socket: net.Socket;
+
+  constructor(socketPath: string, options: CCProcessOptions) {
+    // Connect to tgcc-relay socket instead of spawning a process
+  }
+
+  // Same public API as CCProcess:
+  sendMessage(msg: UserMessage): void;
+  kill(): void;
+  cancel(): void;
+  sendToolResult(toolUseId: string, content: string): void;
+  respondToPermission(requestId: string, allowed: boolean): void;
 }
 ```
 
-### What Goes Where
+Bridge.ts doesn't need to know whether it's talking to a local or container CC — both emit the same events.
 
-| Kind | Install method | Location |
-|------|---------------|----------|
-| Python packages | `pip install --prefix=.local` | `.local/lib/python3.x/site-packages/` |
-| Node packages | `npm install --prefix=.local` | `.local/lib/node_modules/`, `.local/bin/` |
-| CLI tools | Download static binary | `.local/bin/` |
-| Native libraries (GDAL, proj) | `conda create -p .local/conda` or pre-built | `.local/conda/` or `.local/lib/` |
-| Go/Rust tools | Build or download binary | `.local/bin/` |
+## Project Configuration
 
-For heavy native stacks (GDAL, CUDA, etc.), **conda/mamba** is the escape hatch — it bundles system libs + Python bindings into a single prefix without needing root:
+### Agent Config (`~/.tgcc/config.json`)
 
-```bash
-# In setup.sh
-micromamba create -p "$LOCAL/conda" -c conda-forge gdal rasterio proj python=3.11 -y
+Whether an agent runs locally or in Docker is defined on the agent itself via the `share` block. This is a per-agent decision — the same project could be shared to one guest locally and another via Docker.
+
+```json
+{
+  "agents": {
+    "kyo_team": {
+      "botToken": "...",
+      "allowedUsers": ["guest-tg-id"],
+      "defaults": {
+        "repo": "kyo",
+        "permissionMode": "plan",
+        "model": "claude-sonnet-4-6"
+      },
+      "share": {
+        "mode": "docker",
+        "claude_md": ".tgcc/CLAUDE.md",
+        "docker": {
+          "networks": ["supabase_network_KYO"],
+          "env": {
+            "NEXT_PUBLIC_SUPABASE_URL": "http://supabase_kong_KYO:8000",
+            "DATABASE_URL": "postgresql://postgres:postgres@supabase_db_KYO:5432/postgres"
+          },
+          "volumes": {
+            "/data/shared-assets": "/home/project/assets"
+          },
+          "resources": { "cpus": 2, "memory": "4g" }
+        }
+      }
+    }
+  }
+}
 ```
 
-### Generic Container Image
+The `share` block is what marks an agent as sandboxed. When present, TGCC:
+1. Creates an isolated `CLAUDE_CONFIG_DIR` at `~/.tgcc/agents/<agentId>/repos/<repo-slug>/.claude/`
+2. Copies `claude_md` into it (if specified, path relative to project root)
+3. (Docker mode) Starts a container with the specified networks, env, volumes, and resources
+4. (Local mode) Spawns CC directly with `CLAUDE_CONFIG_DIR` set
 
-The base image is project-agnostic. It provides the runtime shell and lets `.tgcc/setup.sh` handle the rest:
+Fields:
+- `mode` — `"local"` or `"docker"` (default: `"docker"`)
+- `claude_md` — path (relative to project root) to a CLAUDE.md for the shared instance
+- `docker` — Docker-specific settings (ignored in local mode):
+  - `networks` — Docker networks to attach (e.g. join Supabase's network so the container can reach the DB by container name)
+  - `env` — environment variable overrides (remap `localhost` addresses to Docker container hostnames)
+  - `env_file` — path to a file with additional env vars
+  - `volumes` — extra bind-mounts beyond the project dir (`host:container`)
+  - `resources` — cgroup limits (`cpus`, `memory`)
+- `sandbox` — CC sandbox settings (both modes):
+  - `allowedDomains` — network allowlist passed to CC's sandbox config
+
+### `.tgcc/CLAUDE.md` (in project repo, optional)
+
+Project-specific instructions for the shared CC instance, referenced by the agent's `share.claude_md` field. Copied to the isolated `CLAUDE_CONFIG_DIR`:
+
+### `.tgcc/CLAUDE.md`
+
+Project-specific instructions for the shared CC instance. Copied to the isolated `CLAUDE_CONFIG_DIR`. Controls what the guest's CC can see and do:
+
+```markdown
+# Project: Sentinella
+
+You are working on the Sentinella satellite imagery pipeline.
+Only modify files in src/ and tests/. Do not touch infrastructure/ or deploy/.
+Always run tests before committing.
+```
+
+### Dependency Installation
+
+No special setup mechanism needed. The project dir is bind-mounted read-write, so dependencies install into it naturally:
+
+- **Node.js**: `npm install` → `node_modules/` in the project dir (already project-local)
+- **Python**: `pip install -r requirements.txt` → installs into container's Python, or `pip install --prefix=.local` for project-local
+- **System packages**: Baked into the base image (build-essential, common libs). For heavy stacks (GDAL, CUDA), use a project-specific image tag or extend the base
+
+CC inside the container can install deps via bash tool — the guest just asks. No entrypoint scripts needed.
+
+## Docker Container Image
+
+One generic image for all projects. Project-specific deps install into the bind-mounted project dir at runtime:
 
 ```dockerfile
 FROM ubuntu:24.04
 
-# Essentials only — project deps go in .local/
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl git openssh-server \
     build-essential libssl-dev zlib1g-dev libbz2-dev libreadline-dev \
     libsqlite3-dev libncurses-dev libffi-dev liblzma-dev \
+    python3 python3-pip python3-venv \
     && mkdir /run/sshd && rm -rf /var/lib/apt/lists/*
 
 # Node.js (for CC CLI)
@@ -157,17 +255,14 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 # CC CLI
 RUN npm install -g @anthropic-ai/claude-code
 
-# direnv — auto-loads .envrc on cd, wires up .local/ PATH etc.
-RUN curl -fsSL https://direnv.net/install.sh | bash
-
-# Micromamba (for projects that need native libs)
+# Micromamba for native deps
 RUN curl -fsSL https://micro.mamba.pm/api/micromamba/linux-64/latest \
     | tar -xj -C /usr/local/bin --strip-components=1 bin/micromamba
 
 # Tailscale
 RUN curl -fsSL https://tailscale.com/install.sh | sh
 
-# Socket daemon (thin relay between TGCC and CC)
+# Socket relay daemon
 COPY tgcc-relay /usr/local/bin/tgcc-relay
 
 # Environment: resolve .local/ first
@@ -176,135 +271,161 @@ ENV PATH="$LOCAL_PREFIX/bin:$LOCAL_PREFIX/conda/bin:$PATH"
 ENV LD_LIBRARY_PATH="$LOCAL_PREFIX/lib:$LOCAL_PREFIX/conda/lib"
 ENV NODE_PATH="$LOCAL_PREFIX/lib/node_modules"
 
+# Non-root user
+RUN useradd -m -s /bin/bash -d /home/project project
+USER project
+WORKDIR /home/project
+
 EXPOSE 22
 ENTRYPOINT ["/usr/local/bin/tgcc-relay"]
 ```
 
-One image. All projects. `docker pull tgcc/sandbox:latest` and go.
+### Container Bind Mounts
 
-## Sandboxing
+```bash
+docker run \
+  --name tgcc-<name> \
+  # Bind mounts
+  -v /path/to/project:/home/project \
+  -v /run/tgcc/sockets/<name>.sock:/run/tgcc/bridge.sock \
+  -v ~/.tgcc/agents/<agentId>/repos/<slug>/.claude:/home/project/.claude-config \
+  # Extra volumes from share.json
+  -v /data/shared-assets:/home/project/assets \
+  # Isolation
+  --read-only --tmpfs /tmp \
+  --cpus 2 --memory 4g \
+  # Docker networks (join existing service networks)
+  --network supabase_network_KYO \
+  # Environment: CC config + remapped service addresses
+  -e CLAUDE_CONFIG_DIR=/home/project/.claude-config \
+  -e ANTHROPIC_API_KEY=<key> \
+  -e TS_AUTHKEY=<key> \
+  -e NEXT_PUBLIC_SUPABASE_URL=http://supabase_kong_KYO:8000 \
+  -e DATABASE_URL=postgresql://postgres:postgres@supabase_db_KYO:5432/postgres \
+  --env-file .tgcc/env \
+  tgcc/sandbox:latest
+```
 
-### What Docker provides (host protection)
+Key mounts:
+- **Project dir** → `/home/project` (read-write, deps install here via `npm install` / `pip install --prefix`)
+- **Socket** → `/run/tgcc/bridge.sock` (relay ↔ TGCC communication)
+- **Config dir** → `/home/project/.claude-config` (sessions, memory, settings — persisted on host)
+- **Extra volumes** → from `docker.volumes` in share.json
 
-| Layer | Mechanism |
-|-------|-----------|
-| Filesystem | Bind-mount only project dir; `--read-only` root + tmpfs for /tmp |
-| Network | Tailscale only (no `--network host`); allowlist Anthropic API, Telegram API, AWS, GEE |
-| Capabilities | Drop all; no `--privileged` |
-| Resources | cgroup limits on CPU/memory per container |
-| User | Non-root user inside container; user namespaces |
+## TGCC Integration
 
-### What CAN'T be sandboxed
+### Config Dir Management
 
-| Risk | Explanation | Mitigation |
-|------|-------------|------------|
-| Project contents from guest | Guest has SSH shell = full read/write on project dir. That's the point — they're a collaborator. | Permission-scoped access (read-only mounts for sensitive subdirs if needed) |
-| Credentials | AWS creds, GEE service accounts, Anthropic API key must be in the container for tools to work | Use per-project scoped IAM roles/keys with minimal permissions. Never share root credentials. |
-| CC behavior | CC process inside container can do anything the container user can | Use `--permission-mode plan` or `acceptEdits`; TGCC worker config enforces behavior |
-| MCP servers | Some MCPs (browser, etc.) won't work headless | Provide only relevant MCPs per project |
+```typescript
+import { computeProjectSlug } from './session.js';
 
-### Threat model
+function getSharedConfigDir(agentId: string, repoPath: string): string {
+  const slug = computeProjectSlug(repoPath);
+  return join(homedir(), '.tgcc', 'agents', agentId, 'repos', slug, '.claude');
+}
+```
 
-The primary threat model is **protecting the host from the guest**, not the project from the guest. Docker handles this well. If you need to protect specific project assets from the guest, use read-only sub-mounts or separate secrets management.
+When sharing a project:
+1. Create the config dir: `mkdirSync(configDir, { recursive: true })`
+2. Copy `.tgcc/CLAUDE.md` → `configDir/CLAUDE.md`
+3. Generate `configDir/settings.json` from `share.json` (permissions, sandbox rules)
+4. For local mode: set `CLAUDE_CONFIG_DIR` env var when spawning CC
+5. For Docker mode: bind-mount the config dir into the container
 
-## Container Lifecycle
+### `ContainerCCProcess` Class
 
-### Startup flow
+New class alongside `CCProcess` in `cc-process.ts`:
+
+```typescript
+class ContainerCCProcess extends EventEmitter {
+  // Connects to tgcc-relay via Unix socket
+  // Emits same events as CCProcess: init, text, tool_use, result, etc.
+  // Same public API: sendMessage, kill, cancel, sendToolResult, respondToPermission
+}
+```
+
+Bridge.ts uses a factory to get the right process type:
+
+```typescript
+function createCCProcess(agent: AgentInstance, options: CCProcessOptions): CCProcess | ContainerCCProcess {
+  if (agent.shared?.mode === 'docker') {
+    return new ContainerCCProcess(agent.shared.socketPath, options);
+  }
+  return new CCProcess(options);
+}
+```
+
+### MCP Tools
 
 ```
-tgcc share <project-path>
+tgcc_share(projectPath, guestChatId?, mode?)
+  → Creates config dir, registers agent, starts container (Docker mode)
+
+tgcc_unshare(projectName)
+  → Kills CC, removes agent, stops container
+
+tgcc_projects()
+  → Lists active shared projects: name, mode, guest, uptime, cost
+```
+
+### Lifecycle
+
+#### Share
+```
+tgcc_share /path/to/project --guest @username
   │
-  ├── 1. Read .tgcc/config.json for project settings
-  ├── 2. Pull tgcc/sandbox:latest (if not cached)
-  ├── 3. Create Tailscale ephemeral auth key (tagged: tgcc-project)
-  ├── 4. docker run with:
-  │       --name tgcc-<project-name>
-  │       -v /path/to/project:/home/project
-  │       -v /run/tgcc/sockets/<project-name>.sock:/run/tgcc/bridge.sock
-  │       --read-only --tmpfs /tmp
-  │       --cpus/--memory from .tgcc/config.json
-  │       --env-file .tgcc/env
-  │       -e TS_AUTHKEY=<key>
-  │       -e ANTHROPIC_API_KEY=<key>
-  ├── 5. Container starts: tailscaled + sshd + tgcc-relay
-  ├── 6. Entrypoint runs .tgcc/setup.sh → installs deps into .local/
-  ├── 7. Register worker in TGCC with socket path
-  └── 8. Return: "Project shared at <project-name>.ts.net"
+  ├── 1. Read .tgcc/share.json for settings
+  ├── 2. Create ~/.tgcc/agents/<agentId>/repos/<slug>/.claude/
+  ├── 3. Copy .tgcc/CLAUDE.md → configDir/CLAUDE.md
+  ├── 4. Generate configDir/settings.json (permissions, sandbox config)
+  ├── 5. Register as TGCC agent (type: shared, chatId: guest's TG chat)
+  ├── 6. (Docker) Create Tailscale ephemeral auth key
+  ├── 7. (Docker) docker run with:
+  │       - bind mounts (project dir, socket, config dir, extra volumes)
+  │       - --network for each network in docker.networks
+  │       - env vars from docker.env + docker.env_file
+  │       - resource limits from docker.resources
+  ├── 8. (Docker) Container starts: tgcc-relay + tailscaled + sshd
+  └── 9. Notify guest: "Project <name> shared with you"
 ```
 
-### Teardown
-
+#### Unshare
 ```
-tgcc unshare <project-name>
+tgcc_unshare <name>
   │
-  ├── 1. Send shutdown to CC process via socket
-  ├── 2. docker stop + docker rm
-  ├── 3. Revoke Tailscale auth key
-  └── 4. Remove socket file
+  ├── 1. Kill CC process
+  ├── 2. Remove TGCC agent registration
+  ├── 3. (Docker) docker stop + docker rm
+  ├── 4. (Docker) Revoke Tailscale auth key
+  └── 5. Config dir preserved (--purge to delete)
 ```
 
-### Persistence
+## Sandboxing Summary
 
-- Project files + `.local/`: bind-mounted, survives container restart
-- Project config: `.tgcc/` in the project repo (committed to git)
-- CC session state: ephemeral (TGCC handles re-spawn on restart)
-- Host-side state: socket files in `/run/tgcc/sockets/`
+### Defense in Depth
 
-## TGCC Integration Changes
+| Layer | Provider | What it Protects |
+|-------|----------|-----------------|
+| Docker container | Docker | Host from guest (namespaces, cgroups, read-only root) |
+| CC sandbox | CC native (bwrap + seccomp) | Project from CC (filesystem, network, syscall filtering) |
+| Network isolation | Docker + Tailscale | No `--network host`; Tailscale-only guest ingress |
+| Session isolation | TGCC | `CLAUDE_CONFIG_DIR` separates sessions/memory per shared project |
+| Permission mode | CC native | `plan` / `acceptEdits` restricts what CC can do without approval |
+| CLAUDE.md | Project owner | Instructions scope CC's behavior to project needs |
+| MCP restrictions | TGCC | Shared agents get minimal MCP tools (no supervisor, no spawning) |
 
-### Socket-based worker spawning
+## Resolved Questions
 
-Currently TGCC spawns CC directly (`cc-process.ts`). For containerized workers:
-
-1. New worker type: `container` (vs current `local`)
-2. `cc-process.ts` gains a `ContainerCCProcess` class that:
-   - Connects to the Unix socket instead of spawning a child process
-   - Sends prompts / receives stream events over the socket protocol
-   - Handles reconnection if the container restarts
-3. Worker config in TGCC registers the socket path per agent
-
-### Socket protocol
-
-Simple JSON-over-newline protocol on the Unix socket:
-
-```
-→ {"type":"spawn","model":"sonnet","permissions":"plan"}
-← {"type":"spawned","pid":1234}
-→ {"type":"prompt","text":"Fix the bug in auth.py"}
-← {"type":"stream","event":{...CC stream event...}}
-← {"type":"stream","event":{...}}
-← {"type":"idle"}
-→ {"type":"kill"}
-← {"type":"killed"}
-```
-
-### Worker restriction
-
-The TGCC worker config gains a `containerOnly: true` flag. When set:
-- The worker CANNOT spawn local CC processes
-- All CC operations go through the socket to the container
-- The worker's MCP config is scoped to container-safe tools only
-
-## Multi-project Resource Management
-
-For N shared projects = N containers:
-
-- **Docker Compose per project** — simplest. Each project gets a `docker-compose.yml` in `~/.tgcc/projects/<name>/`
-- **Resource limits** — each container gets CPU/memory caps via cgroups
-- **Monitoring** — `tgcc projects` lists all active shared projects with status, resource usage, uptime
-- **Auto-cleanup** — containers idle for >24h get stopped (configurable)
-
-## Cost Considerations
-
-- Each active CC process burns API credits
-- Per-project API key or usage tracking needed
-- Hard token/cost limits per project session (configurable in worker config)
-- Usage footer in Telegram shows cost to the guest
+1. **Guest identity**: Telegram chat ID for CC access. Tailscale identity for SSH. Independent auth paths.
+2. **Multi-guest**: 1:1 — one CC process per shared project. Multiple guests = multiple shared instances (separate agents, same repo).
+3. **Git integration**: Left to the guest. CC can commit/push if the guest asks.
+4. **Billing**: `total_cost_usd` tracked per agent in TGCC. Hard budget limit configurable in share.json.
+5. **MCP forwarding**: Shared instances get minimal MCP — `send_message`, `send_file`, `send_image`, `notify_supervisor`. No browser, no agent spawning, no supervisor tools.
+6. **Dep installation**: No special mechanism. Project dir is bind-mounted read-write. CC runs inside Docker, so `npm install` / `pip install` via bash tool works normally — deps land in the project dir (or container filesystem for system packages).
 
 ## Open Questions
 
-1. **Guest identity**: Should the guest authenticate to TGCC via Telegram? Or is Tailscale identity sufficient?
-2. **Multi-guest**: Can multiple guests share one project container? (Probably not — CC is single-user)
-3. **Git integration**: Should the container auto-commit/push? Or leave that to the guest?
-4. **Billing**: How to track/limit API costs per shared project?
-5. **MCP forwarding**: Some host MCPs (like `patchright` browser) can't run headless in container. Forward them via socket? Or just exclude?
+1. **Config dir cleanup**: Preserve by default on unshare. `--purge` to delete. How long to keep stale config dirs?
+2. **Guest permissions escalation**: If the guest's CC needs to run something blocked by the sandbox, should TGCC forward the permission_request to the project owner via TG?
+3. **Hot-reload**: If `.tgcc/share.json` changes while shared, auto-reload or require `tgcc_reshare`?
+4. **Container updates**: When the base image updates (new CC version, security patches), how to roll containers forward? `tgcc_reshare --rebuild`?

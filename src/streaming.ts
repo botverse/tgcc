@@ -240,6 +240,8 @@ function renderSegment(seg: InternalSegment): string {
 
 export class StreamAccumulator {
   private chatId: number | string;
+  /** The chat this accumulator is rendering to. */
+  get activeChatId(): number | string { return this.chatId; }
   private sender: TelegramSender;
   private editIntervalMs: number;
   private splitThreshold: number;
@@ -251,6 +253,8 @@ export class StreamAccumulator {
 
   // State
   private tgMessageId: number | null = null;
+  /** Whether there is an active TG message being edited (streaming bubble). */
+  get hasActiveBubble(): boolean { return this.tgMessageId !== null; }
   private messageIds: number[] = [];
   sealed = false;
   private sendQueue: Promise<void> = Promise.resolve();
@@ -1098,6 +1102,11 @@ export class StreamAccumulator {
     this.clearFlushTimer();
     this.firstSendReady = true; // bypass first-send gate
     this.dirty = false;
+    // Drop unresolved tool segments so they don't freeze as "⚡ ..." in the final bubble
+    this.segments = this.segments.filter(s => {
+      if (s.type === 'tool' && s.status === 'pending') return false;
+      return true;
+    });
     const html = this.renderHtml();
     const targetMsgId = this.tgMessageId;
     if (html && html !== '…') {

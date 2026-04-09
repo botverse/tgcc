@@ -97,7 +97,10 @@ Content blocks: `TextContent` (`type: 'text'`), `ImageContent` (`type: 'image'`,
     name?: string,
     agent_id?: string,
     agent_type?: string,
+    color?: string,
     team_name?: string,
+    prompt?: string,
+    teammate_id?: string,
     [key: string]: unknown
   }
 }

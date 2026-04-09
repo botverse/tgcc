@@ -9,6 +9,17 @@ recovery path — TGCC just emits an error.
 Interactive `claude` sessions handle this transparently (open browser). TGCC
 cannot do that. This spec adds an equivalent recovery path via Telegram.
 
+## Design Decision: Layer 2 Only (Conservative)
+
+We deliberately avoid Layer 1 (proactive token refresh) to stay conservative
+after Anthropic's OpenClaw policy changes (April 2026). TGCC should not
+directly manipulate CC's OAuth tokens — that crosses the boundary between
+"using CC programmatically" and "acting as an OAuth client."
+
+Instead, we only implement **reactive detection + notification**: detect the
+401, run CC's own `claude auth login` command, and let the user complete the
+flow themselves via Telegram. This keeps TGCC firmly in the "CC frontend" role.
+
 ## Affected scenarios
 
 1. **Token expired** — `expiresAt` has passed, refresh token also stale
@@ -16,45 +27,7 @@ cannot do that. This spec adds an equivalent recovery path via Telegram.
 3. **Refresh token expired** — access token expired, refresh endpoint fails
 4. **Anthropic endpoint down** — refresh works but returns 500/503
 
-## Solution Overview
-
-Three layers:
-
-```
-Layer 1: Proactive refresh   — check expiry on every CC spawn, refresh early
-Layer 2: Reactive fallback   — on 401, open auth flow via Telegram
-Layer 3: Retry               — after successful auth, retry original task
-```
-
----
-
-## Layer 1 — Proactive Token Refresh
-
-**When:** Before spawning any CC process.
-
-**Logic:**
-1. Read `~/.claude/.credentials.json`
-2. If `expiresAt` is within `proactiveRefreshMinutes` (default: 60 min), call
-   the refresh endpoint:
-   ```
-   POST https://platform.claude.com/v1/oauth/token
-   Content-Type: application/json
-   {
-     "grant_type": "refresh_token",
-     "refresh_token": "<claudeAiOauth.refreshToken>",
-     "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-   }
-   ```
-3. On success: write new `accessToken`, `refreshToken`, `expiresAt` back to
-   credentials file.
-4. On failure (non-200, network error): log warning, proceed to spawn anyway
-   (Layer 2 will catch the resulting 401).
-
-**No Telegram notification needed** — this is silent and automatic.
-
----
-
-## Layer 2 — Reactive Auth Fallback (Telegram Flow)
+## Solution: Reactive Auth Fallback (Telegram Flow)
 
 **Trigger:** CC process result contains auth error:
 - `"OAuth token has expired"`
@@ -101,11 +74,11 @@ Retry original CC spawn (once)
 ```
 
 **First run:** Same flow. No credentials file → CC fails with auth error →
-Layer 2 kicks in.
+fallback kicks in.
 
 ---
 
-## Layer 3 — Retry
+## Retry Logic
 
 After successful auth:
 - Re-spawn the CC process with the same original message/task
@@ -118,14 +91,12 @@ After successful auth:
 
 TGCC needs to listen for the user's reply containing the auth code. Two options:
 
-**Option A (simple):** Poll for new Telegram messages from `authFallbackChatId`
-during the wait window. Any message that doesn't match a known command and
-arrives during the wait window is treated as the auth code.
+**Option A (simple):** Any message from `authFallbackChatId` during the wait
+window that doesn't match a known command is treated as the auth code.
 
 **Option B (explicit):** Require a prefix, e.g. `/authcode V2aoWGt...`
 
-**Recommendation:** Option A — simpler UX, lower friction. Only one message
-should be expected during the wait window.
+**Recommendation:** Option A — simpler UX, lower friction.
 
 ---
 
@@ -135,11 +106,6 @@ should be expected during the wait window.
 authFallbackEnabled: boolean          // default: true
 authFallbackChatId: string            // default: telegramChatId
 authFallbackTimeoutMs: number         // default: 300_000 (5 min)
-proactiveRefreshEnabled: boolean      // default: true
-proactiveRefreshMinutes: number       // default: 60
-oauthClientId: string                 // default: "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-oauthTokenUrl: string                 // default: "https://platform.claude.com/v1/oauth/token"
-credentialsPath: string               // default: "~/.claude/.credentials.json"
 ```
 
 ---
@@ -152,7 +118,6 @@ credentialsPath: string               // default: "~/.claude/.credentials.json"
 | Timeout | ⚠️ Auth timed out (no code received in 5 min). Use `/auth` to retry manually. |
 | Bad code | ❌ Auth failed (bad code?). Use `/auth` to try again. |
 | Success | ✅ Authenticated. Retrying your task… |
-| Proactive refresh ok | _(silent)_ |
 
 ---
 
@@ -161,14 +126,15 @@ credentialsPath: string               // default: "~/.claude/.credentials.json"
 | File | Change |
 |------|--------|
 | `src/config.ts` | Add new config fields |
-| `src/auth.ts` | **New** — proactive refresh + auth flow logic |
-| `src/bridge.ts` | Call proactive refresh before spawn; catch 401, call auth fallback |
+| `src/auth.ts` | **New** — auth error detection + `claude auth login` flow |
+| `src/bridge.ts` | Catch 401 on CC spawn/result, call auth fallback |
 | `src/telegram.ts` | Add `waitForMessage(chatId, timeoutMs)` helper |
 
 ---
 
 ## Out of scope
 
+- Proactive token refresh (Layer 1) — deliberately excluded
 - Multi-account support
 - Rotating client IDs
 - Non-Telegram notification channels

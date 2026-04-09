@@ -10,6 +10,7 @@ export interface TelegramMessage {
   type: 'text' | 'photo' | 'document' | 'voice' | 'video';
   chatId: number;
   userId: string;
+  userName?: string;
   text: string;
   imageBase64?: string;
   imageMediaType?: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp';
@@ -56,6 +57,7 @@ export const COMMANDS = [
   { command: 'permissions', description: 'Set permission mode' },
   { command: 'repo', description: 'Manage repos & switch working directory' },
   { command: 'cron', description: 'Manage scheduled cron jobs' },
+  { command: 'ralph', description: 'Spawn shepherd to ensure task completion' },
   { command: 'ping', description: 'Quick liveness check' },
   { command: 'help', description: 'List all commands' },
 ];
@@ -103,6 +105,7 @@ export class TelegramBot {
   private onCommand: CommandHandler;
   private onCallback: CallbackHandler | null;
   private replyMaps = new Map<number, ReplyMap>(); // per-chat reply maps
+  private rejectedKeys = new Set<string>(); // "userId:chatId" — tracks who already got rejection message
   private running = false;
 
   constructor(
@@ -126,10 +129,27 @@ export class TelegramBot {
     this.setupHandlers();
   }
 
-  private isAllowed(userId: number): boolean {
-    // Empty allowedUsers = open access (anyone can use the bot)
-    if (this.config.allowedUsers.length === 0) return true;
-    return this.config.allowedUsers.includes(String(userId));
+  private isAllowed(userId: number, chatId: number): boolean {
+    // Open access: no users AND no chats configured
+    if (this.config.allowedUsers.length === 0 && !this.config.allowedChats?.length) return true;
+    // User-level allow (works for both DMs and groups)
+    if (this.config.allowedUsers.includes(String(userId))) return true;
+    // Chat-level allow (group/supergroup whose ID is in allowedChats)
+    if (this.config.allowedChats?.includes(String(chatId))) return true;
+    return false;
+  }
+
+  private async rejectUnauthorized(ctx: Context, userId: number, chatId: number): Promise<void> {
+    const key = `${userId}:${chatId}`;
+    if (this.rejectedKeys.has(key)) return; // silently ignore subsequent messages
+    this.rejectedKeys.add(key);
+    try {
+      await ctx.reply("You're not authorized to use this bot. Contact the admin for access.", {
+        reply_parameters: ctx.message ? { message_id: ctx.message.message_id } : undefined,
+      });
+    } catch (err) {
+      this.logger.warn({ err, userId, chatId }, 'Failed to send rejection message');
+    }
   }
 
   private getReplyMap(chatId: number): ReplyMap {
@@ -143,6 +163,12 @@ export class TelegramBot {
 
   trackBotMessage(chatId: number, messageId: number, text: string): void {
     this.getReplyMap(chatId).add(messageId, text);
+  }
+
+  private static getUserName(ctx: Context): string | undefined {
+    const from = ctx.from;
+    if (!from) return undefined;
+    return from.last_name ? `${from.first_name} ${from.last_name}` : from.first_name;
   }
 
   private setupHandlers(): void {
@@ -170,9 +196,18 @@ export class TelegramBot {
     this.bot.on('message:video', (ctx) => this.handleVideo(ctx));
   }
 
-  private handleCallbackQuery(ctx: Context): void {
+  private async handleCallbackQuery(ctx: Context): Promise<void> {
     const userId = ctx.from?.id;
-    if (!userId || !this.isAllowed(userId)) return;
+    const chatId = ctx.chat?.id;
+    if (!userId || !chatId) return;
+    if (!this.isAllowed(userId, chatId)) {
+      const key = `${userId}:${chatId}`;
+      if (!this.rejectedKeys.has(key)) {
+        this.rejectedKeys.add(key);
+        try { await ctx.answerCallbackQuery({ text: 'Not authorized.', show_alert: true }); } catch {}
+      }
+      return;
+    }
     if (!ctx.callbackQuery?.data) return;
     if (!this.onCallback) return;
 
@@ -192,39 +227,48 @@ export class TelegramBot {
     });
   }
 
-  private handleCommand(ctx: Context, command: string): void {
+  private async handleCommand(ctx: Context, command: string): Promise<void> {
     const userId = ctx.from?.id;
-    if (!userId || !this.isAllowed(userId)) return;
+    const chatId = ctx.chat?.id;
+    if (!userId || !chatId) return;
+    if (!this.isAllowed(userId, chatId)) { await this.rejectUnauthorized(ctx, userId, chatId); return; }
 
     const text = ctx.message?.text ?? '';
-    const args = text.replace(`/${command}`, '').trim();
+    // Strip entire first token (/command or /command@BotName) for group compatibility
+    const args = text.replace(/^\/\S+\s*/, '').trim();
 
     this.onCommand({
       command,
       args,
-      chatId: ctx.chat!.id,
+      chatId,
       userId: String(userId),
     });
   }
 
-  private handleText(ctx: Context): void {
+  private async handleText(ctx: Context): Promise<void> {
     const userId = ctx.from?.id;
-    if (!userId || !this.isAllowed(userId)) return;
+    const chatId = ctx.chat?.id;
+    if (!userId || !chatId) return;
+    if (!this.isAllowed(userId, chatId)) { await this.rejectUnauthorized(ctx, userId, chatId); return; }
     if (!ctx.message?.text) return;
 
     // Skip if it's a command (already handled)
     if (ctx.message.text.startsWith('/')) return;
 
+    // Check for message interceptors (e.g. auth flow waiting for code)
+    if (this.tryIntercept(chatId, ctx.message.text.trim())) return;
+
     // Check for reply context
     let replyToText: string | undefined;
     if (ctx.message.reply_to_message?.message_id) {
-      replyToText = this.getReplyMap(ctx.chat!.id).get(ctx.message.reply_to_message.message_id);
+      replyToText = this.getReplyMap(chatId).get(ctx.message.reply_to_message.message_id);
     }
 
     this.onMessage({
       type: 'text',
-      chatId: ctx.chat!.id,
+      chatId,
       userId: String(userId),
+      userName: TelegramBot.getUserName(ctx),
       text: ctx.message.text,
       replyToText,
     });
@@ -232,7 +276,9 @@ export class TelegramBot {
 
   private async handlePhoto(ctx: Context): Promise<void> {
     const userId = ctx.from?.id;
-    if (!userId || !this.isAllowed(userId)) return;
+    const chatId = ctx.chat?.id;
+    if (!userId || !chatId) return;
+    if (!this.isAllowed(userId, chatId)) { await this.rejectUnauthorized(ctx, userId, chatId); return; }
 
     try {
       // Get the largest photo
@@ -253,8 +299,9 @@ export class TelegramBot {
 
       this.onMessage({
         type: 'photo',
-        chatId: ctx.chat!.id,
+        chatId,
         userId: String(userId),
+        userName: TelegramBot.getUserName(ctx),
         text: caption,
         imageBase64: base64,
         imageMediaType: mediaType,
@@ -266,7 +313,9 @@ export class TelegramBot {
 
   private async handleDocument(ctx: Context): Promise<void> {
     const userId = ctx.from?.id;
-    if (!userId || !this.isAllowed(userId)) return;
+    const chatId = ctx.chat?.id;
+    if (!userId || !chatId) return;
+    if (!this.isAllowed(userId, chatId)) { await this.rejectUnauthorized(ctx, userId, chatId); return; }
 
     try {
       const doc = ctx.message?.document;
@@ -285,6 +334,7 @@ export class TelegramBot {
       writeFileSync(savePath, buffer);
 
       const caption = ctx.message?.caption ?? '';
+      const userName = TelegramBot.getUserName(ctx);
 
       // Check if it's an image — send as image content block
       if (doc.mime_type?.startsWith('image/')) {
@@ -292,8 +342,9 @@ export class TelegramBot {
         const mediaType = detectImageMediaType(fileName);
         this.onMessage({
           type: 'photo',
-          chatId: ctx.chat!.id,
+          chatId,
           userId: String(userId),
+          userName,
           text: caption,
           imageBase64: base64,
           imageMediaType: mediaType,
@@ -303,8 +354,9 @@ export class TelegramBot {
 
       this.onMessage({
         type: 'document',
-        chatId: ctx.chat!.id,
+        chatId,
         userId: String(userId),
+        userName,
         text: caption,
         filePath: savePath,
         fileName,
@@ -316,7 +368,9 @@ export class TelegramBot {
 
   private async handleVoice(ctx: Context): Promise<void> {
     const userId = ctx.from?.id;
-    if (!userId || !this.isAllowed(userId)) return;
+    const chatId = ctx.chat?.id;
+    if (!userId || !chatId) return;
+    if (!this.isAllowed(userId, chatId)) { await this.rejectUnauthorized(ctx, userId, chatId); return; }
 
     try {
       const voice = ctx.message?.voice;
@@ -335,8 +389,9 @@ export class TelegramBot {
 
       this.onMessage({
         type: 'voice',
-        chatId: ctx.chat!.id,
+        chatId,
         userId: String(userId),
+        userName: TelegramBot.getUserName(ctx),
         text: ctx.message?.caption ?? '',
         filePath: savePath,
         fileName,
@@ -348,7 +403,9 @@ export class TelegramBot {
 
   private async handleVideo(ctx: Context): Promise<void> {
     const userId = ctx.from?.id;
-    if (!userId || !this.isAllowed(userId)) return;
+    const chatId = ctx.chat?.id;
+    if (!userId || !chatId) return;
+    if (!this.isAllowed(userId, chatId)) { await this.rejectUnauthorized(ctx, userId, chatId); return; }
 
     try {
       const video = ctx.message?.video;
@@ -367,8 +424,9 @@ export class TelegramBot {
 
       this.onMessage({
         type: 'video',
-        chatId: ctx.chat!.id,
+        chatId,
         userId: String(userId),
+        userName: TelegramBot.getUserName(ctx),
         text: ctx.message?.caption ?? '',
         filePath: savePath,
         fileName,
@@ -404,6 +462,7 @@ export class TelegramBot {
       this.running = false;
       this.bot.stop();
       this.replyMaps.clear();
+      this.rejectedKeys.clear();
       this.logger.info('Bot stopped');
     }
   }
@@ -513,5 +572,39 @@ export class TelegramBot {
     try {
       await this.bot.api.sendChatAction(Number(chatId), 'typing');
     } catch {}
+  }
+
+  // ── Message interception (for auth flow) ──
+
+  private messageInterceptors = new Map<number, (text: string) => boolean>(); // chatId → handler (returns true to consume)
+
+  /**
+   * Register a one-shot interceptor that consumes the next non-command text message from a chat.
+   * Returns the message text, or null on timeout.
+   */
+  waitForMessage(chatId: number, timeoutMs: number): Promise<string | null> {
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.messageInterceptors.delete(chatId);
+        resolve(null);
+      }, timeoutMs);
+
+      this.messageInterceptors.set(chatId, (text: string) => {
+        clearTimeout(timer);
+        this.messageInterceptors.delete(chatId);
+        resolve(text);
+        return true; // consumed
+      });
+    });
+  }
+
+  /**
+   * Try to intercept a message. Returns true if the message was consumed by an interceptor.
+   * Called from handleText before normal message processing.
+   */
+  tryIntercept(chatId: number, text: string): boolean {
+    const handler = this.messageInterceptors.get(chatId);
+    if (handler) return handler(text);
+    return false;
   }
 }

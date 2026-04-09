@@ -5,7 +5,7 @@
  * allowing multiple agents/users to subscribe to a single CC process.
  */
 
-import type { CCProcess } from './cc-process.js';
+import type { ICCProcess } from './cc-process.js';
 import type { StreamAccumulator, SubAgentTracker } from './streaming.js';
 
 // ── Types ──
@@ -23,7 +23,7 @@ export interface Subscriber {
 }
 
 export interface ProcessEntry {
-  ccProcess: CCProcess;
+  ccProcess: ICCProcess;
   repo: string;
   sessionId: string;
   model: string;
@@ -54,7 +54,7 @@ export class ProcessRegistry {
   }
 
   /** Register a new process and subscribe the owner. */
-  register(repo: string, sessionId: string, model: string, proc: CCProcess, owner: ClientRef): ProcessEntry {
+  register(repo: string, sessionId: string, model: string, proc: ICCProcess, owner: ClientRef): ProcessEntry {
     const pKey = processKey(repo, sessionId);
     const cKey = clientKey(owner);
 
@@ -141,8 +141,8 @@ export class ProcessRegistry {
     return this.entries.get(pKey) ?? null;
   }
 
-  /** Find entry that owns a given CCProcess instance. */
-  findByProcess(proc: CCProcess): ProcessEntry | null {
+  /** Find entry that owns a given ICCProcess instance. */
+  findByProcess(proc: ICCProcess): ProcessEntry | null {
     for (const entry of this.entries.values()) {
       if (entry.ccProcess === proc) return entry;
     }

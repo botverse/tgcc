@@ -159,10 +159,12 @@ export class SessionStore {
 /**
  * Get the path to a CC session's JSONL file.
  * CC stores sessions at ~/.claude/projects/<repo-slug>/<sessionId>.jsonl
+ * For shared agents with isolated CLAUDE_CONFIG_DIR, pass configDir to look there instead.
  */
-export function getSessionJsonlPath(sessionId: string, repo: string): string {
+export function getSessionJsonlPath(sessionId: string, repo: string, configDir?: string): string {
   const slug = computeProjectSlug(repo);
-  return join(homedir(), '.claude', 'projects', slug, `${sessionId}.jsonl`);
+  const base = configDir ?? join(homedir(), '.claude');
+  return join(base, 'projects', slug, `${sessionId}.jsonl`);
 }
 
 const MAX_SLUG_LENGTH = 50;
@@ -182,6 +184,7 @@ export type SessionEndState = 'completed' | 'interrupted' | 'unknown';
 export interface DiscoveredSession {
   id: string;
   title: string;
+  summary: string | null;      // AI-generated session summary (from compaction or last assistant turn)
   model: string | null;
   mtime: Date;
   lineCount: number;
@@ -193,9 +196,10 @@ export interface DiscoveredSession {
  * Discover CC sessions from ~/.claude/projects/<slug>/*.jsonl
  * Returns the most recent sessions sorted by modification time.
  */
-export function discoverCCSessions(repo: string, limit = 10): DiscoveredSession[] {
+export function discoverCCSessions(repo: string, limit = 10, configDir?: string): DiscoveredSession[] {
   const slug = computeProjectSlug(repo);
-  const projectDir = join(homedir(), '.claude', 'projects', slug);
+  const base = configDir ?? join(homedir(), '.claude');
+  const projectDir = join(base, 'projects', slug);
 
   if (!existsSync(projectDir)) return [];
 
@@ -239,10 +243,12 @@ export function discoverCCSessions(repo: string, limit = 10): DiscoveredSession[
 
       const contextPct = extractContextPct(fullPath, st.size);
       const endState = getSessionEndState(fullPath, st.size);
+      const summary = extractSessionSummary(fullPath, st.size);
 
       results.push({
         id,
         title,
+        summary,
         model,
         mtime: st.mtime,
         lineCount: countLines(fullPath),
@@ -346,6 +352,120 @@ function extractSessionMeta(jsonlPath: string, fileSize: number): { title: strin
   } catch {}
 
   return { title, model };
+}
+
+/** Extract an AI-generated session summary.
+ *  Priority: (1) last compaction summary, (2) last assistant text snippet. */
+function extractSessionSummary(jsonlPath: string, fileSize: number): string | null {
+  // Read last ~64KB — compaction summaries and recent assistant turns are near the end
+  const readSize = Math.min(65536, fileSize);
+  let text: string;
+  try {
+    const fd = openSync(jsonlPath, 'r');
+    const buf = Buffer.alloc(readSize);
+    readSync(fd, buf, 0, readSize, Math.max(0, fileSize - readSize));
+    closeSync(fd);
+    text = buf.toString('utf-8');
+  } catch {
+    return null;
+  }
+
+  const lines = text.split('\n');
+
+  // Walk backwards — find the most recent compaction summary or assistant text
+  let lastAssistantText: string | null = null;
+
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i];
+    if (!line.trim()) continue;
+
+    try {
+      // Quick checks before parsing
+      if (line.includes('isCompactSummary')) {
+        const parsed = JSON.parse(line.indexOf('{') >= 0 ? line.slice(line.indexOf('{')) : line);
+        const content = parsed?.message?.content;
+        if (content) {
+          const summaryText = typeof content === 'string' ? content
+            : Array.isArray(content) ? content.find((b: { type?: string; text?: string }) => b?.type === 'text')?.text ?? null
+            : null;
+          if (summaryText) return extractCompactSummarySnippet(summaryText);
+        }
+      }
+
+      // Capture last assistant text (only if we haven't found a compaction summary)
+      if (lastAssistantText === null && line.includes('"assistant"') && line.includes('"text"')) {
+        const parsed = JSON.parse(line.indexOf('{') >= 0 ? line.slice(line.indexOf('{')) : line);
+        if (parsed?.message?.role === 'assistant' || parsed?.role === 'assistant') {
+          const content = parsed?.message?.content ?? parsed?.content;
+          if (Array.isArray(content)) {
+            for (const block of content) {
+              if (block?.type === 'text' && block.text?.trim()) {
+                lastAssistantText = block.text.trim();
+                break;
+              }
+            }
+          } else if (typeof content === 'string' && content.trim()) {
+            lastAssistantText = content.trim();
+          }
+        }
+      }
+    } catch { continue; }
+  }
+
+  // Fall back to last assistant text — first meaningful line, truncated
+  if (lastAssistantText) {
+    // Take the first non-empty line that's not a tool-call preamble
+    for (const ln of lastAssistantText.split('\n')) {
+      const trimmed = ln.trim();
+      if (trimmed && !trimmed.startsWith('[') && !trimmed.startsWith('<') && trimmed.length > 5) {
+        return trimmed.length > 200 ? trimmed.slice(0, 200) + '…' : trimmed;
+      }
+    }
+  }
+
+  return null;
+}
+
+/** Extract a short snippet from a compaction summary's Analysis section. */
+function extractCompactSummarySnippet(summaryText: string): string {
+  // Look for numbered items after "Analysis:" or the summary section
+  const lines = summaryText.split('\n');
+  const snippetLines: string[] = [];
+  let inAnalysis = false;
+  let itemCount = 0;
+
+  for (const line of lines) {
+    // Start collecting after "Analysis:" or "Summary:" header
+    if (/^(Analysis|Summary):/.test(line.trim())) {
+      inAnalysis = true;
+      continue;
+    }
+    // Also start after "Primary Request" or "1. " if we haven't found a header
+    if (!inAnalysis && /^\d+\.\s/.test(line.trim())) {
+      inAnalysis = true;
+    }
+    if (inAnalysis) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      // Count numbered items
+      if (/^\d+\.\s/.test(trimmed)) {
+        itemCount++;
+        if (itemCount > 3) break; // take first 3 items
+      }
+      snippetLines.push(trimmed);
+    }
+    // Limit total length
+    if (snippetLines.join(' ').length > 300) break;
+  }
+
+  if (snippetLines.length > 0) {
+    const result = snippetLines.join(' ');
+    return result.length > 300 ? result.slice(0, 300) + '…' : result;
+  }
+
+  // Fallback: first 200 chars of the summary
+  const clean = summaryText.replace(/^This session is being continued.*?\n\n/s, '').trim();
+  return clean.length > 200 ? clean.slice(0, 200) + '…' : clean;
 }
 
 function extractTitleFromContent(content: unknown): string {
@@ -485,4 +605,102 @@ function getModelContextWindow(model: string): number {
   if (m.includes('sonnet')) return 200_000;
   if (m.includes('haiku')) return 200_000;
   return 200_000; // Safe default
+}
+
+// ── Session History Extraction (for Ralph) ──
+
+interface ConversationMessage {
+  role: 'user' | 'assistant';
+  text: string;
+}
+
+/**
+ * Extract the most recent user/assistant messages from a session JSONL file.
+ * Returns a formatted conversation transcript for ralph context injection.
+ */
+export function extractRecentConversation(jsonlPath: string, maxMessages = 8, maxChars = 6000): string {
+  if (!existsSync(jsonlPath)) return '(no session history available)';
+
+  try {
+    const st = statSync(jsonlPath);
+    const fd = openSync(jsonlPath, 'r');
+
+    // Read last ~128KB to capture recent messages
+    const readSize = Math.min(128 * 1024, st.size);
+    const buf = Buffer.alloc(readSize);
+    readSync(fd, buf, 0, readSize, Math.max(0, st.size - readSize));
+    closeSync(fd);
+
+    const text = buf.toString('utf-8');
+    const lines = text.split('\n').filter(l => l.trim());
+
+    const messages: ConversationMessage[] = [];
+
+    for (const line of lines) {
+      try {
+        const start = line.indexOf('{');
+        if (start < 0) continue;
+        const parsed = JSON.parse(line.slice(start));
+
+        // User messages
+        if (parsed.type === 'user' || parsed.role === 'user') {
+          const content = parsed.message?.content ?? parsed.content;
+          const msgText = extractTextFromContent(content);
+          if (msgText) messages.push({ role: 'user', text: msgText });
+        }
+
+        // Assistant messages
+        if (parsed.type === 'assistant' || parsed.role === 'assistant') {
+          const content = parsed.message?.content ?? parsed.content;
+          const msgText = extractTextFromContent(content);
+          if (msgText) messages.push({ role: 'assistant', text: msgText });
+        }
+      } catch { continue; }
+    }
+
+    if (messages.length === 0) return '(no session history available)';
+
+    // Take last N messages
+    const recent = messages.slice(-maxMessages);
+
+    // Format with truncation
+    let totalChars = 0;
+    const formatted: string[] = [];
+    for (const msg of recent) {
+      const truncated = msg.text.length > 1000 ? msg.text.slice(0, 1000) + '…' : msg.text;
+      totalChars += truncated.length;
+      if (totalChars > maxChars) break;
+      formatted.push(`[${msg.role}]: ${truncated}`);
+    }
+
+    return formatted.join('\n\n');
+  } catch {
+    return '(failed to read session history)';
+  }
+}
+
+function extractTextFromContent(content: unknown): string {
+  if (typeof content === 'string') return cleanMessageText(content);
+  if (Array.isArray(content)) {
+    const textParts: string[] = [];
+    for (const block of content) {
+      if (block?.type === 'text' && block.text) {
+        textParts.push(block.text);
+      }
+      // Summarize tool_use blocks briefly
+      if (block?.type === 'tool_use' && block.name) {
+        textParts.push(`[tool: ${block.name}]`);
+      }
+    }
+    return cleanMessageText(textParts.join('\n'));
+  }
+  return '';
+}
+
+function cleanMessageText(text: string): string {
+  // Strip IDE XML blocks and system preambles
+  return text
+    .replace(/<(ide_\w+|environment_details|system-reminder|heartbeat_rules)[^>]*>[\s\S]*?<\/\1>/g, '')
+    .replace(/^\[(Worker events|Context:|From supervisor|From agent )[^\]]*\][^\n]*/gm, '')
+    .trim();
 }

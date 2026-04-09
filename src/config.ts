@@ -14,6 +14,10 @@ export interface GlobalConfig {
   mcpConfigDir: string;
   logLevel: string;
   stateFile: string;
+  /** Enable OAuth auth fallback via Telegram when CC gets a 401. Default: true */
+  authFallbackEnabled: boolean;
+  /** Timeout for waiting for the user's auth code reply (ms). Default: 300000 (5 min) */
+  authFallbackTimeoutMs: number;
 }
 
 export interface AgentDefaults {
@@ -65,12 +69,31 @@ export interface CronJobConfig {
   deleteAfterRun?: boolean;
 }
 
+export interface ShareDockerConfig {
+  networks?: string[];
+  env?: Record<string, string>;
+  env_file?: string;
+  volumes?: Record<string, string>;
+  resources?: { cpus?: number; memory?: string };
+  ports?: Record<string, number>;  // containerPort → hostPort (e.g. "3000": 13000)
+}
+
+export interface ShareConfig {
+  mode: 'local' | 'docker';
+  claude_md?: string;
+  idle_timeout?: string;
+  docker?: ShareDockerConfig;
+  sandbox?: { allowedDomains?: string[] };
+}
+
 export interface AgentConfig {
   botToken: string;
   allowedUsers: string[];
+  allowedChats?: string[];   // Group/supergroup chat IDs (negative numbers as strings)
   defaults: AgentDefaults;
   users?: Record<string, AgentUserOverride>;
   heartbeat?: HeartbeatConfig;
+  share?: ShareConfig;
 }
 
 export interface TgccConfig {
@@ -91,6 +114,8 @@ const DEFAULT_GLOBAL: GlobalConfig = {
   mcpConfigDir: '/tmp/tgcc',
   logLevel: 'info',
   stateFile: join(homedir(), '.tgcc', 'state.json'),
+  authFallbackEnabled: true,
+  authFallbackTimeoutMs: 300_000,
 };
 
 const DEFAULT_AGENT_DEFAULTS: AgentDefaults = {
@@ -121,6 +146,8 @@ export function validateConfig(raw: unknown): TgccConfig {
     mcpConfigDir: typeof globalRaw.mcpConfigDir === 'string' ? globalRaw.mcpConfigDir : DEFAULT_GLOBAL.mcpConfigDir,
     logLevel: typeof globalRaw.logLevel === 'string' ? globalRaw.logLevel : DEFAULT_GLOBAL.logLevel,
     stateFile: typeof globalRaw.stateFile === 'string' ? globalRaw.stateFile : DEFAULT_GLOBAL.stateFile,
+    authFallbackEnabled: globalRaw.authFallbackEnabled !== false,
+    authFallbackTimeoutMs: typeof globalRaw.authFallbackTimeoutMs === 'number' ? globalRaw.authFallbackTimeoutMs : DEFAULT_GLOBAL.authFallbackTimeoutMs,
   };
 
   // Repos registry
@@ -173,11 +200,14 @@ export function validateConfig(raw: unknown): TgccConfig {
         // It's a reference to the repos registry
         resolvedRepo = repos[repoKey];
 
-        // Validate exclusivity: one agent per repo key
-        if (repoOwners.has(repoKey)) {
+        // Validate exclusivity: one agent per repo key (shared/docker agents exempt)
+        const hasShareMode = !!(a as Record<string, unknown>).share;
+        if (repoOwners.has(repoKey) && !hasShareMode) {
           throw new Error(`Repo "${repoKey}" is already assigned to agent "${repoOwners.get(repoKey)}" — each repo can only be assigned to one agent`);
         }
-        repoOwners.set(repoKey, agentId);
+        if (!repoOwners.has(repoKey)) {
+          repoOwners.set(repoKey, agentId);
+        }
       } else {
         // Treat as a direct path (backwards compat)
         resolvedRepo = repoKey;
@@ -225,12 +255,49 @@ export function validateConfig(raw: unknown): TgccConfig {
       };
     }
 
+    // Share config (optional)
+    let share: ShareConfig | undefined;
+    if (a.share && typeof a.share === 'object') {
+      const s = a.share as Record<string, unknown>;
+      const mode = s.mode === 'local' ? 'local' : 'docker';
+      const docker: ShareDockerConfig | undefined = s.docker && typeof s.docker === 'object'
+        ? (() => {
+            const d = s.docker as Record<string, unknown>;
+            return {
+              ...(Array.isArray(d.networks) ? { networks: d.networks.filter((n: unknown) => typeof n === 'string') as string[] } : {}),
+              ...(d.env && typeof d.env === 'object' ? { env: d.env as Record<string, string> } : {}),
+              ...(typeof d.env_file === 'string' ? { env_file: d.env_file } : {}),
+              ...(d.volumes && typeof d.volumes === 'object' ? { volumes: d.volumes as Record<string, string> } : {}),
+              ...(d.resources && typeof d.resources === 'object' ? { resources: d.resources as { cpus?: number; memory?: string } } : {}),
+              ...(d.ports && typeof d.ports === 'object' ? { ports: Object.fromEntries(
+                Object.entries(d.ports as Record<string, unknown>)
+                  .filter(([, v]) => typeof v === 'number')
+                  .map(([k, v]) => [k, v as number])
+              ) } : {}),
+            };
+          })()
+        : undefined;
+
+      share = {
+        mode,
+        ...(typeof s.claude_md === 'string' ? { claude_md: s.claude_md } : {}),
+        ...(typeof s.idle_timeout === 'string' ? { idle_timeout: s.idle_timeout } : {}),
+        ...(docker ? { docker } : {}),
+        ...(s.sandbox && typeof s.sandbox === 'object' ? { sandbox: s.sandbox as ShareConfig['sandbox'] } : {}),
+      };
+    }
+
+    // allowedChats (optional) — group/supergroup chat IDs
+    const allowedChats = Array.isArray(a.allowedChats) ? a.allowedChats.map(String) : undefined;
+
     agents[agentId] = {
       botToken: a.botToken,
       allowedUsers: a.allowedUsers.map(String),
+      ...(allowedChats ? { allowedChats } : {}),
       defaults,
       users,
       ...(heartbeat ? { heartbeat } : {}),
+      ...(share ? { share } : {}),
     };
   }
 

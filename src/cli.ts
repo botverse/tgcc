@@ -314,6 +314,10 @@ function cmdAgentList(): void {
     console.log(`  Token: ${(agent.botToken as string)?.slice(0, 10)}...`);
     console.log(`  Repo: ${repoPath}`);
     console.log(`  Users: ${(agent.allowedUsers as string[])?.join(', ') ?? 'none'}`);
+    const chats = agent.allowedChats as string[] | undefined;
+    if (chats?.length) {
+      console.log(`  Groups: ${chats.join(', ')}`);
+    }
   }
 }
 

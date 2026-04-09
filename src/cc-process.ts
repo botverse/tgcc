@@ -72,6 +72,8 @@ export interface CCProcessOptions {
   sessionId?: string;
   continueSession: boolean;
   logger?: pino.Logger;
+  /** Override CC's config directory (session isolation for shared instances). */
+  claudeConfigDir?: string;
 }
 
 // ── MCP config generation ──
@@ -81,7 +83,7 @@ export function generateMcpConfig(
   userId: string,
   socketDir: string,
   mcpServerPath: string,
-  isSupervisor = false,
+  capabilities: string[] = [],
   mcpConfigDir = '/tmp/tgcc',
 ): string {
   const config = {
@@ -95,7 +97,7 @@ export function generateMcpConfig(
           TGCC_AGENT_ID: agentId,
           TGCC_USER_ID: userId,
           TGCC_SOCKET: join(socketDir, `${agentId}-${userId}.sock`),
-          ...(isSupervisor ? { TGCC_IS_SUPERVISOR: '1' } : {}),
+          ...(capabilities.length > 0 ? { TGCC_CAPABILITIES: capabilities.join(',') } : {}),
         },
       },
     },
@@ -125,9 +127,33 @@ function parseShellArgs(s: string): string[] {
   return args;
 }
 
+/** Common interface for CCProcess and ContainerCCProcess — used by ProcessRegistry and Bridge. */
+export interface ICCProcess extends EventEmitter {
+  readonly agentId: string;
+  readonly userId: string;
+  readonly state: ProcessState;
+  readonly ccActivity: CCActivityState;
+  readonly sessionId: string | null;
+  readonly totalCostUsd: number;
+  readonly spawnedAt: Date | null;
+  readonly pid: number | undefined;
+  readonly hasBackgroundTasks: boolean;
+  readonly takenOver: boolean;
+  readonly stateBeforeExit: ProcessState;
+  readonly killedBeforeExit: boolean;
+  start(): Promise<void>;
+  sendMessage(msg: UserMessage): void;
+  kill(): void;
+  cancel(): void;
+  sendToolResult(toolUseId: string, content: string): void;
+  respondToPermission(requestId: string, allowed: boolean, updatedInput?: Record<string, unknown>): void;
+  clearIdleTimer(): void;
+  destroy(): void;
+}
+
 // ── CC Process ──
 
-export class CCProcess extends EventEmitter {
+export class CCProcess extends EventEmitter implements ICCProcess {
   readonly agentId: string;
   readonly userId: string;
 
@@ -186,10 +212,15 @@ export class CCProcess extends EventEmitter {
     const args = this.buildArgs();
     this.logger.info({ args }, 'Spawning CC process');
 
+    const env = { ...process.env };
+    if (this.options.claudeConfigDir) {
+      env.CLAUDE_CONFIG_DIR = this.options.claudeConfigDir;
+    }
+
     const child = spawn(this.options.ccBinaryPath, args, {
       stdio: ['pipe', 'pipe', 'pipe'],
       cwd: this.options.userConfig.repo,
-      env: { ...process.env },
+      env,
     });
 
     this.process = child;
@@ -415,6 +446,7 @@ export class CCProcess extends EventEmitter {
         // Turn complete — mark that CC exited the turn cleanly
         this._ccActivity = 'idle';
         this._hadResult = true;
+        this.clearHangTimer();
         if (event.total_cost_usd) {
           this._totalCostUsd = event.total_cost_usd;
         }

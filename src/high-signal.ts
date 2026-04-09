@@ -289,6 +289,13 @@ export class HighSignalDetector {
     }
   }
 
+  /**
+   * Emit a high-signal event from external callers (e.g. SubAgentTracker onAllDone).
+   */
+  emitEvent(agentId: string, event: HighSignalEvent): void {
+    this.emit(agentId, event);
+  }
+
   // ── Private: State management ──
 
   private getState(agentId: string): AgentState {
@@ -488,6 +495,7 @@ export class HighSignalDetector {
       case 'git_commit': return '📝';
       case 'context_pressure': return '🧠';
       case 'subagent_spawn': return '🔄';
+      case 'subagent_all_done': return '✅';
       case 'failure_loop': return '🔁';
       case 'task_milestone': return '📋';
       case 'stuck': return '⚠️';
@@ -508,6 +516,8 @@ export class HighSignalDetector {
         return event.label
           ? `Spawned: "${event.label}"`
           : `Spawned sub-agent (${event.toolName})`;
+      case 'subagent_all_done':
+        return `Sub-agents done (${event.count}/${event.count})${event.elapsed ? ` · ${event.elapsed}` : ''}`;
       case 'failure_loop':
         return `${event.consecutiveFailures} consecutive failures — possibly stuck`;
       case 'task_milestone':

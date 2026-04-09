@@ -10,7 +10,8 @@ import { McpBridgeClient, type McpToolRequest } from './mcp-bridge.js';
 const AGENT_ID = process.env.TGCC_AGENT_ID ?? 'unknown';
 const USER_ID = process.env.TGCC_USER_ID ?? 'unknown';
 const SOCKET_PATH = process.env.TGCC_SOCKET ?? '/tmp/tgcc/sockets/default.sock';
-const IS_SUPERVISOR = process.env.TGCC_IS_SUPERVISOR === '1';
+const CAPABILITIES = new Set((process.env.TGCC_CAPABILITIES ?? '').split(',').filter(Boolean));
+const hasCap = (cap: string): boolean => CAPABILITIES.has('*') || CAPABILITIES.has(cap);
 
 async function main(): Promise<void> {
   const client = new McpBridgeClient(SOCKET_PATH);
@@ -404,9 +405,37 @@ Call tgcc_agents first to discover available agents and repos.`,
     }
   );
 
-  // ── Supervisor-only tools ──
+  // ── ralph_done tool (only for ralph instances via watch:self capability) ──
 
-  if (IS_SUPERVISOR) {
+  if (hasCap('watch:self')) {
+    server.tool(
+      'ralph_done',
+      'Declare that the watched task is complete. Sends summary to user, then self-destructs. Only callable by Ralph agents.',
+      {
+        summary: z.string().describe('Brief summary of what the worker accomplished'),
+        success: z.boolean().default(true).describe('Whether the task completed successfully'),
+      },
+      async ({ summary, success }) => {
+        const request: McpToolRequest = {
+          id: uuidv4(), tool: 'ralph_done', agentId: AGENT_ID, userId: USER_ID,
+          params: { summary, success },
+        };
+        try {
+          const response = await client.sendRequest(request);
+          if (response.success) return { content: [{ type: 'text' as const, text: JSON.stringify(response.result, null, 2) }] };
+          return { content: [{ type: 'text' as const, text: `Failed: ${response.error}` }], isError: true };
+        } catch (err) {
+          return { content: [{ type: 'text' as const, text: `Bridge unavailable: ${err instanceof Error ? err.message : 'unknown error'}` }], isError: true };
+        }
+      }
+    );
+  }
+
+  // ── Capability-gated tools ──
+  // Capabilities: * (all), observe (status/log/track), manage (session/kill/destroy),
+  // schedule (cron), watch:self (ralph_done), basic (agents/send/spawn)
+
+  if (hasCap('manage')) {
 
     server.tool(
       'tgcc_kill',
@@ -458,6 +487,10 @@ Call tgcc_agents first to discover available agents and repos.`,
       }
     );
 
+  }
+
+  if (hasCap('observe')) {
+
     server.tool(
       'tgcc_track',
       'Start receiving high-signal events from a worker agent in real time (build results, failures, commits, task progress). Tracking persists until the supervisor session ends or explicit tgcc_untrack. Note: tgcc_send automatically tracks the target worker.',
@@ -501,6 +534,10 @@ Call tgcc_agents first to discover available agents and repos.`,
       }
     );
 
+  }
+
+  if (hasCap('schedule')) {
+
     server.tool(
       'tgcc_cron',
       'Manage scheduled cron jobs for worker agents. Use to schedule periodic nudges (e.g. "check training status every 30m") or one-shot reminders.',
@@ -520,6 +557,33 @@ Call tgcc_agents first to discover available agents and repos.`,
         const request: McpToolRequest = {
           id: uuidv4(), tool: 'tgcc_cron', agentId: AGENT_ID, userId: USER_ID,
           params: { action, agentId, message, every, at, cron, tz, name, session, jobId },
+        };
+        try {
+          const response = await client.sendRequest(request);
+          if (response.success) return { content: [{ type: 'text' as const, text: JSON.stringify(response.result, null, 2) }] };
+          return { content: [{ type: 'text' as const, text: `Failed: ${response.error}` }], isError: true };
+        } catch (err) {
+          return { content: [{ type: 'text' as const, text: `Bridge unavailable: ${err instanceof Error ? err.message : 'unknown error'}` }], isError: true };
+        }
+      }
+    );
+
+  }
+
+  if (hasCap('manage')) {
+
+    server.tool(
+      'tgcc_ralph',
+      'Spawn a Ralph completion shepherd to watch a worker agent until it finishes. Ralph monitors turn completions, can intervene, and notifies you when done.',
+      {
+        agentId: z.string().describe('Target worker agent ID to watch'),
+        prompt: z.string().optional().describe('What Ralph should ensure the worker completes. If omitted, Ralph infers the task from the worker\'s session history.'),
+        timeoutMs: z.number().optional().describe('Max lifetime in ms (default: 30 minutes)'),
+      },
+      async ({ agentId, prompt, timeoutMs }) => {
+        const request: McpToolRequest = {
+          id: uuidv4(), tool: 'tgcc_ralph', agentId: AGENT_ID, userId: USER_ID,
+          params: { agentId, prompt, timeoutMs },
         };
         try {
           const response = await client.sendRequest(request);

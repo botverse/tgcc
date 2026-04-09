@@ -1,4 +1,4 @@
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import { existsSync, readFileSync, statSync, mkdirSync } from 'node:fs';
 import { promisify } from 'node:util';
 import { homedir } from 'node:os';
@@ -12,7 +12,9 @@ import type {
 } from './config.js';
 import type { ApiErrorEvent, PermissionRequest, ToolResultEvent, TaskStartedEvent, TaskProgressEvent, TaskCompletedEvent, CompactBoundaryEvent } from './cc-protocol.js';
 import { resolveUserConfig, resolveRepoPath, updateConfig, isValidRepoName, findRepoOwner } from './config.js';
-import { CCProcess, generateMcpConfig } from './cc-process.js';
+import { CCProcess, generateMcpConfig, type ICCProcess } from './cc-process.js';
+import { ContainerCCProcess } from './container-process.js';
+import { ensureContainer, generateContainerClaudeMd, generateContainerMcpConfig } from './docker.js';
 import {
   createTextMessage,
   createImageMessage,
@@ -25,13 +27,17 @@ import {
 } from './cc-protocol.js';
 import { StreamAccumulator, SubAgentTracker, escapeHtml, formatSystemMessage, type TelegramSender, type SubAgentSender } from './streaming.js';
 import { TelegramBot, type TelegramMessage, type SlashCommand, type CallbackQuery } from './telegram.js';
+import { isAuthError, resultHasAuthError, runAuthFlow } from './auth.js';
 import { InlineKeyboard } from 'grammy';
 import { McpBridgeServer, type McpToolRequest, type McpToolResponse } from './mcp-bridge.js';
 import {
   SessionStore,
   discoverCCSessions,
+  DiscoveredSession,
   getSessionJsonlPath,
   hasIDEContent,
+  computeProjectSlug,
+  extractRecentConversation,
 } from './session.js';
 import {
   CtlServer,
@@ -43,9 +49,14 @@ import { ProcessRegistry, type ClientRef, type ProcessEntry } from './process-re
 import { EventBuffer } from './event-buffer.js';
 import { HighSignalDetector } from './high-signal.js';
 import { EventDedup } from './event-dedup.js';
+import { EventRouter, type RoutableEvent } from './event-router.js';
+import { SupervisorManager, formatElapsed } from './supervisor.js';
+import { WatcherManager } from './watcher.js';
+import { RalphManager, buildRalphPrompt } from './ralph.js';
+import { wrapTeammateMessage, wrapSystemReminder } from './cc-tags.js';
 import { Scheduler, computeOneShotSchedule, parseEveryToCron } from './scheduler.js';
 import { randomUUID } from 'node:crypto';
-import { exec as nodeExec } from 'node:child_process';
+import { exec as nodeExec, execSync } from 'node:child_process';
 
 // ── Types ──
 
@@ -75,6 +86,14 @@ interface PendingPermission {
   awaitingTextQIdx?: number;                   // set when waiting for free-text "Other" answer
 }
 
+interface PendingExecApproval {
+  resolve: (approved: boolean) => void;
+  timer: ReturnType<typeof setTimeout>;
+  command: string;
+  msgId?: number;
+  chatId?: number;
+}
+
 interface AgentInstance {
   id: string;
   config: AgentConfig;
@@ -82,13 +101,16 @@ interface AgentInstance {
   ephemeral: boolean;
   repo: string;                            // resolved repo path (from config or /repo command)
   model: string;                           // resolved model (from config or /model command)
-  ccProcess: CCProcess | null;             // single CC process per agent
+  ccProcess: ICCProcess | null; // single CC process per agent
   accumulator: StreamAccumulator | null;   // single accumulator per agent
   subAgentTracker: SubAgentTracker | null; // single tracker per agent
   batcher: MessageBatcher | null;          // single batcher per agent
   pendingPermissions: Map<string, PendingPermission>; // requestId → pending permission
+  pendingExecApprovals: Map<string, PendingExecApproval>; // id → pending supervisor_exec approval
   typingInterval: ReturnType<typeof setInterval> | null; // single typing interval
   typingChatId: number | null;             // chat currently showing typing indicator
+  lastTgChatId: number | null;             // most recent TG chat that sent a message (for batcher closure)
+  lastTgUserId: number | null;             // most recent TG user that sent a message (for group exec permissions)
   pendingSessionId: string | null;         // for /resume: sessionId to use on next spawn
   forceNewSession: boolean;               // /new was used — don't auto-continue on next spawn
   pendingIdeAwareness: boolean;           // true when resuming a session that was active in an IDE
@@ -96,9 +118,10 @@ interface AgentInstance {
   eventBuffer: EventBuffer;               // ring buffer for observability
   awaitingAskCleanup: boolean;            // true when AskUserQuestion was detected this turn → delete fallback bubble on result
   deferredSends: Array<{ text: string; fromAgentId: string }>; // queued by waitForIdle sends
-  supervisorWakeOnComplete: boolean; // ping supervisor TG when next turn ends
-  lastSupervisorSentText: string | null; // last text sent by supervisor → include in wake context
   muteOutput: boolean; // suppress TG rendering for wake-triggered supervisor turns
+  authFlowInProgress: boolean; // prevents re-entrant auth fallback
+  lastSendData: { text: string; source?: { chatId?: number; spawnSource?: 'telegram' | 'supervisor' | 'cli' } } | null; // for retry after auth
+  claudeConfigDir: string | undefined; // isolated CLAUDE_CONFIG_DIR for docker agents
 }
 
 interface SupervisorPendingRequest {
@@ -207,6 +230,8 @@ const HELP_TEXT = `<b>TGCC Commands</b>
 /cron run &lt;id&gt; — Trigger a job now
 /cron remove &lt;id&gt; — Remove a dynamic job
 
+/ralph &lt;prompt&gt; — Spawn shepherd to ensure task completion
+
 /help — This message`;
 
 // ── Bridge ──
@@ -224,6 +249,10 @@ export class Bridge extends EventEmitter implements CtlHandler {
   // High-signal event detection
   private highSignalDetector: HighSignalDetector;
   private eventDedup: EventDedup;
+  private eventRouter: EventRouter;
+  private supervisorManager: SupervisorManager | null = null;
+  private watcherManager: WatcherManager;
+  private ralphManager: RalphManager;
 
   // Heartbeat & cron scheduling
   private scheduler: Scheduler;
@@ -233,17 +262,11 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
   // Native supervisor (TGCC-internal)
   private nativeSupervisorId: string | null;
-  private supervisorEventQueue: string[] = [];
-  private static readonly SUPERVISOR_QUEUE_MAX = 20;
-  /** Workers whose high-signal events are forwarded to the supervisor's TG chat in real time. */
-  private trackedWorkers = new Set<string>();
   private pendingWaitForResult = new Map<string, {
     resolve: (response: McpToolResponse) => void;
     timer: ReturnType<typeof setTimeout>;
   }>();
   /** Periodic heartbeat timer that wakes the supervisor with tracked worker status. */
-  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
-  private heartbeatIntervalMs = 0;
 
   // External supervisor protocol (OpenClaw plugin)
   private supervisorWrite: ((line: string) => void) | null = null;
@@ -272,6 +295,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
       }
     };
     this.eventDedup = new EventDedup(routeDedupedEvent);
+    this.eventRouter = new EventRouter();
 
     this.highSignalDetector = new HighSignalDetector({
       emitSupervisorEvent: (event) => {
@@ -280,127 +304,108 @@ export class Bridge extends EventEmitter implements CtlHandler {
           this.sendToSupervisor(event);
         }
         // Native supervisor queue — tier 1+2 events, filtered through dedup layer
-        const ROUTED_EVENTS = new Set(['failure_loop', 'stuck', 'task_milestone', 'build_result', 'git_commit', 'subagent_spawn', 'budget_alert']);
+        const ROUTED_EVENTS = new Set(['failure_loop', 'stuck', 'task_milestone', 'build_result', 'git_commit', 'subagent_spawn', 'subagent_all_done', 'budget_alert']);
         if (ROUTED_EVENTS.has(event.event) && event.emoji && event.summary) {
           if (this.eventDedup.shouldForward(event)) {
             this.pushSupervisorEvent(event.agentId, `${event.emoji} ${event.summary}`);
           }
         }
+        // Route through EventRouter → delivers to WatcherManager subscribers (ralph) + future consumers
+        this.eventRouter.routeHighSignal(event);
       },
       pushEventBuffer: (agentId, line) => {
         const agent = this.agents.get(agentId);
         if (agent) agent.eventBuffer.push(line);
       },
     });
+
+    // Initialize SupervisorManager if a native supervisor is configured
+    if (this.nativeSupervisorId) {
+      this.supervisorManager = new SupervisorManager(this.nativeSupervisorId, {
+        sendToCC: (supId, text) => this.sendToCC(supId, { text }, { spawnSource: 'supervisor' }),
+        setMuteOutput: (supId, mute) => {
+          const a = this.agents.get(supId);
+          if (a) a.muteOutput = mute;
+        },
+        getSupervisorState: () => {
+          const a = this.agents.get(this.nativeSupervisorId!);
+          return a?.ccProcess?.state;
+        },
+        sendTgBlockquote: async (line) => {
+          const supAgent = this.agents.get(this.nativeSupervisorId!);
+          if (!supAgent?.tgBot) return;
+          const chatId = this.getAgentChatId(supAgent);
+          if (!chatId) return;
+          const acc = supAgent.accumulator;
+          if (acc?.hasActiveBubble) { await acc.flushIfDirty(); acc.reset(); }
+          await supAgent.tgBot.sendText(chatId, `<blockquote>${escapeHtml(line)}</blockquote>`, 'HTML', true);
+        },
+        getWorkerStatus: (agentId) => {
+          const a = this.agents.get(agentId);
+          const agentState = this.sessionStore.getAgent(agentId);
+          return {
+            state: a?.ccProcess?.state ?? 'idle',
+            cost: this.highSignalDetector.getSessionCost(agentId),
+            contextPct: this.highSignalDetector.getContextPercent(agentId),
+            lastActivity: agentState.lastActivity ?? null,
+          };
+        },
+      }, this.logger);
+    }
+
+    // Initialize WatcherManager (generic agent-watches-agent via EventRouter)
+    this.watcherManager = new WatcherManager(this.eventRouter, {
+      sendToCC: (watcherId, text) => this.sendToCC(watcherId, { text }, { spawnSource: 'supervisor' }),
+      agentExists: (agentId) => this.agents.has(agentId),
+    }, this.logger);
+
+    // Initialize RalphManager (ralph lifecycle: prompt, metadata, TG notifications)
+    this.ralphManager = new RalphManager({
+      watcherManager: this.watcherManager,
+      supervisorTrack: (agentId) => this.supervisorManager?.track(agentId),
+      pushSupervisorEvent: (agentId, text) => this.pushSupervisorEvent(agentId, text),
+      sendTgText: async (agentId, chatId, text, parseMode) => {
+        const a = this.agents.get(agentId);
+        if (!a?.tgBot) throw new Error('Agent has no TG bot');
+        await a.tgBot.sendText(chatId, text, parseMode as 'HTML');
+      },
+    }, this.logger, join(homedir(), '.tgcc', 'ralphs.json'));
   }
 
-  /** Wake the supervisor CC process directly by feeding queued worker events via sendToCC.
-   *  No Telegram round-trip — just pipes the event summary straight into the supervisor's stdin. */
-  private wakeSupervisor(sourceAgentId: string): void {
-    if (!this.nativeSupervisorId || sourceAgentId === this.nativeSupervisorId) return;
-    const supAgent = this.agents.get(this.nativeSupervisorId);
-    if (!supAgent) return;
-    // Mute TG output for this wake turn — supervisor responses to wake pings are internal
-    supAgent.muteOutput = true;
-    // Drain queued events into a single wake message
-    const events = this.supervisorEventQueue.splice(0);
-    const summary = events.length > 0
-      ? events.join('\n')
-      : `[${sourceAgentId}] turn complete`;
-    this.sendToCC(this.nativeSupervisorId, { text: summary }, { spawnSource: 'supervisor' });
-  }
-
-  /** Start or restart the supervisor heartbeat timer. Clears any existing timer first. */
+  /** Start or restart the supervisor heartbeat timer. Delegates to SupervisorManager. */
   private startHeartbeat(intervalMs: number): void {
-    this.stopHeartbeat();
-    if (intervalMs <= 0) return;
-    this.heartbeatIntervalMs = intervalMs;
-    this.heartbeatTimer = setInterval(() => this.heartbeatTick(), intervalMs);
-    this.logger.info({ intervalMs }, 'Supervisor heartbeat started');
+    this.supervisorManager?.startHeartbeat(intervalMs);
   }
 
-  /** Stop the supervisor heartbeat timer. */
+  /** Stop the supervisor heartbeat timer. Delegates to SupervisorManager. */
   private stopHeartbeat(): void {
-    if (this.heartbeatTimer) {
-      clearInterval(this.heartbeatTimer);
-      this.heartbeatTimer = null;
-      this.heartbeatIntervalMs = 0;
-      this.logger.info('Supervisor heartbeat stopped');
-    }
+    this.supervisorManager?.stopHeartbeat();
   }
 
-  /** Heartbeat tick — gather status for all tracked workers and wake the supervisor. */
-  private heartbeatTick(): void {
-    if (!this.nativeSupervisorId || this.trackedWorkers.size === 0) return;
-    // Don't wake if supervisor is mid-turn (it'll see events when its turn ends)
-    const sup = this.agents.get(this.nativeSupervisorId);
-    if (sup?.ccProcess && sup.ccProcess.state !== 'idle') return;
-
-    const lines: string[] = [];
-    for (const wid of this.trackedWorkers) {
-      const a = this.agents.get(wid);
-      if (!a) continue;
-      const state = a.ccProcess?.state ?? 'idle';
-      const cost = this.highSignalDetector.getSessionCost(wid);
-      const ctxPct = this.highSignalDetector.getContextPercent(wid);
-      const agentState = this.sessionStore.getAgent(wid);
-      const ago = agentState.lastActivity
-        ? this.formatElapsed(Date.now() - new Date(agentState.lastActivity).getTime())
-        : '?';
-      lines.push(`${wid}: ${state}, ${ctxPct}% ctx, $${cost.toFixed(2)}, last activity ${ago}`);
-    }
-    if (lines.length === 0) return;
-
-    const text = `[heartbeat] ${lines.join(' | ')}`;
-    this.pushSupervisorEvent(this.nativeSupervisorId, text, false);
-    this.wakeSupervisor(this.nativeSupervisorId);
-  }
-
-  /** Format milliseconds as a human-readable elapsed string (e.g. "3m", "1h 5m"). */
-  private formatElapsed(ms: number): string {
-    if (ms < 60_000) return `${Math.round(ms / 1000)}s`;
-    const mins = Math.round(ms / 60_000);
-    if (mins < 60) return `${mins}m`;
-    const hours = Math.floor(mins / 60);
-    return `${hours}h ${mins % 60}m`;
-  }
-
-  /** Push a message from a worker agent into the native supervisor's event queue, and immediately
-   *  post it to the supervisor's Telegram chat (if the worker is tracked or forceTg is set).
-   *  No-op if no native supervisor is configured or the source is the supervisor itself.
-   *  @param notifyTg — whether TG notification is desired at all (false suppresses completely)
-   *  @param forceTg — bypass tracking check (e.g. for explicit notify_parent calls) */
+  /** Push a message from a worker agent into the native supervisor's event queue.
+   *  Delegates to SupervisorManager. */
   private pushSupervisorEvent(sourceAgentId: string, text: string, notifyTg = true, forceTg = false): void {
-    if (!this.nativeSupervisorId || sourceAgentId === this.nativeSupervisorId) return;
-    const line = `🤖 [${sourceAgentId}] ${text}`;
-    this.supervisorEventQueue.push(line);
-    if (this.supervisorEventQueue.length > Bridge.SUPERVISOR_QUEUE_MAX) {
-      this.supervisorEventQueue.shift();
-    }
-    // Only forward to TG in real time if the worker is being tracked (or forceTg)
-    if (!notifyTg || (!forceTg && !this.trackedWorkers.has(sourceAgentId))) return;
-    // Send immediately to supervisor's TG chat
-    const supAgent = this.agents.get(this.nativeSupervisorId);
-    if (supAgent?.tgBot) {
-      const chatId = this.getAgentChatId(supAgent);
-      if (chatId) {
-        supAgent.tgBot.sendText(chatId, `<blockquote>${escapeHtml(line)}</blockquote>`, 'HTML', true)
-          .catch(err => this.logger.warn({ err }, 'Failed to push worker event to supervisor TG'));
-      }
-    }
+    this.supervisorManager?.pushEvent(sourceAgentId, text, notifyTg, forceTg);
+  }
+
+  /** The effective repo path for session discovery (container agents use a different path). */
+  private agentSessionRepo(agent: AgentInstance): string {
+    return agent.claudeConfigDir ? '/home/project' : agent.repo;
+  }
+
+  /** Discover CC sessions for an agent, using the correct config dir and repo slug. */
+  private discoverAgentSessions(agent: AgentInstance, limit = 10): DiscoveredSession[] {
+    if (!agent.repo) return [];
+    return discoverCCSessions(this.agentSessionRepo(agent), limit, agent.claudeConfigDir);
   }
 
   /** Send a supervisor message to an agent and register a wake-on-complete ping. */
   private sendSupervisorMessage(agentId: string, text: string, fromAgentId: string): void {
     const agent = this.agents.get(agentId);
     if (!agent) return;
-    const label = fromAgentId === this.nativeSupervisorId
-      ? `[From supervisor]`
-      : `[From agent ${fromAgentId}]`;
-    const labeledText = `${label}: ${text}`;
-    this.sendToCC(agentId, { text: labeledText }, { spawnSource: 'supervisor' });
-    agent.supervisorWakeOnComplete = true;
-    agent.lastSupervisorSentText = text;
+    const summary = text.length > 60 ? text.slice(0, 60) + '…' : text;
+    const taggedText = wrapTeammateMessage(fromAgentId, text, summary);
+    this.sendToCC(agentId, { text: taggedText }, { spawnSource: 'supervisor' });
     if (agent.tgBot) {
       const chatId = this.getAgentChatId(agent);
       if (chatId) {
@@ -536,6 +541,9 @@ export class Bridge extends EventEmitter implements CtlHandler {
       validAgentIds,
     );
 
+    // Restore persisted ralphs (re-create ephemeral agents and re-spawn with fresh prompt)
+    await this.restoreRalphs();
+
     this.logger.info({ agents: Object.keys(this.config.agents) }, 'Bridge started');
 
     // Emit bridge_started event to supervisor
@@ -565,7 +573,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
       if (!agent.repo) continue;
 
       try {
-        const sessions = discoverCCSessions(agent.repo, 1);
+        const sessions = this.discoverAgentSessions(agent, 1);
         if (sessions.length === 0) continue;
 
         const session = sessions[0];
@@ -584,7 +592,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
         if (session.endState === 'interrupted') {
           this.logger.info({ agentId, sessionId: session.id }, 'Auto-resume: sending nudge for interrupted session');
           this.sendToCC(agentId, {
-            text: '[System] TGCC restarted while you were mid-turn. Your previous session has been resumed. Continue where you left off.',
+            text: wrapSystemReminder('TGCC restarted while you were mid-turn. Your previous session has been resumed. Continue where you left off.'),
           });
         }
       } catch (err) {
@@ -622,8 +630,11 @@ export class Bridge extends EventEmitter implements CtlHandler {
       subAgentTracker: null,
       batcher: null,
       pendingPermissions: new Map(),
+      pendingExecApprovals: new Map(),
       typingInterval: null,
       typingChatId: null,
+      lastTgChatId: null,
+      lastTgUserId: null,
       pendingSessionId: null,
       forceNewSession: false,
       pendingIdeAwareness: false,
@@ -631,9 +642,12 @@ export class Bridge extends EventEmitter implements CtlHandler {
       eventBuffer: new EventBuffer(),
       awaitingAskCleanup: false,
       deferredSends: [],
-      supervisorWakeOnComplete: false,
-      lastSupervisorSentText: null,
       muteOutput: false,
+      authFlowInProgress: false,
+      lastSendData: null,
+      claudeConfigDir: agentConfig.share
+        ? join(homedir(), '.tgcc', 'agents', agentId, 'repos', computeProjectSlug(agentState.repo || configDefaults.repo), '.claude')
+        : undefined,
     };
 
     this.agents.set(agentId, instance);
@@ -837,6 +851,11 @@ ${hbContent}`;
     agent.typingChatId = null;
 
     agent.pendingPermissions.clear();
+    for (const [id, pending] of agent.pendingExecApprovals) {
+      clearTimeout(pending.timer);
+      pending.resolve(false);
+    }
+    agent.pendingExecApprovals.clear();
     agent.ccProcess = null;
     agent.batcher = null;
 
@@ -893,16 +912,23 @@ ${hbContent}`;
     }
 
     // Ensure batcher exists (one per agent, not per user)
+    // Track the most recent chatId so the flush callback uses the right one
+    agent.lastTgChatId = msg.chatId;
+    agent.lastTgUserId = msg.userId ? Number(msg.userId) : null;
     if (!agent.batcher) {
       agent.batcher = new MessageBatcher(2000, (combined) => {
-        this.sendToCC(agentId, combined, { chatId: msg.chatId, spawnSource: 'telegram' });
+        this.sendToCC(agentId, combined, { chatId: agent.lastTgChatId!, spawnSource: 'telegram' });
       });
     }
 
-    // Prepare text with reply context
+    // Prepare text with reply context and group attribution
     let text = msg.text;
     if (msg.replyToText) {
       text = `[Replying to: '${msg.replyToText}']\n\n${text}`;
+    }
+    // In group chats (negative chatId), prepend sender name so CC knows who's talking
+    if (msg.chatId < 0 && msg.userName) {
+      text = `[${msg.userName}]: ${text}`;
     }
 
     agent.batcher.add({
@@ -927,20 +953,16 @@ ${hbContent}`;
       agent.muteOutput = false;
     }
 
+    // Save for potential auth retry
+    agent.lastSendData = { text: data.text, source };
+
     // Construct CC message
     let text = data.text;
 
     // Prepend IDE awareness context to the first message after an IDE session takeover
     if (agent.pendingIdeAwareness) {
       agent.pendingIdeAwareness = false;
-      text = `[Context: This session was recently active in an IDE (VSCode). IDE messages are in your conversation history but may not appear in this Telegram chat.]\n\n${text}`;
-    }
-
-    // Drain queued worker events into the supervisor's message
-    if (agentId === this.nativeSupervisorId && this.supervisorEventQueue.length > 0) {
-      const events = this.supervisorEventQueue.splice(0);
-      const preamble = `[Worker events since last session]\n${events.join('\n')}\n\n`;
-      text = preamble + text;
+      text = `${wrapSystemReminder('This session was recently active in an IDE (VSCode). IDE messages are in your conversation history but may not appear in this Telegram chat.')}\n\n${text}`;
     }
 
     let ccMsg;
@@ -966,7 +988,10 @@ ${hbContent}`;
       proc = null;
     }
 
-    if (!proc || proc.state === 'idle') {
+    // Container agents can reuse their idle process (relay keeps CC alive between turns)
+    const isContainerIdle = proc?.state === 'idle' && agent.config.share?.mode === 'docker';
+
+    if (!proc || (proc.state === 'idle' && !isContainerIdle)) {
       // Warn if no repo is configured
       if (agent.repo === homedir()) {
         const chatId = source?.chatId;
@@ -1004,9 +1029,9 @@ ${hbContent}`;
           // Auto-continuing a recent session — check if it came from an IDE (e.g. VSCode)
           const ideChatId = source?.chatId;
           if (ideChatId && agent.tgBot) {
-            const recent = discoverCCSessions(agent.repo, 1);
+            const recent = this.discoverAgentSessions(agent, 1);
             if (recent.length > 0) {
-              const jsonlPath = getSessionJsonlPath(recent[0].id, agent.repo);
+              const jsonlPath = getSessionJsonlPath(recent[0].id, this.agentSessionRepo(agent), agent.claudeConfigDir);
               if (hasIDEContent(jsonlPath)) {
                 agent.tgBot.sendText(ideChatId, formatSystemMessage('status', 'Resuming a session previously active in VSCode IDE.'), 'HTML', true)
                   .catch(err => this.logger.error({ err }, 'Failed to send IDE origin notification'));
@@ -1046,7 +1071,7 @@ ${hbContent}`;
         });
       }
       // Native supervisor: notify if worker is tracked
-      if (this.trackedWorkers.has(agentId)) {
+      if (this.supervisorManager?.isTracked(agentId)) {
         this.pushSupervisorEvent(agentId, `🚀 Spawned (${spawnSource})`);
       }
     }
@@ -1103,11 +1128,20 @@ ${hbContent}`;
 
   // ── Typing indicator management ──
 
-  /** Get the primary TG chat ID for an agent (first allowed user). */
+  /** Get the primary TG chat ID for an agent. Priority: typing > last message > first allowed user. */
+  /** Get MCP tool capabilities for an agent. */
+  private getAgentCapabilities(agentId: string): string[] {
+    if (agentId === this.nativeSupervisorId) return ['*'];
+    if (this.ralphManager.isRalph(agentId)) return ['observe', 'manage', 'watch:self', 'basic'];
+    return [];
+  }
+
   private getAgentChatId(agent: AgentInstance): number | null {
-    // If we have a typing chatId, use that (most recent active chat)
+    // Active typing indicator (set during CC processing)
     if (agent.typingChatId) return agent.typingChatId;
-    // Fall back to first allowed user
+    // Last TG chat that sent a message (survives typing indicator stop)
+    if (agent.lastTgChatId) return agent.lastTgChatId;
+    // Fall back to first allowed user (DM chatId == userId for private chats)
     const firstUser = agent.config.allowedUsers[0];
     return firstUser ? Number(firstUser) : null;
   }
@@ -1140,7 +1174,7 @@ ${hbContent}`;
     }
   }
 
-  private spawnCCProcess(agentId: string): CCProcess {
+  private spawnCCProcess(agentId: string): ICCProcess {
     const agent = this.agents.get(agentId)!;
     const agentState = this.sessionStore.getAgent(agentId);
 
@@ -1164,31 +1198,89 @@ ${hbContent}`;
     const lastActivityMs = new Date(agentState.lastActivity).getTime();
     const continueSession = !forceNew && (!!sessionId || (Date.now() - lastActivityMs < STALE_THRESHOLD_MS));
 
-    // Generate MCP config (use agentId as the "userId" for socket naming)
-    const mcpServerPath = resolveMcpServerPath();
-    const mcpConfigPath = generateMcpConfig(
-      agentId,
-      agentId, // single socket per agent
-      this.config.global.socketDir,
-      mcpServerPath,
-      agentId === this.nativeSupervisorId,
-      this.config.global.mcpConfigDir,
-    );
+    // Start MCP socket listener for this agent (bridge-side, receives tool calls from CC's MCP client)
+    const mcpSocketPath = join(this.config.global.socketDir, `${agentId}-${agentId}.sock`);
+    this.mcpServer.listen(mcpSocketPath);
 
-    // Start MCP socket listener for this agent
-    const socketPath = join(this.config.global.socketDir, `${agentId}-${agentId}.sock`);
-    this.mcpServer.listen(socketPath);
+    // Compute isolated CLAUDE_CONFIG_DIR for shared agents
+    let claudeConfigDir: string | undefined;
+    if (agent.config.share) {
+      const slug = computeProjectSlug(agent.repo);
+      claudeConfigDir = join(homedir(), '.tgcc', 'agents', agentId, 'repos', slug, '.claude');
+      mkdirSync(claudeConfigDir, { recursive: true });
+      agent.claudeConfigDir = claudeConfigDir;
+    }
 
-    const proc = new CCProcess({
-      agentId,
-      userId: agentId, // agent is the sole "user"
-      ccBinaryPath: this.config.global.ccBinaryPath,
-      userConfig,
-      mcpConfigPath,
-      sessionId,
-      continueSession,
-      logger: this.logger,
-    });
+    const isDockerMode = agent.config.share?.mode === 'docker';
+
+    // Generate container CLAUDE.md (combines repo's CLAUDE.md + container instructions)
+    if (isDockerMode && claudeConfigDir) {
+      generateContainerClaudeMd(userConfig.repo, claudeConfigDir, agent.config.share?.claude_md);
+    }
+
+    let mcpConfigPath: string;
+    let proc: ICCProcess;
+
+    if (isDockerMode && agent.config.share && claudeConfigDir) {
+      // Docker mode: generate MCP config into the mounted .claude/ dir
+      // so it's accessible inside the container at /home/project/.claude/
+      mcpConfigPath = generateContainerMcpConfig(
+        agentId,
+        agentId,
+        claudeConfigDir,
+      );
+
+      // Ensure the container is running (syncs auth, mounts repo + dist + sockets)
+      const tgccDistDir = join(dirname(new URL(import.meta.url).pathname), '..');
+      const relaySocketPath = ensureContainer({
+        agentId,
+        repo: userConfig.repo,
+        shareConfig: agent.config.share,
+        socketDir: this.config.global.socketDir,
+        claudeConfigDir,
+        tgccDistDir,
+      });
+      this.logger.info({ agentId, socketPath: relaySocketPath }, 'Docker container ensured');
+
+      // Translate host MCP config path to container-local path
+      const mcpConfigFilename = mcpConfigPath.split('/').pop()!;
+      const containerMcpConfigPath = `/home/project/.claude/${mcpConfigFilename}`;
+
+      proc = new ContainerCCProcess({
+        agentId,
+        userId: agentId,
+        socketPath: relaySocketPath,
+        userConfig,
+        mcpConfigPath: containerMcpConfigPath,
+        sessionId,
+        continueSession,
+        logger: this.logger,
+        claudeConfigDir,
+      });
+    } else {
+      // Local mode: generate MCP config with host paths
+      const mcpServerPath = resolveMcpServerPath();
+      mcpConfigPath = generateMcpConfig(
+        agentId,
+        agentId,
+        this.config.global.socketDir,
+        mcpServerPath,
+        this.getAgentCapabilities(agentId),
+        this.config.global.mcpConfigDir,
+      );
+
+      proc = new CCProcess({
+        agentId,
+        userId: agentId,
+        ccBinaryPath: this.config.global.ccBinaryPath,
+        userConfig,
+        mcpConfigPath,
+        sessionId,
+        continueSession,
+        logger: this.logger,
+        claudeConfigDir,
+      });
+    }
 
     // Register in the process registry
     const ownerRef: ClientRef = { agentId, userId: agentId, chatId: 0 };
@@ -1267,7 +1359,7 @@ ${hbContent}`;
           tracker.setOnAllReported(() => {
             if (proc.state === 'active') {
               proc.sendMessage(createTextMessage(
-                '[System] All background agents have reported back. Please read their results from the mailbox/files and provide a synthesis to the user.',
+                wrapSystemReminder('All background agents have reported back. Please read their results from the mailbox/files and provide a synthesis to the user.'),
               ));
             }
           });
@@ -1397,12 +1489,17 @@ ${hbContent}`;
       agent.eventBuffer.push({ ts: Date.now(), type: 'system', text: label + tokenInfo });
       const chatId = this.getAgentChatId(agent);
       if (chatId && agent.tgBot) {
-        agent.tgBot.sendText(
-          chatId,
-          `<blockquote>${escapeHtml(label + tokenInfo)}</blockquote>`,
-          'HTML',
-          true, // silent
-        ).catch((err: Error) => this.logger.error({ err }, 'Failed to send compact notification'));
+        // Finalize the current streaming bubble so the compact notice appears below it
+        const acc = agent.accumulator;
+        const flush = acc?.hasActiveBubble ? acc.flushIfDirty().then(() => acc.reset()) : Promise.resolve();
+        flush
+          .then(() => agent.tgBot!.sendText(
+            chatId,
+            `<blockquote>${escapeHtml(label + tokenInfo)}</blockquote>`,
+            'HTML',
+            true, // silent
+          ))
+          .catch((err: Error) => this.logger.error({ err }, 'Failed to send compact notification'));
       }
     });
 
@@ -1443,7 +1540,18 @@ ${hbContent}`;
             await agent.accumulator.flushIfDirty();
             agent.accumulator.reset();
           }
-          const planText = '📋 CC wants to exit plan mode and start implementing.';
+          // Send plan content as a .md document if available
+          const planContent = req.input?.plan as string | undefined;
+          const planFilePath = req.input?.planFilePath as string | undefined;
+          if (planContent && agent.tgBot) {
+            const filename = planFilePath ? planFilePath.split('/').pop()! : 'plan.md';
+            await agent.tgBot.sendDocumentBuffer(
+              permChatId,
+              Buffer.from(planContent, 'utf-8'),
+              filename,
+            );
+          }
+          const planText = '📋 Plan submitted — approve to start implementing.';
           const keyboard = new InlineKeyboard()
             .text('✅ Approve', `perm_allow:${requestId}`)
             .text('❌ Reject', `perm_deny:${requestId}`);
@@ -1470,14 +1578,18 @@ ${hbContent}`;
       // Forward to supervisor so it can render approve/deny UI
       if (this.isSupervisorSubscribed(agentId, proc.sessionId)) {
         const description = req.decision_reason || `CC wants to use ${req.tool_name}`;
-        this.sendToSupervisor({
+        const supervisorEvent: Record<string, unknown> = {
           type: 'event',
           event: 'permission_request',
           agentId,
           toolName: req.tool_name,
           requestId,
           description,
-        });
+        };
+        if (req.tool_name === 'ExitPlanMode' && req.input?.plan) {
+          supervisorEvent.planContent = req.input.plan;
+        }
+        this.sendToSupervisor(supervisorEvent);
       }
     });
 
@@ -1490,6 +1602,12 @@ ${hbContent}`;
         : '';
 
       agent.eventBuffer.push({ ts: Date.now(), type: 'error', text: `${errMsg}${retryInfo}` });
+
+      // Auth error detection — trigger OAuth fallback via Telegram
+      if (isAuthError(status, errMsg) && !agent.authFlowInProgress) {
+        this.triggerAuthFallback(agentId);
+        return; // skip normal error display — auth flow handles messaging
+      }
 
       const text = isOverloaded
         ? formatSystemMessage('error', `API overloaded, retrying...${retryInfo}`)
@@ -1506,7 +1624,8 @@ ${hbContent}`;
       agent.pendingSessionId = proc.sessionId ?? null;
       this.stopTypingIndicator(agent);
       // Auto-destroy ephemeral agents when their CC session ends naturally
-      if (agent.ephemeral && agent.deferredSends.length === 0) {
+      // Skip ralph/watcher agents — they stay alive waiting for events and have their own timeout
+      if (agent.ephemeral && agent.deferredSends.length === 0 && !this.ralphManager.isRalph(agentId)) {
         this.logger.info({ agentId }, 'Ephemeral agent session idle — auto-destroying');
         this.destroyEphemeralAgent(agentId);
       }
@@ -1554,7 +1673,7 @@ ${hbContent}`;
 
       // If the supervisor's session just ended, clear tracked workers and stop heartbeat
       if (agentId === this.nativeSupervisorId) {
-        this.trackedWorkers.clear();
+        this.supervisorManager?.clearTracked();
         this.stopHeartbeat();
       }
 
@@ -1577,9 +1696,14 @@ ${hbContent}`;
           this.sendToSupervisor({ type: 'event', event: 'process_exit', agentId, sessionId: proc.sessionId, exitCode: null });
         }
         // Native supervisor: notify if worker is tracked
-        if (this.trackedWorkers.has(agentId)) {
+        if (this.supervisorManager?.isTracked(agentId)) {
           this.pushSupervisorEvent(agentId, wasActive ? `💀 Process died mid-turn` : `💀 Process exited`);
         }
+        // Route to EventRouter → watchers (ralph) + future consumers
+        this.eventRouter.routeLifecycle({
+          type: 'process_exited', agentId, event: 'process_exited',
+          summary: wasActive ? 'Process died mid-turn' : 'Process exited',
+        });
       }
 
       this.stopTypingIndicator(agent);
@@ -1603,7 +1727,8 @@ ${hbContent}`;
       // Process exited — deliver any deferred messages (will spawn a new process)
       this.drainDeferredSends(agentId);
       // Auto-destroy ephemeral agents on process exit (if no deferred sends spawned a new process)
-      if (agent.ephemeral && agent.deferredSends.length === 0 && !agent.ccProcess) {
+      // Skip ralph/watcher agents — they stay alive waiting for events and have their own timeout
+      if (agent.ephemeral && agent.deferredSends.length === 0 && !agent.ccProcess && !this.ralphManager.isRalph(agentId)) {
         this.logger.info({ agentId }, 'Ephemeral agent process exited — auto-destroying');
         this.destroyEphemeralAgent(agentId);
       }
@@ -1633,6 +1758,12 @@ ${hbContent}`;
 
     const chatId = this.getAgentChatId(agent);
     if (!chatId) return;
+
+    // Recreate accumulator if the active chat changed (e.g. DM → group or vice versa)
+    if (agent.accumulator && agent.accumulator.activeChatId !== chatId) {
+      agent.accumulator.flushIfDirty().then(() => agent.accumulator?.reset()).catch(() => {});
+      agent.accumulator = null;
+    }
 
     if (!agent.accumulator && agent.tgBot) {
       const tgBot = agent.tgBot; // capture for closures (non-null here)
@@ -1671,8 +1802,14 @@ ${hbContent}`;
         sender: subAgentSender,
         onEditAttempt: (msgId, preview) => agent.accumulator?.logIfSealed(msgId, preview),
         onAllDone: ({ count, elapsedMs }) => {
-          const elapsed = elapsedMs > 0 ? ` · ${Math.round(elapsedMs / 1000)}s` : '';
-          this.pushSupervisorEvent(agentId, `✅ Sub-agents done (${count}/${count})${elapsed}`, false);
+          const elapsed = elapsedMs > 0 ? `${Math.round(elapsedMs / 1000)}s` : '';
+          this.highSignalDetector.emitEvent(agentId, {
+            type: 'event',
+            event: 'subagent_all_done',
+            agentId,
+            count,
+            elapsed,
+          });
         },
       });
     }
@@ -1702,6 +1839,54 @@ ${hbContent}`;
     });
   }
 
+  /**
+   * Trigger the OAuth auth fallback flow for an agent.
+   * Kills the current CC process, runs `claude auth login` via TG, then retries.
+   */
+  private async triggerAuthFallback(agentId: string): Promise<void> {
+    const agent = this.agents.get(agentId);
+    if (!agent || agent.authFlowInProgress) return;
+    if (!this.config.global.authFallbackEnabled) return;
+
+    const chatId = this.getAgentChatId(agent);
+    if (!chatId || !agent.tgBot) {
+      this.logger.warn({ agentId }, 'Auth fallback skipped — no TG chat');
+      return;
+    }
+
+    agent.authFlowInProgress = true;
+
+    // Kill the current CC process (it's in an auth-error state)
+    if (agent.ccProcess) {
+      agent.ccProcess.kill();
+    }
+
+    this.logger.info({ agentId }, 'Auth error detected — starting OAuth fallback flow');
+    agent.eventBuffer.push({ ts: Date.now(), type: 'system', text: '🔑 Auth error detected — starting OAuth fallback' });
+
+    const result = await runAuthFlow({
+      ccBinaryPath: this.config.global.ccBinaryPath,
+      chatId,
+      tgBot: agent.tgBot,
+      timeoutMs: this.config.global.authFallbackTimeoutMs,
+      logger: this.logger,
+    });
+
+    agent.authFlowInProgress = false;
+
+    if (result.success && agent.lastSendData) {
+      // Retry the last message
+      const { text, source } = agent.lastSendData;
+      agent.lastSendData = null;
+      agent.forceNewSession = true;
+      this.logger.info({ agentId }, 'Auth successful — retrying last message');
+      await this.sendToCC(agentId, { text }, source);
+    } else if (!result.success) {
+      agent.lastSendData = null;
+      this.logger.error({ agentId, error: result.error }, 'Auth fallback failed');
+    }
+  }
+
   private async handleResult(agentId: string, event: ResultEvent): Promise<void> {
     const agent = this.agents.get(agentId);
     if (!agent) return;
@@ -1727,12 +1912,14 @@ ${hbContent}`;
       agent.muteOutput = false;
       const cost = event.total_cost_usd ? ` · $${event.total_cost_usd.toFixed(4)}` : '';
       this.pushSupervisorEvent(agentId, `${event.is_error ? '❌' : '✅'} Turn complete${cost}`, false);
-      if (agent.supervisorWakeOnComplete) {
-        agent.supervisorWakeOnComplete = false;
-        agent.lastSupervisorSentText = null;
-        this.wakeSupervisor(agentId);
-      }
       this.drainDeferredSends(agentId);
+      // Route to EventRouter → watchers (ralph) get notified even for muted turns
+      this.eventRouter.routeLifecycle({
+        type: 'turn_complete', agentId, event: 'turn_complete',
+        cost: event.total_cost_usd ? `$${event.total_cost_usd.toFixed(4)}` : undefined,
+        isError: event.is_error,
+        replySnippet: typeof event.result === 'string' ? event.result.trim().slice(0, 300) : undefined,
+      });
       return;
     }
 
@@ -1776,27 +1963,29 @@ ${hbContent}`;
       }
     }
 
-    // Route turn-complete to native supervisor queue
+    // Route turn-complete to native supervisor
     const cost = event.total_cost_usd ? ` · $${event.total_cost_usd.toFixed(4)}` : '';
     this.pushSupervisorEvent(agentId, `${event.is_error ? '❌' : '✅'} Turn complete${cost}`, false);
-
-    // Wake supervisor if it sent a message this turn — enrich queue with sent/reply context
-    if (agent.supervisorWakeOnComplete) {
-      agent.supervisorWakeOnComplete = false;
-      const sentText = agent.lastSupervisorSentText;
-      agent.lastSupervisorSentText = null;
-      const replyText = typeof event.result === 'string' ? event.result.trim() : null;
-      const sentLine = sentText ? `\n  Sent: "${sentText.length > 80 ? sentText.slice(0, 80) + '…' : sentText}"` : '';
-      const replyLine = replyText ? `\n  Reply: "${replyText.length > 120 ? replyText.slice(0, 120) + '…' : replyText}"` : '';
-      this.pushSupervisorEvent(agentId, `💬 Turn complete${cost}${sentLine}${replyLine}`, false);
-      this.wakeSupervisor(agentId);
-    }
 
     // Deliver any waitForIdle-deferred messages now that the turn is done
     this.drainDeferredSends(agentId);
 
+    // Route to EventRouter → watchers (ralph) + future consumers
+    this.eventRouter.routeLifecycle({
+      type: 'turn_complete', agentId, event: 'turn_complete',
+      cost: event.total_cost_usd ? `$${event.total_cost_usd.toFixed(4)}` : undefined,
+      isError: event.is_error,
+      replySnippet: typeof event.result === 'string' ? event.result.trim().slice(0, 300) : undefined,
+    });
+
     // Handle errors (only send to TG if bot available)
     if (event.is_error && chatId && agent.tgBot) {
+      // Check if result errors contain auth failures — trigger auth fallback instead of showing error
+      if (resultHasAuthError(event.errors) && !agent.authFlowInProgress) {
+        void this.triggerAuthFallback(agentId);
+        return;
+      }
+
       // Capture diagnostic errors from error_during_execution subtype
       const errorDetails = event.errors?.length
         ? event.errors.join('\n')
@@ -1829,7 +2018,7 @@ ${hbContent}`;
               tracker.markCompleted(info.toolUseId, '(results delivered in CC response)');
             }
           }
-          proc.sendMessage(createTextMessage('[System] The background agents should be done by now. Please read their results from the mailbox/files and report to the user.'));
+          proc.sendMessage(createTextMessage(wrapSystemReminder('The background agents should be done by now. Please read their results from the mailbox/files and report to the user.')));
         }, 60_000);
       }
     }
@@ -1944,7 +2133,7 @@ ${hbContent}`;
         let sessionToResume = contSession;
         let sessionTitle: string | null = null;
         if (agent.repo) {
-          const discovered = discoverCCSessions(agent.repo, 20);
+          const discovered = this.discoverAgentSessions(agent, 20);
           if (!sessionToResume && discovered.length > 0) {
             sessionToResume = discovered[0].id;
           }
@@ -1970,15 +2159,16 @@ ${hbContent}`;
         const currentSessionId = agent.ccProcess?.sessionId ?? null;
 
         // Discover sessions from CC's session directory
-        const discovered = repo ? discoverCCSessions(repo, 5) : [];
+        const discovered = this.discoverAgentSessions(agent, 5);
 
-        type MergedSession = { id: string; title: string; age: string; detail: string; isCurrent: boolean };
+        type MergedSession = { id: string; title: string; summary: string | null; age: string; detail: string; isCurrent: boolean };
         const merged: MergedSession[] = discovered.map(d => {
           const ctx = d.contextPct !== null ? ` · ${d.contextPct}% ctx` : '';
           const modelTag = d.model ? ` · ${shortModel(d.model)}` : '';
           return {
             id: d.id,
             title: d.title,
+            summary: d.summary,
             age: formatAge(d.mtime),
             detail: `~${d.lineCount} entries${ctx}${modelTag}`,
             isCurrent: d.id === currentSessionId,
@@ -1997,15 +2187,16 @@ ${hbContent}`;
         for (const s of merged) {
           const displayTitle = escapeHtml(s.title);
           const kb = new InlineKeyboard();
+          const summaryLine = s.summary ? `\n<i>${escapeHtml(s.summary.length > 150 ? s.summary.slice(0, 150) + '…' : s.summary)}</i>` : '';
           if (s.isCurrent) {
             const repoLine = repo ? `\n📂 <code>${escapeHtml(shortenRepoPath(repo))}</code>` : '';
             const sessModel = agent.model;
             const modelLine = sessModel ? `\n🤖 ${escapeHtml(sessModel)}` : '';
             const sessionLine = `\n📎 <code>${escapeHtml(s.id.slice(0, 8))}</code>`;
-            const text = `<blockquote><b>Current session:</b>\n${displayTitle}\n${s.detail} · ${s.age}${repoLine}${modelLine}${sessionLine}</blockquote>`;
+            const text = `<blockquote><b>Current session:</b>\n${displayTitle}${summaryLine}\n${s.detail} · ${s.age}${repoLine}${modelLine}${sessionLine}</blockquote>`;
             await agent.tgBot.sendText(cmd.chatId, text, 'HTML');
           } else {
-            const text = `${displayTitle}\n<code>${escapeHtml(s.id.slice(0, 8))}</code> · ${s.detail} · ${s.age}`;
+            const text = `${displayTitle}${summaryLine}\n<code>${escapeHtml(s.id.slice(0, 8))}</code> · ${s.detail} · ${s.age}`;
             const btnTitle = s.title.length > 30 ? s.title.slice(0, 30) + '…' : s.title;
             kb.text(`▶ ${btnTitle}`, `resume:${s.id}`);
             await agent.tgBot.sendTextWithKeyboard(cmd.chatId, text, kb, 'HTML');
@@ -2031,7 +2222,7 @@ ${hbContent}`;
           await agent.tgBot.sendText(cmd.chatId, '<blockquote>No active session.</blockquote>', 'HTML');
           break;
         }
-        const discovered = agent.repo ? discoverCCSessions(agent.repo, 20) : [];
+        const discovered = this.discoverAgentSessions(agent, 20);
         const info = discovered.find(d => d.id === currentSessionId);
         if (!info) {
           await agent.tgBot.sendText(cmd.chatId, `<b>Session:</b> <code>${escapeHtml(currentSessionId.slice(0, 8))}</code>`, 'HTML');
@@ -2256,6 +2447,23 @@ ${hbContent}`;
           : '/compact';
         await agent.tgBot.sendText(cmd.chatId, formatSystemMessage('status', 'Compacting…'), 'HTML');
         agent.ccProcess.sendMessage(createTextMessage(compactMsg));
+        break;
+      }
+
+      case 'ralph': {
+        const prompt = cmd.args?.trim() || 'Ensure the worker completes its current task successfully. Infer the goal from the session history and event log below.';
+        const { ralphId, error: ralphError } = this.spawnRalph({
+          targetAgentId: agentId,
+          prompt,
+          invokerAgentId: agentId,
+          invokerChatId: cmd.chatId,
+        });
+        if (ralphError) {
+          await agent.tgBot.sendText(cmd.chatId, `<blockquote>❌ ${escapeHtml(ralphError)}</blockquote>`, 'HTML');
+        } else {
+          await agent.tgBot.sendText(cmd.chatId,
+            `<blockquote>🐕 Ralph spawned as <code>${ralphId}</code>, watching <code>${agentId}</code>\nPrompt: ${escapeHtml(prompt.slice(0, 120))}</blockquote>`, 'HTML');
+        }
         break;
       }
 
@@ -2777,6 +2985,40 @@ ${hbContent}`;
         break;
       }
 
+      case 'exec_allow': {
+        const approvalId = query.data;
+        const pending = agent.pendingExecApprovals.get(approvalId);
+        if (!pending) {
+          await agent.tgBot.answerCallbackQuery(query.callbackQueryId, 'Request expired');
+          break;
+        }
+        clearTimeout(pending.timer);
+        agent.pendingExecApprovals.delete(approvalId);
+        pending.resolve(true);
+        await agent.tgBot.answerCallbackQuery(query.callbackQueryId, '✅ Allowed');
+        if (pending.msgId && pending.chatId) {
+          agent.tgBot.editText(pending.chatId, pending.msgId, `✅ Exec approved: <code>${escapeHtml(pending.command)}</code>`, 'HTML').catch(() => {});
+        }
+        break;
+      }
+
+      case 'exec_deny': {
+        const approvalId = query.data;
+        const pending = agent.pendingExecApprovals.get(approvalId);
+        if (!pending) {
+          await agent.tgBot.answerCallbackQuery(query.callbackQueryId, 'Request expired');
+          break;
+        }
+        clearTimeout(pending.timer);
+        agent.pendingExecApprovals.delete(approvalId);
+        pending.resolve(false);
+        await agent.tgBot.answerCallbackQuery(query.callbackQueryId, '❌ Denied');
+        if (pending.msgId && pending.chatId) {
+          agent.tgBot.editText(pending.chatId, pending.msgId, `❌ Exec denied: <code>${escapeHtml(pending.command)}</code>`, 'HTML').catch(() => {});
+        }
+        break;
+      }
+
       default:
         await agent.tgBot.answerCallbackQuery(query.callbackQueryId);
     }
@@ -2826,7 +3068,7 @@ ${hbContent}`;
 
       // List sessions from CC's session directory
       if (agent.repo) {
-        for (const d of discoverCCSessions(agent.repo, 5)) {
+        for (const d of this.discoverAgentSessions(agent, 5)) {
           sessions.push({
             id: d.id,
             agentId: id,
@@ -2867,8 +3109,6 @@ ${hbContent}`;
           const priority = String(request.params.priority ?? 'info');
           const emoji = priority === 'blocker' ? '🚨' : 'ℹ️';
           this.pushSupervisorEvent(request.agentId, `${emoji} ${request.params.message as string}`, true, true);
-          // Wake supervisor CC process directly
-          this.wakeSupervisor(request.agentId);
           if (!this.supervisorWrite && !this.nativeSupervisorId) {
             return { id: request.id, success: false, error: 'No supervisor connected' };
           }
@@ -2876,21 +3116,81 @@ ${hbContent}`;
         }
 
         case 'supervisor_exec': {
-          if (!this.supervisorWrite) {
-            return { id: request.id, success: false, error: 'No supervisor connected' };
-          }
           const timeoutMs = (request.params.timeoutMs as number) || 60000;
-          const result = await this.sendSupervisorRequest({
-            type: 'command',
-            requestId: randomUUID(),
-            action: 'exec',
-            params: {
-              command: request.params.command,
-              agentId: request.agentId,
-              timeoutMs,
-            },
-          }, timeoutMs);
-          return { id: request.id, success: true, result };
+          const command = String(request.params.command ?? '');
+
+          // Group permission check: if triggered from a group by a non-admin, require admin approval
+          if (agent) {
+            const chatId = agent.lastTgChatId;
+            const userId = agent.lastTgUserId;
+            const isGroup = chatId !== null && chatId < 0;
+            const isAdmin = userId !== null && agent.config.allowedUsers.includes(String(userId));
+
+            if (isGroup && !isAdmin && agent.tgBot) {
+              // Find admin DM chat ID (first allowedUser)
+              const adminId = agent.config.allowedUsers[0];
+              if (!adminId) {
+                return { id: request.id, success: false, error: 'No admin configured — cannot approve exec' };
+              }
+              const adminChatId = Number(adminId);
+
+              // Send approval request to admin's DM
+              const approvalId = randomUUID();
+              const approved = await new Promise<boolean>((resolve) => {
+                const timer = setTimeout(() => {
+                  agent.pendingExecApprovals.delete(approvalId);
+                  resolve(false);
+                }, 60_000);
+                agent.pendingExecApprovals.set(approvalId, { resolve, timer, command });
+
+                const keyboard = new InlineKeyboard()
+                  .text('✅ Allow', `exec_allow:${approvalId}`)
+                  .text('❌ Deny', `exec_deny:${approvalId}`);
+                const text = `⚡ <b>Exec request</b> from group:\n<code>${escapeHtml(command)}</code>\n\nRequested by user ${userId}`;
+                agent.tgBot!.sendTextWithKeyboard(adminChatId, text, keyboard, 'HTML')
+                  .then(msgId => {
+                    const pending = agent.pendingExecApprovals.get(approvalId);
+                    if (pending) { pending.msgId = msgId; pending.chatId = adminChatId; }
+                  })
+                  .catch(err => this.logger.error({ err }, 'Failed to send exec approval request'));
+              });
+
+              if (!approved) {
+                return { id: request.id, success: false, error: 'Command denied or approval timed out' };
+              }
+            }
+          }
+
+          // Route to external supervisor plugin if connected
+          if (this.supervisorWrite) {
+            const result = await this.sendSupervisorRequest({
+              type: 'command',
+              requestId: randomUUID(),
+              action: 'exec',
+              params: {
+                command,
+                agentId: request.agentId,
+                timeoutMs,
+              },
+            }, timeoutMs);
+            return { id: request.id, success: true, result };
+          }
+
+          // Native fallback: execute locally on the host
+          // Log it and notify supervisor TG chat so there's visibility
+          this.logger.info({ command, agentId: request.agentId }, 'supervisor_exec: running locally (no external supervisor)');
+          this.pushSupervisorEvent(request.agentId, `⚡ exec: \`${command}\``, true, true);
+          try {
+            const output = execSync(command, {
+              timeout: timeoutMs,
+              encoding: 'utf-8',
+              maxBuffer: 1024 * 1024,
+            });
+            return { id: request.id, success: true, result: output };
+          } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            return { id: request.id, success: false, error: `exec failed: ${msg}` };
+          }
         }
 
         case 'supervisor_notify': {
@@ -2930,8 +3230,6 @@ ${hbContent}`;
                 ).catch(err => this.logger.warn({ err }, 'Failed to send supervisor_notify to supervisor TG'));
               }
             }
-            // Wake supervisor CC process directly
-            this.wakeSupervisor(request.agentId);
           }
 
           if (!this.supervisorWrite && !this.nativeSupervisorId) {
@@ -2945,22 +3243,31 @@ ${hbContent}`;
 
       const workerAllowedTools = new Set([
         'tgcc_agents', 'tgcc_spawn', 'tgcc_send', 'tgcc_status', 'tgcc_log', 'tgcc_destroy',
+        'ralph_done',
       ]);
       const supervisorOnlyTools = new Set([
         'tgcc_kill', 'tgcc_session', 'tgcc_cron', 'tgcc_track', 'tgcc_untrack',
+        'tgcc_ralph',
       ]);
 
       if (workerAllowedTools.has(request.tool) || supervisorOnlyTools.has(request.tool)) {
         const isInternalCaller = request.userId === 'cron' || request.userId === 'system';
-        // Supervisor-only tools: reject non-supervisor callers
+        // Supervisor-only tools: reject non-supervisor callers (ralph agents with 'manage' cap are allowed)
         if (supervisorOnlyTools.has(request.tool) &&
-            request.agentId !== this.nativeSupervisorId && !isInternalCaller) {
+            request.agentId !== this.nativeSupervisorId &&
+            !this.ralphManager.isRalph(request.agentId) &&
+            !isInternalCaller) {
+          this.logger.warn({ tool: request.tool, agentId: request.agentId, userId: request.userId }, 'Rejected supervisor-only tool from non-supervisor');
           return { id: request.id, success: false, error: 'Only the supervisor may use this tool' };
         }
         // Worker-allowed tools: verify calling agent exists
         if (workerAllowedTools.has(request.tool) &&
             !this.agents.has(request.agentId) && !isInternalCaller) {
           return { id: request.id, success: false, error: 'Unknown calling agent' };
+        }
+
+        if (supervisorOnlyTools.has(request.tool)) {
+          this.logger.info({ tool: request.tool, agentId: request.agentId, userId: request.userId }, 'Supervisor-only tool allowed');
         }
 
         switch (request.tool) {
@@ -2998,7 +3305,7 @@ ${hbContent}`;
                 lastActivitySummary: lastLog?.text ?? null,
                 sessionCost: this.highSignalDetector.getSessionCost(aid),
                 contextPct: this.highSignalDetector.getContextPercent(aid),
-                tracked: this.trackedWorkers.has(aid),
+                tracked: this.supervisorManager?.isTracked(aid) ?? false,
               };
             }
             return { id: request.id, success: true, result };
@@ -3010,7 +3317,7 @@ ${hbContent}`;
             const targetAgent = this.agents.get(targetId);
             if (!targetAgent) return { id: request.id, success: false, error: `Unknown agent: ${targetId}` };
             // Implicitly track this worker so its high-signal events are forwarded to supervisor TG
-            this.trackedWorkers.add(targetId);
+            this.supervisorManager?.track(targetId);
             if (request.params.newSession) targetAgent.forceNewSession = true;
             if (request.params.sessionId) targetAgent.pendingSessionId = request.params.sessionId as string;
             if (request.params.followUp && (!targetAgent.ccProcess || targetAgent.ccProcess.state === 'idle')) {
@@ -3019,7 +3326,6 @@ ${hbContent}`;
             // waitForIdle: queue if agent is mid-turn, deliver on next turn complete
             if (request.params.waitForIdle && targetAgent.ccProcess) {
               targetAgent.deferredSends.push({ text, fromAgentId: request.agentId });
-              targetAgent.supervisorWakeOnComplete = true;
               return { id: request.id, success: true, result: { agentId: targetId, state: 'deferred' } };
             }
             this.sendSupervisorMessage(targetId, text, request.agentId);
@@ -3053,7 +3359,7 @@ ${hbContent}`;
 
             switch (action) {
               case 'list': {
-                const sessions = discoverCCSessions(targetAgent.repo, (request.params.limit as number) ?? 10);
+                const sessions = this.discoverAgentSessions(targetAgent, (request.params.limit as number) ?? 10);
                 return { id: request.id, success: true, result: sessions };
               }
               case 'new': {
@@ -3084,7 +3390,7 @@ ${hbContent}`;
                 this.killAgentProcess(targetId);
                 let sessionToResume = contSession;
                 if (!sessionToResume && targetAgent.repo) {
-                  const discovered = discoverCCSessions(targetAgent.repo, 1);
+                  const discovered = this.discoverAgentSessions(targetAgent, 1);
                   if (discovered.length > 0) sessionToResume = discovered[0].id;
                 }
                 if (sessionToResume) {
@@ -3178,8 +3484,11 @@ ${hbContent}`;
               subAgentTracker: null,
               batcher: null,
               pendingPermissions: new Map(),
+      pendingExecApprovals: new Map(),
               typingInterval: null,
               typingChatId: null,
+      lastTgChatId: null,
+      lastTgUserId: null,
               pendingSessionId: null,
               forceNewSession: true,
               pendingIdeAwareness: false,
@@ -3187,10 +3496,11 @@ ${hbContent}`;
               eventBuffer: new EventBuffer(),
               awaitingAskCleanup: false,
               deferredSends: [],
-              supervisorWakeOnComplete: false,
-              lastSupervisorSentText: null,
               muteOutput: false,
-            };
+              authFlowInProgress: false,
+              lastSendData: null,
+              claudeConfigDir: undefined,
+                    };
 
             // Auto-destroy timer
             const timeoutMs = request.params.timeoutMs as number | undefined;
@@ -3262,16 +3572,48 @@ ${hbContent}`;
             return { id: request.id, success: true, result: { destroyed: true, agentId: targetId } };
           }
 
+          case 'tgcc_ralph': {
+            const targetId = request.params.agentId as string;
+            if (!targetId) return { id: request.id, success: false, error: 'agentId is required' };
+            const prompt = (request.params.prompt as string) || 'Ensure the worker completes its current task successfully. Infer the goal from the session history and event log below.';
+
+            // Determine invoker chat for TG notifications
+            const invokerAgent = this.agents.get(request.agentId);
+            const invokerChatId = invokerAgent ? (this.getAgentChatId(invokerAgent) ?? 0) : 0;
+
+            const { ralphId, error } = this.spawnRalph({
+              targetAgentId: targetId,
+              prompt,
+              invokerAgentId: request.agentId,
+              invokerChatId,
+              timeoutMs: request.params.timeoutMs as number | undefined,
+            });
+
+            if (error) return { id: request.id, success: false, error };
+            return { id: request.id, success: true, result: { ralphId, targetAgentId: targetId, state: 'spawning' } };
+          }
+
+          case 'ralph_done': {
+            if (!this.ralphManager.isRalph(request.agentId)) {
+              return { id: request.id, success: false, error: 'Only Ralph agents can call ralph_done' };
+            }
+
+            const summary = request.params.summary as string || 'No summary provided';
+            const success = (request.params.success as boolean) ?? true;
+
+            const result = this.ralphManager.done(request.agentId, summary, success);
+            if (result.error) return { id: request.id, success: false, error: result.error };
+
+            this.destroyEphemeralAgent(request.agentId);
+            return { id: request.id, success: true, result: { destroyed: true } };
+          }
+
           case 'tgcc_track': {
             const targetId = request.params.agentId as string;
             if (!targetId) return { id: request.id, success: false, error: 'agentId is required' };
             const targetAgent = this.agents.get(targetId);
             if (!targetAgent) return { id: request.id, success: false, error: `Unknown agent: ${targetId}` };
-            this.trackedWorkers.add(targetId);
-            // If agent is mid-turn, wake supervisor when the turn ends
-            if (targetAgent.ccProcess && targetAgent.ccProcess.state !== 'idle') {
-              targetAgent.supervisorWakeOnComplete = true;
-            }
+            this.supervisorManager?.track(targetId);
             // Start/update heartbeat if requested
             const heartbeatMs = request.params.heartbeatMs as number | undefined;
             if (heartbeatMs && heartbeatMs >= 30_000) {
@@ -3280,16 +3622,16 @@ ${hbContent}`;
             this.logger.info({ targetId, heartbeatMs }, 'Supervisor tracking worker');
             return {
               id: request.id, success: true,
-              result: { agentId: targetId, tracked: true, heartbeatMs: this.heartbeatIntervalMs || null },
+              result: { agentId: targetId, tracked: true, heartbeatMs: this.supervisorManager?.getHeartbeatInterval() || null },
             };
           }
 
           case 'tgcc_untrack': {
             const targetId = request.params.agentId as string;
             if (!targetId) return { id: request.id, success: false, error: 'agentId is required' };
-            const wasTracked = this.trackedWorkers.delete(targetId);
+            const wasTracked = this.supervisorManager?.untrack(targetId) ?? false;
             // Stop heartbeat if no more tracked workers
-            if (this.trackedWorkers.size === 0) this.stopHeartbeat();
+            if (this.supervisorManager && this.supervisorManager.trackedWorkers.size === 0) this.stopHeartbeat();
             this.logger.info({ targetId, wasTracked }, 'Supervisor untracking worker');
             return { id: request.id, success: true, result: { agentId: targetId, tracked: false, wasTracked } };
           }
@@ -3391,6 +3733,14 @@ ${hbContent}`;
                 return { id: request.id, success: false, error: `Unknown cron action: ${action}` };
             }
           }
+        }
+      }
+
+      // Ralph agents don't have their own TG chat — route send_message through invoker
+      if (request.tool === 'send_message') {
+        const ralphResult = await this.ralphManager.routeSendMessage(request.agentId, request.params.text);
+        if (ralphResult) {
+          return { id: request.id, success: ralphResult.success, error: ralphResult.error };
         }
       }
 
@@ -3537,8 +3887,11 @@ ${hbContent}`;
           subAgentTracker: null,
           batcher: null,
           pendingPermissions: new Map(),
+      pendingExecApprovals: new Map(),
           typingInterval: null,
           typingChatId: null,
+      lastTgChatId: null,
+      lastTgUserId: null,
           pendingSessionId: null,
           forceNewSession: false,
           pendingIdeAwareness: false,
@@ -3546,9 +3899,10 @@ ${hbContent}`;
           eventBuffer: new EventBuffer(),
           awaitingAskCleanup: false,
           deferredSends: [],
-          supervisorWakeOnComplete: false,
-      lastSupervisorSentText: null,
-      muteOutput: false,
+          muteOutput: false,
+      authFlowInProgress: false,
+      lastSendData: null,
+      claudeConfigDir: undefined,
         };
 
         // Auto-destroy timer
@@ -3761,7 +4115,7 @@ ${hbContent}`;
         this.killAgentProcess(agentId);
         let sessionToResume = contSession;
         if (!sessionToResume && agent.repo) {
-          const discovered = discoverCCSessions(agent.repo, 1);
+          const discovered = this.discoverAgentSessions(agent, 1);
           if (discovered.length > 0) sessionToResume = discovered[0].id;
         }
         if (sessionToResume) {
@@ -3789,7 +4143,7 @@ ${hbContent}`;
         if (!agent) throw new Error(`Unknown agent: ${agentId}`);
         const limit = (params.limit as number | undefined) ?? 10;
         const currentSessionId = agent.ccProcess?.sessionId ?? null;
-        const discovered = agent.repo ? discoverCCSessions(agent.repo, limit) : [];
+        const discovered = this.discoverAgentSessions(agent, limit);
         const sessions = discovered.map(d => ({
           id: d.id,
           title: d.title,
@@ -3922,11 +4276,178 @@ ${hbContent}`;
   private destroyEphemeralAgent(agentId: string): void {
     const agent = this.agents.get(agentId);
     if (!agent || !agent.ephemeral) return;
+
+    // Route agent_destroyed to EventRouter → watchers (ralph) + future consumers
+    this.eventRouter.routeLifecycle({
+      type: 'agent_destroyed', agentId, event: 'agent_destroyed',
+      summary: 'Ephemeral agent destroyed',
+    });
+    // Remove watcher registration (if ralph is destroyed, stop watching its target)
+    this.watcherManager.removeWatcher(agentId);
+    // Remove all watchers that were watching this agent
+    this.watcherManager.removeWatchersForTarget(agentId);
+    // Clean up ralph metadata
+    this.ralphManager.handleDestroyed(agentId);
+
     this.killAgentProcess(agentId);
     this.agents.delete(agentId);
     this.logger.info({ agentId }, 'Ephemeral agent destroyed');
     this.sendToSupervisor({ type: 'event', event: 'agent_destroyed', agentId });
     this.pushSupervisorEvent(agentId, `🗑️ Ephemeral agent destroyed`);
+  }
+
+  // ── Ralph: spawn completion shepherd ──
+
+  /** Restore persisted ralphs after restart — re-creates ephemeral agents with fresh sessions. */
+  private async restoreRalphs(): Promise<void> {
+    const persisted = this.ralphManager.loadPersisted();
+    if (persisted.length === 0) return;
+
+    this.logger.info({ count: persisted.length }, 'Restoring persisted ralphs');
+    for (const pr of persisted) {
+      // Check target agent still exists
+      if (!this.agents.has(pr.meta.targetAgentId)) {
+        this.logger.warn({ ralphId: pr.ralphId, targetAgentId: pr.meta.targetAgentId }, 'Ralph target agent gone — skipping restore');
+        this.ralphManager.handleDestroyed(pr.ralphId);
+        continue;
+      }
+
+      // Calculate remaining timeout
+      const elapsed = Date.now() - pr.createdAt;
+      const remaining = pr.timeoutMs - elapsed;
+      if (remaining <= 0) {
+        this.logger.info({ ralphId: pr.ralphId }, 'Ralph expired during downtime — skipping restore');
+        this.ralphManager.handleDestroyed(pr.ralphId);
+        continue;
+      }
+
+      // Re-spawn ralph with the original prompt (will get fresh session history)
+      const { ralphId, error } = this.spawnRalph({
+        targetAgentId: pr.meta.targetAgentId,
+        prompt: pr.prompt,
+        invokerAgentId: pr.meta.invokerAgentId,
+        invokerChatId: pr.meta.invokerChatId,
+        timeoutMs: remaining,
+        ralphIdOverride: pr.ralphId,
+        restored: true,
+      });
+
+      if (error) {
+        this.logger.warn({ ralphId: pr.ralphId, error }, 'Failed to restore ralph');
+        this.ralphManager.handleDestroyed(pr.ralphId);
+      } else {
+        this.logger.info({ ralphId }, 'Ralph restored after restart');
+      }
+    }
+  }
+
+  private spawnRalph(opts: {
+    targetAgentId: string;
+    prompt: string;
+    invokerAgentId: string;
+    invokerChatId: number;
+    timeoutMs?: number;
+    ralphIdOverride?: string;
+    restored?: boolean;
+  }): { ralphId: string; error?: string } {
+    const { targetAgentId, prompt, invokerAgentId, invokerChatId } = opts;
+    const targetAgent = this.agents.get(targetAgentId);
+    if (!targetAgent) return { ralphId: '', error: `Unknown agent: ${targetAgentId}` };
+
+    const ralphId = opts.ralphIdOverride ?? `ralph-${randomUUID().slice(0, 8)}`;
+    if (this.agents.has(ralphId)) return { ralphId: '', error: 'Ralph ID collision — try again' };
+
+    // Gather context
+    const proc = targetAgent.ccProcess;
+    const status = {
+      state: proc?.state ?? 'idle',
+      model: targetAgent.model,
+      repo: targetAgent.repo,
+      cost: this.highSignalDetector.getSessionCost(targetAgentId) ?? 0,
+      contextPct: this.highSignalDetector.getContextPercent(targetAgentId),
+      sessionId: proc?.sessionId ?? null,
+    };
+
+    const recentLog = targetAgent.eventBuffer.query({ limit: 30 });
+    const logText = recentLog.lines.map(l => `[${l.type}] ${l.text}`).join('\n');
+
+    let sessionHistory = '';
+    if (status.sessionId) {
+      const jsonlPath = getSessionJsonlPath(status.sessionId, targetAgent.repo, targetAgent.claudeConfigDir);
+      sessionHistory = extractRecentConversation(jsonlPath, 16, 10000);
+    }
+
+    const systemPrompt = buildRalphPrompt({ targetAgentId, prompt, status, recentLog: logText, sessionHistory, restored: opts.restored });
+
+    // Create ephemeral ralph agent
+    const ephemeralConfig: AgentConfig = {
+      botToken: '',
+      allowedUsers: [],
+      defaults: {
+        model: 'sonnet',
+        repo: targetAgent.repo,
+        maxTurns: 200,
+        idleTimeoutMs: 600_000,
+        hangTimeoutMs: 300_000,
+        permissionMode: 'dangerously-skip',
+      },
+    };
+
+    const instance: AgentInstance = {
+      id: ralphId,
+      config: ephemeralConfig,
+      tgBot: null,
+      ephemeral: true,
+      repo: targetAgent.repo,
+      model: 'sonnet',
+      ccProcess: null,
+      accumulator: null,
+      subAgentTracker: null,
+      batcher: null,
+      pendingPermissions: new Map(),
+      pendingExecApprovals: new Map(),
+      typingInterval: null,
+      typingChatId: null,
+      lastTgChatId: null,
+      lastTgUserId: null,
+      pendingSessionId: null,
+      forceNewSession: true,
+      pendingIdeAwareness: false,
+      destroyTimer: null,
+      eventBuffer: new EventBuffer(),
+      awaitingAskCleanup: false,
+      deferredSends: [],
+      muteOutput: false,
+      authFlowInProgress: false,
+      lastSendData: null,
+      claudeConfigDir: undefined,
+    };
+
+    // Auto-destroy timeout (default 30 minutes)
+    const timeoutMs = opts.timeoutMs ?? 30 * 60_000;
+    instance.destroyTimer = setTimeout(() => {
+      // Guard: skip if ralph was already destroyed (e.g. via ralph_done)
+      if (!this.agents.has(ralphId)) return;
+      this.logger.info({ agentId: ralphId, timeoutMs }, 'Ralph timeout — auto-destroying');
+      // Notify user
+      const invokerAgent = this.agents.get(invokerAgentId);
+      if (invokerAgent?.tgBot) {
+        invokerAgent.tgBot.sendText(invokerChatId,
+          `<blockquote>⏰ Ralph (<code>${ralphId}</code>) timed out after ${Math.round(timeoutMs / 60_000)}min watching <code>${targetAgentId}</code></blockquote>`, 'HTML')
+          .catch(() => {});
+      }
+      this.destroyEphemeralAgent(ralphId);
+    }, timeoutMs);
+
+    this.agents.set(ralphId, instance);
+
+    // Register ralph: watcher subscription + supervisor tracking + TG notification
+    this.ralphManager.register(ralphId, { targetAgentId, invokerChatId, invokerAgentId }, { prompt, timeoutMs });
+
+    // Send initial prompt
+    this.sendToCC(ralphId, { text: systemPrompt }, { spawnSource: 'supervisor' });
+
+    return { ralphId };
   }
 
   // ── Shutdown ──
@@ -3952,6 +4473,10 @@ ${hbContent}`;
     this.processRegistry.clear();
     this.highSignalDetector.destroy();
     this.eventDedup.destroy();
+    this.ralphManager.destroy();
+    this.watcherManager.destroy();
+    this.supervisorManager?.destroy();
+    this.eventRouter.destroy();
     this.mcpServer.closeAll();
     this.ctlServer.closeAll();
     this.removeAllListeners();
@@ -4015,7 +4540,7 @@ function buildAskAnswers(
 /** Submit answers for AskUserQuestion via the correct mechanism. */
 function submitAskAnswer(
   pending: PendingPermission,
-  proc: CCProcess,
+  proc: ICCProcess,
   questions: AskQuestion[],
   answers: Record<string, string[]>,
 ): void {

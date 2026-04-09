@@ -83,7 +83,7 @@ Available to every CC process — workers and supervisor alike.
 | `send_image` | Send an image with preview |
 | `send_voice` | Send a voice message (.ogg opus) |
 | `send_message` | Send a text message to the user |
-| `notify_parent` | Send a message to the supervisor (info/question/blocker) |
+| `notify_supervisor` | Send a message to the supervisor (info/question/blocker) |
 | `supervisor_exec` | Request the supervisor to execute a shell command |
 | `supervisor_notify` | Send a notification to the user through the supervisor |
 
@@ -157,9 +157,9 @@ Jobs persist to `~/.config/tgcc/cron-jobs.json`.
 | `remove` | `jobId` (dynamic only) |
 | `trigger` | `jobId` |
 
-Schedule params (mutually exclusive): `every` (e.g. `"30m"`), `at` (e.g. `"20m"`, one-shot), `cron` (raw expression). Optional: `name`, `tz`, `session` (main/isolated), `announce`.
+Schedule params (mutually exclusive): `every` (e.g. `"30m"`), `at` (e.g. `"20m"`, one-shot), `cron` (raw expression). Optional: `name`, `tz`, `session` (main/isolated).
 
-#### `notify_parent(message, [priority])`
+#### `notify_supervisor(message, [priority])`
 
 Priority levels: `info`, `question`, `blocker`. Routes to supervisor event queue + TG chat.
 
@@ -175,6 +175,7 @@ Priority levels: `info`, `question`, `blocker`. Routes to supervisor event queue
 | `git_commit` | `git commit` in Bash output | 📝 |
 | `context_pressure` | Token usage crosses 50/75/90% | 🧠 |
 | `subagent_spawn` | CC uses Agent/Task/SendMessage/TeamCreate | 🔄 |
+| `subagent_all_done` | All dispatched sub-agents complete | ✅ |
 | `failure_loop` | 3+ consecutive tool failures | 🔁 |
 | `task_milestone` | TodoWrite call with progress | 📋 |
 | `stuck` | No CC output for 5 minutes | ⚠️ |
@@ -221,7 +222,7 @@ HighSignalDetector.handleToolResult()
 ### 5.4 Routed Events
 
 Events forwarded to the native supervisor queue:
-`failure_loop`, `stuck`, `task_milestone`, `build_result`, `git_commit`, `subagent_spawn`, `budget_alert`
+`failure_loop`, `stuck`, `task_milestone`, `build_result`, `git_commit`, `subagent_spawn`, `subagent_all_done`, `budget_alert`
 
 Not routed: `context_pressure` (pull-only via `tgcc_log`), compaction events, stream deltas.
 

@@ -115,7 +115,7 @@ text block starts → text segment pushed, deltas arrive → requestRender()
     │
     ▼
 [firstSendReady gate]
-    ├─ 200+ chars of text OR 2s elapsed → send first TG message (new bubble)
+    ├─ 200+ chars of text OR (newline + 80 chars) OR 4s elapsed → send first TG message (new bubble)
     └─ neither → wait (firstSendTimer fires after remaining time)
     │
     ▼
@@ -262,19 +262,20 @@ New turn starts (reset() called)
     │
     flushRender() called, no tgMessageId yet
     checkFirstSendReady():
-        ├─ text chars >= 200  → firstSendReady=true, send now ✓
-        ├─ elapsed >= 2000ms  → firstSendReady=true, send now ✓
+        ├─ text chars >= 200                      → firstSendReady=true, send now ✓
+        ├─ hasNewline && text chars >= 80          → firstSendReady=true, send now ✓
+        ├─ elapsed >= 4000ms                      → firstSendReady=true, send now ✓
         └─ neither → start firstSendTimer if not running
     │
     firstSendTimer = setTimeout(() => {
         firstSendReady = true
         requestRender()          ← triggers flush on next tick
-    }, max(0, 2000 - elapsed))
+    }, max(0, 4000 - elapsed))
 ```
 
 **Cleared by:** text threshold hit early, `finalize()` (force-sets `firstSendReady=true`), `softReset()`, `reset()`.
 
-**Purpose:** Avoid sending a TG message with just "…" for fast turns. Waits for meaningful content.
+**Purpose:** Avoid sending a TG message with just "…" for fast turns. Waits for meaningful content (200+ chars, or 2+ lines with 80+ chars, or 4s timeout).
 
 ### 7c. toolHideTimers — fast-tool suppressor
 
