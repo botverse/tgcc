@@ -1865,9 +1865,6 @@ ${hbContent}`;
     const agent = this.agents.get(agentId);
     if (!agent) return;
 
-    // Muted turn (heartbeat or supervisor wake) — skip TG rendering
-    if (agent.muteOutput) return;
-
     const chatId = this.getAgentChatId(agent);
     if (!chatId) return;
 
@@ -2019,21 +2016,9 @@ ${hbContent}`;
       return;
     }
 
-    // Muted turn (heartbeat or supervisor wake) — skip TG rendering
-    if (agent.muteOutput) {
-      agent.muteOutput = false;
-      const cost = event.total_cost_usd ? ` · $${event.total_cost_usd.toFixed(4)}` : '';
-      this.pushSupervisorEvent(agentId, `${event.is_error ? '❌' : '✅'} Turn complete${cost}`, false);
-      this.drainDeferredSends(agentId);
-      // Route to EventRouter → watchers (ralph) get notified even for muted turns
-      this.eventRouter.routeLifecycle({
-        type: 'turn_complete', agentId, event: 'turn_complete',
-        cost: event.total_cost_usd ? `$${event.total_cost_usd.toFixed(4)}` : undefined,
-        isError: event.is_error,
-        replySnippet: typeof event.result === 'string' ? event.result.trim().slice(0, 300) : undefined,
-      });
-      return;
-    }
+    // Always reset mute on turn complete — mute is disabled for now, but keep the reset
+    // so any stale value cleared from a pre-upgrade state doesn't persist.
+    agent.muteOutput = false;
 
     const chatId = this.getAgentChatId(agent);
 
