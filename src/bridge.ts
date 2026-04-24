@@ -18,6 +18,7 @@ import { ensureContainer, generateContainerClaudeMd, generateContainerMcpConfig 
 import {
   createTextMessage,
   createImageMessage,
+  createMultiImageMessage,
   createDocumentMessage,
   extractAssistantText,
   type InitEvent,
@@ -44,6 +45,7 @@ import {
   type CtlHandler,
   type CtlAckResponse,
   type CtlStatusResponse,
+  type CtlCliAttachedResponse,
 } from './ctl-server.js';
 import { ProcessRegistry, type ClientRef, type ProcessEntry } from './process-registry.js';
 import { EventBuffer } from './event-buffer.js';
@@ -122,6 +124,7 @@ interface AgentInstance {
   authFlowInProgress: boolean; // prevents re-entrant auth fallback
   lastSendData: { text: string; source?: { chatId?: number; spawnSource?: 'telegram' | 'supervisor' | 'cli' } } | null; // for retry after auth
   claudeConfigDir: string | undefined; // isolated CLAUDE_CONFIG_DIR for docker agents
+  pendingCliTmuxAgent: string | null; // waiting for tmux session name reply from /new-cli
 }
 
 interface SupervisorPendingRequest {
@@ -132,21 +135,51 @@ interface SupervisorPendingRequest {
 
 // ── Message Batcher ──
 
-class MessageBatcher {
-  private pending: Array<{ text: string; imageBase64?: string; imageMediaType?: string; filePath?: string; fileName?: string }> = [];
-  private timer: ReturnType<typeof setTimeout> | null = null;
-  private readonly windowMs: number;
-  private flush: (combined: { text: string; imageBase64?: string; imageMediaType?: string; filePath?: string; fileName?: string }) => void;
+interface BatcherMessage {
+  text: string;
+  imageBase64?: string;
+  imageMediaType?: string;
+  filePath?: string;
+  fileName?: string;
+  mediaGroupId?: string;
+}
 
-  constructor(windowMs: number, flushFn: typeof MessageBatcher.prototype.flush) {
+interface BatcherOutput {
+  text: string;
+  imageBase64?: string;
+  imageMediaType?: string;
+  images?: Array<{ base64: string; mediaType: string }>;
+  filePath?: string;
+  fileName?: string;
+}
+
+class MessageBatcher {
+  private pending: BatcherMessage[] = [];
+  private timer: ReturnType<typeof setTimeout> | null = null;
+  private mediaGroupTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly windowMs: number;
+  private readonly mediaGroupWindowMs = 500; // wait for more photos in the same album
+  private flush: (combined: BatcherOutput) => void;
+
+  constructor(windowMs: number, flushFn: (combined: BatcherOutput) => void) {
     this.windowMs = windowMs;
     this.flush = flushFn;
   }
 
-  add(msg: { text: string; imageBase64?: string; imageMediaType?: string; filePath?: string; fileName?: string }): void {
+  add(msg: BatcherMessage): void {
     this.pending.push(msg);
 
-    // If this is a media message, flush immediately (don't batch media)
+    // Media group photo: wait briefly for more photos in the same album
+    if (msg.imageBase64 && msg.mediaGroupId) {
+      if (this.mediaGroupTimer) clearTimeout(this.mediaGroupTimer);
+      this.mediaGroupTimer = setTimeout(() => {
+        this.mediaGroupTimer = null;
+        this.doFlush();
+      }, this.mediaGroupWindowMs);
+      return;
+    }
+
+    // Single (non-grouped) media: flush immediately
     if (msg.imageBase64 || msg.filePath) {
       this.doFlush();
       return;
@@ -158,39 +191,50 @@ class MessageBatcher {
   }
 
   private doFlush(): void {
-    if (this.timer) {
-      clearTimeout(this.timer);
-      this.timer = null;
-    }
+    if (this.timer) { clearTimeout(this.timer); this.timer = null; }
+    if (this.mediaGroupTimer) { clearTimeout(this.mediaGroupTimer); this.mediaGroupTimer = null; }
 
     if (this.pending.length === 0) return;
 
-    // If there's a single message with media, send it directly
-    if (this.pending.length === 1) {
+    // Collect all images from the batch
+    const imageMessages = this.pending.filter(m => m.imageBase64);
+    const textParts = this.pending.map(m => m.text).filter(Boolean);
+    const combinedText = textParts.join('\n\n');
+
+    if (imageMessages.length > 1) {
+      // Multiple images → send as multi-image message
+      const images = imageMessages.map(m => ({
+        base64: m.imageBase64!,
+        mediaType: m.imageMediaType || 'image/jpeg',
+      }));
+      this.flush({ text: combinedText, images });
+    } else if (imageMessages.length === 1) {
+      // Single image
+      this.flush({
+        text: combinedText,
+        imageBase64: imageMessages[0].imageBase64,
+        imageMediaType: imageMessages[0].imageMediaType,
+      });
+    } else if (this.pending.length === 1 && (this.pending[0].filePath)) {
+      // Single file attachment
       this.flush(this.pending[0]);
-      this.pending = [];
-      return;
+    } else {
+      // Text-only
+      this.flush({ text: combinedText });
     }
 
-    // Combine text-only messages
-    const combined = this.pending.map(m => m.text).filter(Boolean).join('\n\n');
-    this.flush({ text: combined });
     this.pending = [];
   }
 
   cancel(): void {
-    if (this.timer) {
-      clearTimeout(this.timer);
-      this.timer = null;
-    }
+    if (this.timer) { clearTimeout(this.timer); this.timer = null; }
+    if (this.mediaGroupTimer) { clearTimeout(this.mediaGroupTimer); this.mediaGroupTimer = null; }
     this.pending = [];
   }
 
   destroy(): void {
-    if (this.timer) {
-      clearTimeout(this.timer);
-      this.timer = null;
-    }
+    if (this.timer) { clearTimeout(this.timer); this.timer = null; }
+    if (this.mediaGroupTimer) { clearTimeout(this.mediaGroupTimer); this.mediaGroupTimer = null; }
   }
 }
 
@@ -200,6 +244,7 @@ const HELP_TEXT = `<b>TGCC Commands</b>
 
 <b>Session</b>
 /new — Start a fresh session
+/new_cli — Open interactive CLI session via tmux
 /continue — Respawn process, keep session
 /sessions — List recent sessions
 /resume &lt;id&gt; — Resume a session by ID
@@ -357,11 +402,21 @@ export class Bridge extends EventEmitter implements CtlHandler {
     this.watcherManager = new WatcherManager(this.eventRouter, {
       sendToCC: (watcherId, text) => this.sendToCC(watcherId, { text }, { spawnSource: 'supervisor' }),
       agentExists: (agentId) => this.agents.has(agentId),
+      sendTgBlockquote: async (agentId, text) => {
+        const agent = this.agents.get(agentId);
+        if (!agent?.tgBot) return;
+        const chatId = this.getAgentChatId(agent);
+        if (!chatId) return;
+        const acc = agent.accumulator;
+        if (acc?.hasActiveBubble) { await acc.flushIfDirty(); acc.reset(); }
+        await agent.tgBot.sendText(chatId, `<blockquote>${escapeHtml(text)}</blockquote>`, 'HTML', true);
+      },
     }, this.logger);
 
     // Initialize RalphManager (ralph lifecycle: prompt, metadata, TG notifications)
     this.ralphManager = new RalphManager({
       watcherManager: this.watcherManager,
+      eventRouter: this.eventRouter,
       supervisorTrack: (agentId) => this.supervisorManager?.track(agentId),
       pushSupervisorEvent: (agentId, text) => this.pushSupervisorEvent(agentId, text),
       sendTgText: async (agentId, chatId, text, parseMode) => {
@@ -544,6 +599,9 @@ export class Bridge extends EventEmitter implements CtlHandler {
     // Restore persisted ralphs (re-create ephemeral agents and re-spawn with fresh prompt)
     await this.restoreRalphs();
 
+    // Set up config-based persistent tracking (agent.tracks → WatcherManager)
+    this.setupPersistentTracking();
+
     this.logger.info({ agents: Object.keys(this.config.agents) }, 'Bridge started');
 
     // Emit bridge_started event to supervisor
@@ -648,6 +706,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
       claudeConfigDir: agentConfig.share
         ? join(homedir(), '.tgcc', 'agents', agentId, 'repos', computeProjectSlug(agentState.repo || configDefaults.repo), '.claude')
         : undefined,
+      pendingCliTmuxAgent: null,
     };
 
     this.agents.set(agentId, instance);
@@ -720,6 +779,8 @@ ${hbContent}`;
       } else {
         // Update in-memory config — active processes keep old config
         oldAgent.config = newAgentConfig;
+        // Propagate to TelegramBot (clears rejection cache, bootstraps new group rosters)
+        oldAgent.tgBot?.updateConfig(newAgentConfig);
       }
     }
 
@@ -902,6 +963,29 @@ ${hbContent}`;
       }
     }
 
+    // Handle pending /new-cli tmux session name reply
+    if (agent.pendingCliTmuxAgent && msg.text) {
+      const tmuxName = msg.text.trim().replace(/[^a-zA-Z0-9_-]/g, '');
+      const targetAgent = agent.pendingCliTmuxAgent;
+      agent.pendingCliTmuxAgent = null;
+      if (!tmuxName) {
+        agent.tgBot?.sendText(msg.chatId, '<blockquote>Invalid session name. Use alphanumeric characters only.</blockquote>', 'HTML').catch(() => {});
+        return;
+      }
+      const tgccBin = process.argv[1] ?? 'tgcc';
+      try {
+        execSync(`tmux new-session -d -s ${JSON.stringify(tmuxName)} "${tgccBin} attach --agent ${targetAgent}"`, { stdio: 'ignore' });
+        agent.tgBot?.sendText(
+          msg.chatId,
+          `<blockquote>CLI session created in new tmux session <code>${escapeHtml(tmuxName)}</code>.\nAttach: <code>tmux attach -t ${escapeHtml(tmuxName)}</code></blockquote>`,
+          'HTML',
+        ).catch(() => {});
+      } catch (err) {
+        agent.tgBot?.sendText(msg.chatId, `<blockquote>Failed to create tmux session: ${escapeHtml(String(err))}</blockquote>`, 'HTML').catch(() => {});
+      }
+      return;
+    }
+
     // Voice messages: transcribe with whisper before forwarding
     if (msg.type === 'voice') {
       this.transcribeVoice(agentId, msg).catch(err => {
@@ -926,9 +1010,17 @@ ${hbContent}`;
     if (msg.replyToText) {
       text = `[Replying to: '${msg.replyToText}']\n\n${text}`;
     }
-    // In group chats (negative chatId), prepend sender name so CC knows who's talking
+    // In group chats (negative chatId), prepend sender identity so CC knows who's talking
     if (msg.chatId < 0 && msg.userName) {
-      text = `[${msg.userName}]: ${text}`;
+      const tag = msg.userHandle ? `${msg.userName} (@${msg.userHandle})` : msg.userName;
+      text = `[${tag}]: ${text}`;
+      // Inject group roster + optional groupContext as system-reminder
+      const roster = agent.tgBot?.getGroupRoster(msg.chatId);
+      const groupCtx = agent.config.groupContext;
+      const contextParts = [roster, groupCtx].filter(Boolean);
+      if (contextParts.length > 0) {
+        text = `${wrapSystemReminder(contextParts.join('\n\n'))}\n${text}`;
+      }
     }
 
     agent.batcher.add({
@@ -937,16 +1029,23 @@ ${hbContent}`;
       imageMediaType: msg.imageMediaType,
       filePath: msg.filePath,
       fileName: msg.fileName,
+      mediaGroupId: msg.mediaGroupId,
     });
   }
 
   private async sendToCC(
     agentId: string,
-    data: { text: string; imageBase64?: string; imageMediaType?: string; filePath?: string; fileName?: string },
+    data: { text: string; imageBase64?: string; imageMediaType?: string; images?: Array<{ base64: string; mediaType: string }>; filePath?: string; fileName?: string },
     source?: { chatId?: number; spawnSource?: 'telegram' | 'supervisor' | 'cli' }
   ): Promise<void> {
     const agent = this.agents.get(agentId);
     if (!agent) return;
+
+    // If this agent has an active CLI session, inject text into the PTY instead of pipe mode
+    if (this.ctlServer.hasCliSession(agentId)) {
+      this.ctlServer.sendToCliSocket(agentId, { type: 'cli_inject', text: data.text });
+      return;
+    }
 
     // Clear mute if this is a user-facing send (not a wake ping)
     if (source?.spawnSource !== 'supervisor') {
@@ -966,7 +1065,9 @@ ${hbContent}`;
     }
 
     let ccMsg;
-    if (data.imageBase64) {
+    if (data.images && data.images.length > 0) {
+      ccMsg = createMultiImageMessage(text, data.images);
+    } else if (data.imageBase64) {
       ccMsg = createImageMessage(
         text,
         data.imageBase64,
@@ -1102,6 +1203,11 @@ ${hbContent}`;
   private killAgentProcess(agentId: string): void {
     const agent = this.agents.get(agentId);
     if (!agent) return;
+
+    // If agent has an active CLI session, kill via ctl socket
+    if (this.ctlServer.hasCliSession(agentId)) {
+      this.ctlServer.sendToCliSocket(agentId, { type: 'cli_kill' });
+    }
 
     const proc = agent.ccProcess;
     if (proc) {
@@ -1665,7 +1771,7 @@ ${hbContent}`;
     });
 
     proc.on('exit', () => {
-      const wasActive = proc.stateBeforeExit === 'active';
+      const wasActive = proc.stateBeforeExit === 'active' && proc.activityBeforeExit !== 'idle';
       const wasKilledByUs = proc.killedBeforeExit;
       agent.eventBuffer.push({ ts: Date.now(), type: 'system', text: wasActive ? 'Process died mid-turn' : 'Process exited' });
       this.highSignalDetector.cleanup(agentId);
@@ -2106,6 +2212,51 @@ ${hbContent}`;
         break;
       }
 
+      case 'new-cli':
+      case 'new_cli': {
+        // Spawn a CLI session via tmux
+        if (!this.config.global.tmux) {
+          await agent.tgBot.sendText(cmd.chatId, '<blockquote>tmux not enabled. Set <code>"tmux": true</code> in global config.</blockquote>', 'HTML');
+          break;
+        }
+
+        // Check if tmux is available
+        let tmuxAvailable = false;
+        try {
+          execSync('which tmux', { stdio: 'ignore' });
+          tmuxAvailable = true;
+        } catch {}
+
+        if (!tmuxAvailable) {
+          await agent.tgBot.sendText(cmd.chatId, '<blockquote>tmux not found on this system.</blockquote>', 'HTML');
+          break;
+        }
+
+        // List existing tmux sessions
+        let tmuxSessions: string[] = [];
+        try {
+          const out = execSync("tmux list-sessions -F '#{session_name}' 2>/dev/null", { encoding: 'utf-8' });
+          tmuxSessions = out.trim().split('\n').filter(Boolean);
+        } catch {
+          // No tmux server running — that's fine, we'll create a new session
+        }
+
+        // Build inline keyboard with existing sessions + "New session" option
+        const kb = new InlineKeyboard();
+        for (const sess of tmuxSessions) {
+          kb.text(sess, `cli-tmux:${agentId}:${sess}`).row();
+        }
+        kb.text('+ New session...', `cli-tmux-new:${agentId}`);
+
+        await agent.tgBot.sendTextWithKeyboard(
+          cmd.chatId,
+          '<b>Select tmux session for CLI window:</b>',
+          kb,
+          'HTML',
+        );
+        break;
+      }
+
       case 'restart': {
         // Restart the TGCC systemd service — this process will die and come back
         // Only notify supervisor chat — workers don't need the restart message
@@ -2189,11 +2340,12 @@ ${hbContent}`;
           const kb = new InlineKeyboard();
           const summaryLine = s.summary ? `\n<i>${escapeHtml(s.summary.length > 150 ? s.summary.slice(0, 150) + '…' : s.summary)}</i>` : '';
           if (s.isCurrent) {
+            const cliTag = this.ctlServer.hasCliSession(agentId) ? ' [CLI]' : '';
             const repoLine = repo ? `\n📂 <code>${escapeHtml(shortenRepoPath(repo))}</code>` : '';
             const sessModel = agent.model;
             const modelLine = sessModel ? `\n🤖 ${escapeHtml(sessModel)}` : '';
             const sessionLine = `\n📎 <code>${escapeHtml(s.id.slice(0, 8))}</code>`;
-            const text = `<blockquote><b>Current session:</b>\n${displayTitle}${summaryLine}\n${s.detail} · ${s.age}${repoLine}${modelLine}${sessionLine}</blockquote>`;
+            const text = `<blockquote><b>Current session${cliTag}:</b>\n${displayTitle}${summaryLine}\n${s.detail} · ${s.age}${repoLine}${modelLine}${sessionLine}</blockquote>`;
             await agent.tgBot.sendText(cmd.chatId, text, 'HTML');
           } else {
             const text = `${displayTitle}${summaryLine}\n<code>${escapeHtml(s.id.slice(0, 8))}</code> · ${s.detail} · ${s.age}`;
@@ -2428,7 +2580,10 @@ ${hbContent}`;
       }
 
       case 'cancel': {
-        if (agent.ccProcess && agent.ccProcess.state === 'active') {
+        if (this.ctlServer.hasCliSession(agentId)) {
+          this.ctlServer.sendToCliSocket(agentId, { type: 'cli_cancel' });
+          await agent.tgBot.sendText(cmd.chatId, '<blockquote>Cancelled (CLI session).</blockquote>', 'HTML');
+        } else if (agent.ccProcess && agent.ccProcess.state === 'active') {
           agent.ccProcess.cancel();
           await agent.tgBot.sendText(cmd.chatId, '<blockquote>Cancelled.</blockquote>', 'HTML');
         } else {
@@ -3019,6 +3174,39 @@ ${hbContent}`;
         break;
       }
 
+      case 'cli-tmux': {
+        // User picked an existing tmux session — open a new window
+        const [targetAgent, tmuxSession] = query.data.split(':', 2);
+        const tgccBin = process.argv[1] ?? 'tgcc';
+        try {
+          execSync(`tmux new-window -t ${JSON.stringify(tmuxSession)} "${tgccBin} attach --agent ${targetAgent}"`, { stdio: 'ignore' });
+          await agent.tgBot.answerCallbackQuery(query.callbackQueryId, 'CLI window created');
+          await agent.tgBot.sendText(
+            query.chatId,
+            `<blockquote>CLI session created in tmux <code>${escapeHtml(tmuxSession)}</code>.\nAttach: <code>tmux attach -t ${escapeHtml(tmuxSession)}</code></blockquote>`,
+            'HTML',
+          );
+        } catch (err) {
+          await agent.tgBot.answerCallbackQuery(query.callbackQueryId, 'Failed');
+          await agent.tgBot.sendText(query.chatId, `<blockquote>Failed to create tmux window: ${escapeHtml(String(err))}</blockquote>`, 'HTML');
+        }
+        break;
+      }
+
+      case 'cli-tmux-new': {
+        // User wants a new tmux session — ask for name via reply
+        const targetAgent2 = query.data;
+        await agent.tgBot.answerCallbackQuery(query.callbackQueryId, 'Send session name');
+        await agent.tgBot.sendText(
+          query.chatId,
+          `Reply with a name for the new tmux session (e.g. <code>dev</code>):`,
+          'HTML',
+        );
+        // Store pending state to catch the next text message as the session name
+        agent.pendingCliTmuxAgent = targetAgent2;
+        break;
+      }
+
       default:
         await agent.tgBot.answerCallbackQuery(query.callbackQueryId);
     }
@@ -3500,6 +3688,7 @@ ${hbContent}`;
               authFlowInProgress: false,
               lastSendData: null,
               claudeConfigDir: undefined,
+              pendingCliTmuxAgent: null,
                     };
 
             // Auto-destroy timer
@@ -3576,6 +3765,7 @@ ${hbContent}`;
             const targetId = request.params.agentId as string;
             if (!targetId) return { id: request.id, success: false, error: 'agentId is required' };
             const prompt = (request.params.prompt as string) || 'Ensure the worker completes its current task successfully. Infer the goal from the session history and event log below.';
+            const spec = request.params.spec as string | undefined;
 
             // Determine invoker chat for TG notifications
             const invokerAgent = this.agents.get(request.agentId);
@@ -3584,9 +3774,11 @@ ${hbContent}`;
             const { ralphId, error } = this.spawnRalph({
               targetAgentId: targetId,
               prompt,
+              spec,
               invokerAgentId: request.agentId,
               invokerChatId,
               timeoutMs: request.params.timeoutMs as number | undefined,
+              minTurns: request.params.minTurns as number | undefined,
             });
 
             if (error) return { id: request.id, success: false, error };
@@ -3839,6 +4031,74 @@ ${hbContent}`;
     }
   }
 
+  // ── CLI session handlers (CtlHandler interface) ──
+
+  handleCliAttach(agentId: string, repo: string, _writeFn: (line: string) => void): CtlCliAttachedResponse {
+    const agent = this.agents.get(agentId);
+    if (!agent) throw new Error(`Unknown agent: ${agentId}`);
+
+    // Kill existing CC process if any (CLI takes over)
+    if (agent.ccProcess) {
+      this.logger.info({ agentId }, 'CLI attach: killing existing CC process');
+      agent.ccProcess.kill();
+      agent.ccProcess = null;
+    }
+
+    // Update repo if provided
+    if (repo) agent.repo = repo;
+
+    // Generate MCP config for the CLI session
+    const mcpServerPath = resolveMcpServerPath();
+    const mcpConfigPath = generateMcpConfig(
+      agentId,
+      agent.config.allowedUsers[0] ?? 'cli',
+      this.config.global.socketDir,
+      mcpServerPath,
+      [],
+      this.config.global.mcpConfigDir,
+    );
+
+    this.logger.info({ agentId, mcpConfigPath }, 'CLI session attached');
+    return { type: 'cli_attached', mcpConfigPath };
+  }
+
+  handleCliEvent(agentId: string, event: string, data: Record<string, unknown>): void {
+    const agent = this.agents.get(agentId);
+    if (!agent) return;
+
+    switch (event) {
+      case 'state': {
+        const state = data.state as string;
+        this.logger.debug({ agentId, state }, 'CLI state event');
+        // Update typing indicator based on CLI state
+        if (state === 'thinking' && agent.tgBot && agent.lastTgChatId) {
+          this.startTypingIndicator(agent, agent.lastTgChatId);
+        } else if (state === 'idle') {
+          this.stopTypingIndicator(agent);
+        }
+        break;
+      }
+      case 'session': {
+        const sessionId = data.sessionId as string;
+        this.logger.info({ agentId, sessionId }, 'CLI session ID detected');
+        break;
+      }
+    }
+  }
+
+  handleCliDetach(agentId: string): void {
+    const agent = this.agents.get(agentId);
+    if (!agent) return;
+
+    this.logger.info({ agentId }, 'CLI session detached');
+    this.stopTypingIndicator(agent);
+
+    // Notify TG
+    if (agent.tgBot && agent.lastTgChatId) {
+      agent.tgBot.sendText(agent.lastTgChatId, formatSystemMessage('status', 'CLI session ended'), 'HTML').catch(() => {});
+    }
+  }
+
   private handleSupervisorCommand(action: string, params: Record<string, unknown>): unknown {
     switch (action) {
       case 'ping':
@@ -3903,6 +4163,7 @@ ${hbContent}`;
       authFlowInProgress: false,
       lastSendData: null,
       claudeConfigDir: undefined,
+      pendingCliTmuxAgent: null,
         };
 
         // Auto-destroy timer
@@ -4192,6 +4453,10 @@ ${hbContent}`;
         if (!agentId) throw new Error('Missing agentId');
         const agent = this.agents.get(agentId);
         if (!agent) throw new Error(`Unknown agent: ${agentId}`);
+        if (this.ctlServer.hasCliSession(agentId)) {
+          this.ctlServer.sendToCliSocket(agentId, { type: 'cli_cancel' });
+          return { cancelled: true };
+        }
         const cancelled = agent.ccProcess?.state === 'active';
         if (cancelled) {
           agent.ccProcess!.cancel();
@@ -4325,9 +4590,11 @@ ${hbContent}`;
       const { ralphId, error } = this.spawnRalph({
         targetAgentId: pr.meta.targetAgentId,
         prompt: pr.prompt,
+        spec: pr.spec,
         invokerAgentId: pr.meta.invokerAgentId,
         invokerChatId: pr.meta.invokerChatId,
         timeoutMs: remaining,
+        minTurns: pr.minTurns,
         ralphIdOverride: pr.ralphId,
         restored: true,
       });
@@ -4341,12 +4608,39 @@ ${hbContent}`;
     }
   }
 
+  /** Set up config-based persistent tracking: agents with `tracks` field automatically watch their targets. */
+  private setupPersistentTracking(): void {
+    let count = 0;
+    for (const [agentId, agentConfig] of Object.entries(this.config.agents)) {
+      if (!agentConfig.tracks?.length) continue;
+      for (const targetId of agentConfig.tracks) {
+        if (!this.agents.has(targetId)) {
+          this.logger.warn({ agentId, targetId }, 'Persistent tracking target not found — skipping');
+          continue;
+        }
+        this.watcherManager.addWatcher({
+          watcherId: agentId,
+          targetAgentId: targetId,
+          includeReply: true,
+          notifyTg: true,
+          meta: { persistent: true },
+        });
+        count++;
+      }
+    }
+    if (count > 0) {
+      this.logger.info({ count }, 'Persistent tracking set up from config');
+    }
+  }
+
   private spawnRalph(opts: {
     targetAgentId: string;
     prompt: string;
+    spec?: string;
     invokerAgentId: string;
     invokerChatId: number;
     timeoutMs?: number;
+    minTurns?: number;
     ralphIdOverride?: string;
     restored?: boolean;
   }): { ralphId: string; error?: string } {
@@ -4377,7 +4671,7 @@ ${hbContent}`;
       sessionHistory = extractRecentConversation(jsonlPath, 16, 10000);
     }
 
-    const systemPrompt = buildRalphPrompt({ targetAgentId, prompt, status, recentLog: logText, sessionHistory, restored: opts.restored });
+    const systemPrompt = buildRalphPrompt({ targetAgentId, prompt, spec: opts.spec, status, recentLog: logText, sessionHistory, restored: opts.restored, minTurns: opts.minTurns });
 
     // Create ephemeral ralph agent
     const ephemeralConfig: AgentConfig = {
@@ -4421,10 +4715,11 @@ ${hbContent}`;
       authFlowInProgress: false,
       lastSendData: null,
       claudeConfigDir: undefined,
+      pendingCliTmuxAgent: null,
     };
 
-    // Auto-destroy timeout (default 30 minutes)
-    const timeoutMs = opts.timeoutMs ?? 30 * 60_000;
+    // Auto-destroy timeout (default 2 hours)
+    const timeoutMs = opts.timeoutMs ?? 120 * 60_000;
     instance.destroyTimer = setTimeout(() => {
       // Guard: skip if ralph was already destroyed (e.g. via ralph_done)
       if (!this.agents.has(ralphId)) return;
@@ -4442,7 +4737,7 @@ ${hbContent}`;
     this.agents.set(ralphId, instance);
 
     // Register ralph: watcher subscription + supervisor tracking + TG notification
-    this.ralphManager.register(ralphId, { targetAgentId, invokerChatId, invokerAgentId }, { prompt, timeoutMs });
+    this.ralphManager.register(ralphId, { targetAgentId, invokerChatId, invokerAgentId }, { prompt, spec: opts.spec, timeoutMs, minTurns: opts.minTurns });
 
     // Send initial prompt
     this.sendToCC(ralphId, { text: systemPrompt }, { spawnSource: 'supervisor' });

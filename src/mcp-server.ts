@@ -578,12 +578,14 @@ Call tgcc_agents first to discover available agents and repos.`,
       {
         agentId: z.string().describe('Target worker agent ID to watch'),
         prompt: z.string().optional().describe('What Ralph should ensure the worker completes. If omitted, Ralph infers the task from the worker\'s session history.'),
-        timeoutMs: z.number().optional().describe('Max lifetime in ms (default: 30 minutes)'),
+        spec: z.string().optional().describe('Spec text or acceptance criteria for Ralph to verify against. When provided, Ralph will verify the output matches the spec (including visual fidelity for UI/game projects).'),
+        timeoutMs: z.number().optional().describe('Max lifetime in ms (default: 2 hours)'),
+        minTurns: z.number().optional().describe('Minimum worker turns before ralph_done is allowed (default: 3)'),
       },
-      async ({ agentId, prompt, timeoutMs }) => {
+      async ({ agentId, prompt, spec, timeoutMs, minTurns }) => {
         const request: McpToolRequest = {
           id: uuidv4(), tool: 'tgcc_ralph', agentId: AGENT_ID, userId: USER_ID,
-          params: { agentId, prompt, timeoutMs },
+          params: { agentId, prompt, spec, timeoutMs, minTurns },
         };
         try {
           const response = await client.sendRequest(request);

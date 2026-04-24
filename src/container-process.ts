@@ -87,6 +87,7 @@ export class ContainerCCProcess extends EventEmitter implements ICCProcess {
   private _killedByUs = false;
   private _takenOver = false;
   private _stateBeforeExit: ProcessState = 'idle';
+  private _activityBeforeExit: CCActivityState = 'idle';
   private _killedBeforeExit = false;
   private _hadResult = false;
   private _pid: number | undefined;
@@ -120,6 +121,7 @@ export class ContainerCCProcess extends EventEmitter implements ICCProcess {
   get hasBackgroundTasks(): boolean { return this._activeBackgroundTasks.size > 0; }
   get takenOver(): boolean { return this._takenOver; }
   get stateBeforeExit(): ProcessState { return this._stateBeforeExit; }
+  get activityBeforeExit(): CCActivityState { return this._activityBeforeExit; }
   get killedBeforeExit(): boolean { return this._killedBeforeExit; }
 
   // ── Start: connect to relay and spawn CC ──
@@ -471,13 +473,7 @@ export class ContainerCCProcess extends EventEmitter implements ICCProcess {
   }
 
   startIdleTimer(): void {
-    this.clearIdleTimer();
-    const timeout = this.options.userConfig.idleTimeoutMs;
-    this.idleTimer = setTimeout(() => {
-      this.logger.info('Idle timeout — killing container CC');
-      this.emit('idle');
-      this.kill();
-    }, timeout);
+    // No-op: idle timeout disabled — CC sessions stay alive until /new or explicit kill
   }
 
   // ── Hang timer ──
@@ -505,6 +501,7 @@ export class ContainerCCProcess extends EventEmitter implements ICCProcess {
 
   private handleExit(code: number | null, signal: string | null): void {
     this._stateBeforeExit = this._state;
+    this._activityBeforeExit = this._ccActivity;
     this._killedBeforeExit = this._killedByUs;
     this._state = 'idle';
     this._ccActivity = 'idle';

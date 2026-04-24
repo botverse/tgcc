@@ -279,8 +279,8 @@ export class StreamAccumulator {
 
   // Delayed first send (fix: don't create TG message until real content arrives)
   private turnStartTime = 0;
+  private firstTextTime = 0;
   private firstSendReady = true;  // true until first reset() — pre-turn sends are unrestricted
-  private firstSendTimer: ReturnType<typeof setTimeout> | null = null;
 
   // Tool hide timers (fix: don't flash ⚡ for fast tools that resolve <500ms)
   private toolHideTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -388,7 +388,12 @@ export class StreamAccumulator {
         break;
 
       case 'message_stop':
-        // message_stop within a tool-use loop — finalize is called separately by bridge on `result`
+        // Ungate first send — the assistant's message text is complete.
+        if (!this.firstSendReady) {
+          this.firstSendReady = true;
+
+          this.requestRender();
+        }
         break;
     }
   }
@@ -413,6 +418,7 @@ export class StreamAccumulator {
       this.requestRender();
 
     } else if (blockType === 'text') {
+      if (!this.firstTextTime) this.firstTextTime = Date.now();
       const seg: InternalSegment = { type: 'text', rawText: '', content: '' };
       this.segments.push(seg);
       this.currentSegment = seg;
@@ -601,8 +607,8 @@ export class StreamAccumulator {
             }
             // Re-gate first send so the post-thinking text bubble doesn't flush a single char
             this.firstSendReady = false;
+            this.firstTextTime = 0;
             this.turnStartTime = Date.now();
-            this.clearFirstSendTimer();
           })
           .catch(err => {
             this.logger?.error?.({ err }, 'thinking bubble split send failed');
@@ -638,8 +644,8 @@ export class StreamAccumulator {
             }
             // Re-gate first send so the post-thinking text bubble doesn't flush a single char
             this.firstSendReady = false;
+            this.firstTextTime = 0;
             this.turnStartTime = Date.now();
-            this.clearFirstSendTimer();
           })
           .catch(err => {
             this.logger?.error?.({ err }, 'thinking bubble send failed');
@@ -796,24 +802,20 @@ export class StreamAccumulator {
     this.flushTimer = null;
     if (!this.dirty || this.sealed) return;
 
-    // Gate: delay first TG message until real text content arrives or 4s have passed.
-    if (!this.tgMessageId && !this.checkFirstSendReady()) {
-      if (!this.firstSendTimer) {
-        const remaining = Math.max(0, 4000 - (Date.now() - this.turnStartTime));
-        this.firstSendTimer = setTimeout(() => {
-          this.firstSendTimer = null;
-          this.firstSendReady = true;
-          this.requestRender();
-        }, remaining);
-      }
-      // dirty stays true; requestRender() will re-schedule when timer fires
+    // Gate: delay first TG message until message_stop fires (or finalize unblocks).
+    // This prevents incomplete notification previews like "TGCC re" or "Let me".
+    if (!this.tgMessageId && !this.firstSendReady) {
+      // dirty stays true; message_stop handler or finalize() will call requestRender()
       return;
     }
 
     this.dirty = false;
     this.flushInFlight = true;
     const html = this.renderHtml();
-    const targetMsgId = this.tgMessageId; // capture NOW before any reset() can clear it
+    // Capture non-null tgMessageId to protect against reset() clearing it mid-queue.
+    // When null, pass undefined so _doSendOrEdit uses this.tgMessageId at execution time —
+    // a preceding queued send (e.g. from thinking split) may have set it by then.
+    const targetMsgId: number | undefined = this.tgMessageId ?? undefined;
 
     // Skip empty renders — nothing to show yet (e.g. gap between thinking split and first text delta)
     if ((!html || html === '…') && !targetMsgId) {
@@ -909,28 +911,7 @@ export class StreamAccumulator {
     }
   }
 
-  private checkFirstSendReady(): boolean {
-    if (this.firstSendReady) return true;
-    const textSegs = this.segments
-      .filter((s): s is Extract<InternalSegment, { type: 'text' }> => s.type === 'text');
-    const textChars = textSegs.reduce((sum, s) => sum + s.rawText.length, 0);
-    const hasNewline = textSegs.some(s => s.rawText.includes('\n'));
-    // Require at least 2 lines (newline) with 80+ chars, OR 200+ chars, OR 4s timeout
-    // This prevents tiny bubbles ("Hey", "…") from being flushed too early
-    if ((hasNewline && textChars >= 80) || textChars >= 200 || Date.now() - this.turnStartTime >= 4000) {
-      this.firstSendReady = true;
-      this.clearFirstSendTimer();
-      return true;
-    }
-    return false;
-  }
-
-  private clearFirstSendTimer(): void {
-    if (this.firstSendTimer) {
-      clearTimeout(this.firstSendTimer);
-      this.firstSendTimer = null;
-    }
-  }
+  // firstSendReady is set by message_stop handler or finalize(). No heuristics needed.
 
   /** Force-split when a text segment exceeds 50KB */
   private async forceSplitText(seg: Extract<InternalSegment, { type: 'text' }>): Promise<void> {
@@ -962,7 +943,11 @@ export class StreamAccumulator {
 
     // Ensure first send is unblocked — finalize is the last chance to send anything
     this.firstSendReady = true;
-    this.clearFirstSendTimer();
+
+    // Drain pending sends so tgMessageId is up-to-date before we capture it.
+    // Without this, a pending _doSendOrEdit (e.g. from thinking split) may not have
+    // set tgMessageId yet, causing finalize to create a spurious new bubble.
+    await this.sendQueue;
 
     // Append usage footer segment
     if (this.turnUsage) {
@@ -974,8 +959,8 @@ export class StreamAccumulator {
     // Final render — chain directly onto sendQueue so it runs after any in-flight edits.
     // Use splitMessage if over threshold, same as flushRender, to avoid silent Telegram failures.
     const html = this.renderHtml();
-    // Capture NOW before any reset() can clear it, but treat sealed IDs as null
-    // (thinking split may have sealed tgMessageId before finalize() runs).
+    // Capture after queue drain — tgMessageId is now accurate.
+    // Treat sealed IDs as null (thinking split may have sealed tgMessageId before finalize).
     const rawTargetId = this.tgMessageId;
     if (rawTargetId !== null && this.sealedMsgIds.has(rawTargetId)) {
       this.logger?.warn?.({ targetMsgId: rawTargetId }, '[FINALIZE-SEALED-TARGET] finalize() captured sealed msgId — creating new message instead');
@@ -1130,8 +1115,9 @@ export class StreamAccumulator {
     this.flushInFlight = false;
     this.sendQueue = prevQueue.catch(() => {});
     this.turnStartTime = Date.now();
+    this.firstTextTime = 0;
     this.firstSendReady = false;
-    this.clearFirstSendTimer();
+
     for (const t of this.toolHideTimers.values()) clearTimeout(t);
     this.toolHideTimers.clear();
   }

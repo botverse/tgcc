@@ -241,6 +241,9 @@ export function discoverCCSessions(repo: string, limit = 10, configDir?: string)
       // Skip sessions with no real user messages
       if (title === 'untitled') continue;
 
+      // Skip ephemeral agent sessions (ralph, etc.) that share the same project dir
+      if (title.startsWith('You are Ralph')) continue;
+
       const contextPct = extractContextPct(fullPath, st.size);
       const endState = getSessionEndState(fullPath, st.size);
       const summary = extractSessionSummary(fullPath, st.size);

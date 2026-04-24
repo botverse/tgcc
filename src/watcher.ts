@@ -13,6 +13,8 @@ export interface WatcherConfig {
   watcherId: string;
   targetAgentId: string;
   includeReply: boolean;
+  /** Also forward events to the watcher's TG chat as blockquotes. */
+  notifyTg?: boolean;
   /** Optional opaque metadata (e.g., { isRalph: true }). */
   meta?: Record<string, unknown>;
 }
@@ -22,6 +24,8 @@ export interface WatcherDeps {
   sendToCC: (watcherId: string, text: string) => void;
   /** Check if a watcher agent still exists. */
   agentExists: (agentId: string) => boolean;
+  /** Send a TG blockquote to a specific agent's chat. */
+  sendTgBlockquote?: (agentId: string, text: string) => Promise<void>;
 }
 
 // ── WatcherManager ──
@@ -55,13 +59,22 @@ export class WatcherManager {
           this.removeWatcher(config.watcherId);
           return;
         }
-        const text = wrapSystemReminder(formatWatcherEvent(event));
+        const formatted = formatWatcherEvent(event);
+        const text = wrapSystemReminder(formatted);
         this.deps.sendToCC(config.watcherId, text);
+
+        // TG blockquote delivery (if enabled and dep available)
+        if (config.notifyTg && this.deps.sendTgBlockquote) {
+          const tgLine = `🤖 [${event.agentId}] ${formatted}`;
+          this.deps.sendTgBlockquote(config.watcherId, tgLine).catch(err =>
+            this.logger.warn({ err, watcherId: config.watcherId }, 'Failed to send watcher TG blockquote'),
+          );
+        }
       },
       meta: config.meta,
     });
 
-    this.logger.debug({ watcherId: config.watcherId, targetAgentId: config.targetAgentId }, 'Watcher registered');
+    this.logger.debug({ watcherId: config.watcherId, targetAgentId: config.targetAgentId, notifyTg: !!config.notifyTg }, 'Watcher registered');
   }
 
   /** Remove a watcher subscription. */

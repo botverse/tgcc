@@ -50,6 +50,25 @@ export function createImageMessage(
   };
 }
 
+export function createMultiImageMessage(
+  text: string,
+  images: Array<{ base64: string; mediaType: string }>,
+): UserMessage {
+  const content: ContentBlock[] = [];
+  if (text) content.push({ type: 'text', text });
+  for (const img of images) {
+    content.push({
+      type: 'image',
+      source: { type: 'base64', media_type: img.mediaType as ImageContent['source']['media_type'], data: img.base64 },
+    });
+  }
+  return {
+    type: 'user',
+    message: { role: 'user', content },
+    uuid: uuidv4(),
+  };
+}
+
 export function createDocumentMessage(text: string, filePath: string, fileName: string): UserMessage {
   const fileLine = `[Attached file: ${filePath} (${fileName})]`;
   const content = text ? `${text}\n\n${fileLine}` : fileLine;

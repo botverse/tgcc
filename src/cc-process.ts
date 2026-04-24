@@ -140,6 +140,7 @@ export interface ICCProcess extends EventEmitter {
   readonly hasBackgroundTasks: boolean;
   readonly takenOver: boolean;
   readonly stateBeforeExit: ProcessState;
+  readonly activityBeforeExit: CCActivityState;
   readonly killedBeforeExit: boolean;
   start(): Promise<void>;
   sendMessage(msg: UserMessage): void;
@@ -174,6 +175,7 @@ export class CCProcess extends EventEmitter implements ICCProcess {
   private _killedByUs = false;
   private _takenOver = false;
   private _stateBeforeExit: ProcessState = 'idle';
+  private _activityBeforeExit: CCActivityState = 'idle';
   private _killedBeforeExit = false;
   private _hadResult = false; // true after a clean result event; reset on each new message sent
 
@@ -196,6 +198,7 @@ export class CCProcess extends EventEmitter implements ICCProcess {
   get hasBackgroundTasks(): boolean { return this._activeBackgroundTasks.size > 0; }
   get takenOver(): boolean { return this._takenOver; }
   get stateBeforeExit(): ProcessState { return this._stateBeforeExit; }
+  get activityBeforeExit(): CCActivityState { return this._activityBeforeExit; }
   get killedBeforeExit(): boolean { return this._killedBeforeExit; }
 
   // ── Spawn ──
@@ -541,22 +544,7 @@ export class CCProcess extends EventEmitter implements ICCProcess {
   // ── Timers ──
 
   private startIdleTimer(): void {
-    this.clearIdleTimer();
-    // Don't start idle timer if background tasks are running
-    if (this._activeBackgroundTasks.size > 0) {
-      this.logger.debug({ activeTasks: this._activeBackgroundTasks.size }, 'Skipping idle timer — background tasks active');
-      return;
-    }
-    this.idleTimer = setTimeout(() => {
-      // Double-check at fire time in case a task started during the timeout
-      if (this._activeBackgroundTasks.size > 0) {
-        this.logger.debug({ activeTasks: this._activeBackgroundTasks.size }, 'Idle timer fired but background tasks active — skipping kill');
-        return;
-      }
-      this.logger.info('Idle timeout — killing CC process');
-      this.emit('idle');
-      this.kill();
-    }, this.options.userConfig.idleTimeoutMs);
+    // No-op: idle timeout disabled — CC sessions stay alive until /new or explicit kill
   }
 
   clearIdleTimer(): void {
@@ -729,6 +717,7 @@ export class CCProcess extends EventEmitter implements ICCProcess {
     this.stopBackgroundTaskCheck();
     this._activeBackgroundTasks.clear();
     this._stateBeforeExit = this._state;
+    this._activityBeforeExit = this._ccActivity;
     this._killedBeforeExit = this._killedByUs;
     this._state = 'idle';
     this._ccActivity = 'idle';

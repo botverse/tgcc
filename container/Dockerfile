@@ -4,7 +4,7 @@ FROM node:20-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl git sudo \
     build-essential python3 python3-pip python3-venv \
-    procps \
+    procps postgresql-client \
     && rm -rf /var/lib/apt/lists/*
 
 # CC CLI

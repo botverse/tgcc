@@ -11,12 +11,14 @@ export interface TelegramMessage {
   chatId: number;
   userId: string;
   userName?: string;
+  userHandle?: string; // Telegram @username (without @)
   text: string;
   imageBase64?: string;
   imageMediaType?: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp';
   filePath?: string;
   fileName?: string;
   replyToText?: string;
+  mediaGroupId?: string;
 }
 
 export interface SlashCommand {
@@ -58,6 +60,7 @@ export const COMMANDS = [
   { command: 'repo', description: 'Manage repos & switch working directory' },
   { command: 'cron', description: 'Manage scheduled cron jobs' },
   { command: 'ralph', description: 'Spawn shepherd to ensure task completion' },
+  { command: 'new_cli', description: 'Open interactive CLI session via tmux' },
   { command: 'ping', description: 'Quick liveness check' },
   { command: 'help', description: 'List all commands' },
 ];
@@ -93,6 +96,18 @@ class ReplyMap {
   }
 }
 
+// ── Group member tracking ──
+
+export interface GroupMember {
+  userId: number;
+  firstName: string;
+  lastName?: string;
+  handle?: string; // @username without the @
+  isBot: boolean;
+  role?: 'creator' | 'administrator' | 'member';
+  lastSeen?: number; // epoch ms
+}
+
 // ── Telegram Agent Bot ──
 
 export class TelegramBot {
@@ -107,6 +122,8 @@ export class TelegramBot {
   private replyMaps = new Map<number, ReplyMap>(); // per-chat reply maps
   private rejectedKeys = new Set<string>(); // "userId:chatId" — tracks who already got rejection message
   private running = false;
+  /** Per-chat group member roster: chatId → userId → GroupMember */
+  private groupMembers = new Map<number, Map<number, GroupMember>>();
 
   constructor(
     agentId: string,
@@ -165,6 +182,75 @@ export class TelegramBot {
     this.getReplyMap(chatId).add(messageId, text);
   }
 
+  /** Track a user seen in a group chat. Called on every group message. */
+  trackGroupMember(ctx: Context): void {
+    const chatId = ctx.chat?.id;
+    const from = ctx.from;
+    if (!chatId || chatId > 0 || !from) return; // only for group chats
+
+    let members = this.groupMembers.get(chatId);
+    if (!members) {
+      members = new Map();
+      this.groupMembers.set(chatId, members);
+    }
+
+    const existing = members.get(from.id);
+    members.set(from.id, {
+      userId: from.id,
+      firstName: from.first_name,
+      lastName: from.last_name,
+      handle: from.username,
+      isBot: from.is_bot,
+      role: existing?.role,
+      lastSeen: Date.now(),
+    });
+  }
+
+  /** Bootstrap group roster by fetching admins from the TG API. */
+  async fetchGroupAdmins(chatId: number): Promise<void> {
+    try {
+      const admins = await this.bot.api.getChatAdministrators(chatId);
+      let members = this.groupMembers.get(chatId);
+      if (!members) {
+        members = new Map();
+        this.groupMembers.set(chatId, members);
+      }
+      for (const admin of admins) {
+        const existing = members.get(admin.user.id);
+        members.set(admin.user.id, {
+          userId: admin.user.id,
+          firstName: admin.user.first_name,
+          lastName: admin.user.last_name,
+          handle: admin.user.username,
+          isBot: admin.user.is_bot,
+          role: admin.status as 'creator' | 'administrator',
+          lastSeen: existing?.lastSeen,
+        });
+      }
+      this.logger.debug({ chatId, count: admins.length }, 'Fetched group admins');
+    } catch (err) {
+      this.logger.warn({ err, chatId }, 'Failed to fetch group admins');
+    }
+  }
+
+  /** Get formatted group roster for a chat. Returns null if no members tracked. */
+  getGroupRoster(chatId: number): string | null {
+    const members = this.groupMembers.get(chatId);
+    if (!members || members.size === 0) return null;
+
+    const lines: string[] = ['Group members:'];
+    for (const m of members.values()) {
+      if (m.isBot) continue; // skip bots from roster
+      const name = m.lastName ? `${m.firstName} ${m.lastName}` : m.firstName;
+      const handle = m.handle ? ` (@${m.handle})` : '';
+      const role = m.role ? ` [${m.role}]` : '';
+      lines.push(`- ${name}${handle}${role}`);
+    }
+    if (lines.length === 1) return null; // only header, no humans
+    lines.push('\nUse @username mentions to address specific people.');
+    return lines.join('\n');
+  }
+
   private static getUserName(ctx: Context): string | undefined {
     const from = ctx.from;
     if (!from) return undefined;
@@ -172,6 +258,12 @@ export class TelegramBot {
   }
 
   private setupHandlers(): void {
+    // ── Group member tracking (runs before all handlers) ──
+    this.bot.use((ctx, next) => {
+      this.trackGroupMember(ctx);
+      return next();
+    });
+
     // ── Slash commands ──
     for (const { command } of COMMANDS) {
       this.bot.command(command, (ctx) => this.handleCommand(ctx, command));
@@ -269,6 +361,7 @@ export class TelegramBot {
       chatId,
       userId: String(userId),
       userName: TelegramBot.getUserName(ctx),
+      userHandle: ctx.from?.username,
       text: ctx.message.text,
       replyToText,
     });
@@ -302,9 +395,11 @@ export class TelegramBot {
         chatId,
         userId: String(userId),
         userName: TelegramBot.getUserName(ctx),
+        userHandle: ctx.from?.username,
         text: caption,
         imageBase64: base64,
         imageMediaType: mediaType,
+        mediaGroupId: ctx.message?.media_group_id,
       });
     } catch (err) {
       this.logger.error({ err }, 'Failed to handle photo');
@@ -335,6 +430,7 @@ export class TelegramBot {
 
       const caption = ctx.message?.caption ?? '';
       const userName = TelegramBot.getUserName(ctx);
+      const userHandle = ctx.from?.username;
 
       // Check if it's an image — send as image content block
       if (doc.mime_type?.startsWith('image/')) {
@@ -345,6 +441,7 @@ export class TelegramBot {
           chatId,
           userId: String(userId),
           userName,
+          userHandle,
           text: caption,
           imageBase64: base64,
           imageMediaType: mediaType,
@@ -357,6 +454,7 @@ export class TelegramBot {
         chatId,
         userId: String(userId),
         userName,
+        userHandle,
         text: caption,
         filePath: savePath,
         fileName,
@@ -392,6 +490,7 @@ export class TelegramBot {
         chatId,
         userId: String(userId),
         userName: TelegramBot.getUserName(ctx),
+        userHandle: ctx.from?.username,
         text: ctx.message?.caption ?? '',
         filePath: savePath,
         fileName,
@@ -427,6 +526,7 @@ export class TelegramBot {
         chatId,
         userId: String(userId),
         userName: TelegramBot.getUserName(ctx),
+        userHandle: ctx.from?.username,
         text: ctx.message?.caption ?? '',
         filePath: savePath,
         fileName,
@@ -447,6 +547,16 @@ export class TelegramBot {
       this.logger.warn({ err }, 'Failed to register commands');
     }
 
+    // Bootstrap group member roster from admin list
+    if (this.config.allowedChats?.length) {
+      for (const chatIdStr of this.config.allowedChats) {
+        const chatId = Number(chatIdStr);
+        if (chatId < 0) {
+          this.fetchGroupAdmins(chatId).catch(() => {}); // fire & forget
+        }
+      }
+    }
+
     this.running = true;
     this.bot.start({
       drop_pending_updates: true,
@@ -455,6 +565,24 @@ export class TelegramBot {
         this.logger.info({ username: info.username }, 'Bot started');
       },
     });
+  }
+
+  /** Update config at runtime (e.g. after hot-reload). Clears rejection cache and bootstraps new group rosters. */
+  updateConfig(newConfig: AgentConfig): void {
+    const oldChats = new Set(this.config.allowedChats ?? []);
+    this.config = newConfig;
+    // Auth rules changed — clear rejection cache so previously-rejected users get re-evaluated
+    this.rejectedKeys.clear();
+    this.logger.info('Config updated — rejectedKeys cleared');
+    // Bootstrap group roster for any newly-added allowedChats
+    for (const chatIdStr of newConfig.allowedChats ?? []) {
+      if (!oldChats.has(chatIdStr)) {
+        const chatId = Number(chatIdStr);
+        if (chatId < 0) {
+          this.fetchGroupAdmins(chatId).catch(() => {});
+        }
+      }
+    }
   }
 
   async stop(): Promise<void> {

@@ -17,6 +17,45 @@ export interface CtlStatusRequest {
   agent?: string;
 }
 
+// CLI session protocol (persistent bidirectional socket, like register_supervisor)
+
+export interface CtlCliAttachRequest {
+  type: 'cli_attach';
+  agent: string;
+  repo: string;
+}
+
+export interface CtlCliEventRequest {
+  type: 'cli_event';
+  event: 'state' | 'session';
+  data: { state?: 'thinking' | 'idle'; sessionId?: string };
+}
+
+export interface CtlCliDetachRequest {
+  type: 'cli_detach';
+}
+
+/** Daemon → CLI: inject text into CC's PTY. */
+export interface CtlCliInjectCommand {
+  type: 'cli_inject';
+  text: string;
+}
+
+/** Daemon → CLI: kill CC process. */
+export interface CtlCliKillCommand {
+  type: 'cli_kill';
+}
+
+/** Daemon → CLI: cancel (SIGINT) CC process. */
+export interface CtlCliCancelCommand {
+  type: 'cli_cancel';
+}
+
+export interface CtlCliAttachedResponse {
+  type: 'cli_attached';
+  mcpConfigPath: string;
+}
+
 export type CtlRequest = CtlMessageRequest | CtlStatusRequest;
 
 export interface CtlAckResponse {
@@ -60,6 +99,12 @@ export interface CtlHandler {
   registerSupervisor(agentId: string, capabilities: string[], writeFn: (line: string) => void): void;
   handleSupervisorDetach(): void;
   handleSupervisorLine(line: string): void;
+  /** CLI session attached — returns MCP config path for the agent. */
+  handleCliAttach(agentId: string, repo: string, writeFn: (line: string) => void): CtlCliAttachedResponse;
+  /** CLI session forwarded a state/session event. */
+  handleCliEvent(agentId: string, event: string, data: Record<string, unknown>): void;
+  /** CLI session detached (socket closed or explicit detach). */
+  handleCliDetach(agentId: string): void;
 }
 
 // ── Control Server ──
@@ -68,6 +113,7 @@ export class CtlServer {
   private servers = new Map<string, Server>();
   private activeSockets = new Map<string, Set<Socket>>(); // socketPath → Set<Socket>
   private supervisorSocket: Socket | null = null;
+  private cliSockets = new Map<string, Socket>(); // agentId → persistent CLI socket
   private handler: CtlHandler;
   private logger: pino.Logger;
   private defaultSupervisorId: string | null;
@@ -138,7 +184,32 @@ export class CtlServer {
         this.supervisorSocket = null;
         this.handler.handleSupervisorDetach();
       }
+      // Detach CLI session if this was a CLI socket
+      for (const [agentId, cliSocket] of this.cliSockets) {
+        if (cliSocket === socket) {
+          this.cliSockets.delete(agentId);
+          this.handler.handleCliDetach(agentId);
+          break;
+        }
+      }
     });
+  }
+
+  /** Send a command to a CLI session's persistent socket. */
+  sendToCliSocket(agentId: string, command: CtlCliInjectCommand | CtlCliKillCommand | CtlCliCancelCommand): boolean {
+    const cliSocket = this.cliSockets.get(agentId);
+    if (!cliSocket) return false;
+    try {
+      cliSocket.write(JSON.stringify(command) + '\n');
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Check if an agent has an active CLI session. */
+  hasCliSession(agentId: string): boolean {
+    return this.cliSockets.has(agentId);
   }
 
   private processLine(line: string, socket: Socket): void {
@@ -146,6 +217,14 @@ export class CtlServer {
     if (socket === this.supervisorSocket) {
       this.handler.handleSupervisorLine(line);
       return;
+    }
+
+    // Route CLI socket lines (after cli_attach) to handler
+    for (const [agentId, cliSocket] of this.cliSockets) {
+      if (cliSocket === socket) {
+        this.processCliLine(line, agentId);
+        return;
+      }
     }
 
     try {
@@ -180,6 +259,16 @@ export class CtlServer {
           socket.write(JSON.stringify({ type: 'registered', agentId: resolvedId }) + '\n');
           return;
         }
+        case 'cli_attach': {
+          const attachReq = request as unknown as CtlCliAttachRequest;
+          const writeFn = (data: string) => { try { socket.write(data); } catch {} };
+          const attachResp = this.handler.handleCliAttach(attachReq.agent, attachReq.repo, writeFn);
+          // Register this as a persistent CLI socket
+          this.cliSockets.set(attachReq.agent, socket);
+          socket.write(JSON.stringify(attachResp) + '\n');
+          this.logger.info({ agentId: attachReq.agent }, 'CLI session attached');
+          return;
+        }
         default:
           response = { type: 'error', message: `Unknown request type: ${(request as { type: string }).type}` };
       }
@@ -191,6 +280,31 @@ export class CtlServer {
         message: err instanceof Error ? err.message : 'Unknown error',
       };
       socket.write(JSON.stringify(errResponse) + '\n');
+    }
+  }
+
+  /** Process a line from an already-attached CLI socket. */
+  private processCliLine(line: string, agentId: string): void {
+    try {
+      const request = JSON.parse(line) as Record<string, unknown>;
+
+      switch (request.type as string) {
+        case 'cli_event': {
+          const evReq = request as unknown as CtlCliEventRequest;
+          this.handler.handleCliEvent(agentId, evReq.event, evReq.data);
+          break;
+        }
+        case 'cli_detach': {
+          this.cliSockets.delete(agentId);
+          this.handler.handleCliDetach(agentId);
+          this.logger.info({ agentId }, 'CLI session detached');
+          break;
+        }
+        default:
+          this.logger.warn({ agentId, type: request.type }, 'Unknown CLI request type');
+      }
+    } catch (err) {
+      this.logger.debug({ err, agentId }, 'Failed to parse CLI line');
     }
   }
 

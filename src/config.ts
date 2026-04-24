@@ -18,6 +18,8 @@ export interface GlobalConfig {
   authFallbackEnabled: boolean;
   /** Timeout for waiting for the user's auth code reply (ms). Default: 300000 (5 min) */
   authFallbackTimeoutMs: number;
+  /** Enable tmux integration for /new-cli. Default: false */
+  tmux: boolean;
 }
 
 export interface AgentDefaults {
@@ -94,6 +96,10 @@ export interface AgentConfig {
   users?: Record<string, AgentUserOverride>;
   heartbeat?: HeartbeatConfig;
   share?: ShareConfig;
+  /** Agent IDs this agent always tracks (survives restarts). Events forwarded to TG + CC stdin. */
+  tracks?: string[];
+  /** Group context injected as system-reminder on messages (e.g. team member roster, roles). */
+  groupContext?: string;
 }
 
 export interface TgccConfig {
@@ -116,6 +122,7 @@ const DEFAULT_GLOBAL: GlobalConfig = {
   stateFile: join(homedir(), '.tgcc', 'state.json'),
   authFallbackEnabled: true,
   authFallbackTimeoutMs: 300_000,
+  tmux: false,
 };
 
 const DEFAULT_AGENT_DEFAULTS: AgentDefaults = {
@@ -148,6 +155,7 @@ export function validateConfig(raw: unknown): TgccConfig {
     stateFile: typeof globalRaw.stateFile === 'string' ? globalRaw.stateFile : DEFAULT_GLOBAL.stateFile,
     authFallbackEnabled: globalRaw.authFallbackEnabled !== false,
     authFallbackTimeoutMs: typeof globalRaw.authFallbackTimeoutMs === 'number' ? globalRaw.authFallbackTimeoutMs : DEFAULT_GLOBAL.authFallbackTimeoutMs,
+    tmux: globalRaw.tmux === true,
   };
 
   // Repos registry
@@ -290,6 +298,12 @@ export function validateConfig(raw: unknown): TgccConfig {
     // allowedChats (optional) — group/supergroup chat IDs
     const allowedChats = Array.isArray(a.allowedChats) ? a.allowedChats.map(String) : undefined;
 
+    // tracks (optional) — agent IDs to always track
+    const tracks = Array.isArray(a.tracks) ? a.tracks.filter((t: unknown) => typeof t === 'string') as string[] : undefined;
+
+    // groupContext (optional) — injected as system-reminder for group chats
+    const groupContext = typeof a.groupContext === 'string' ? a.groupContext : undefined;
+
     agents[agentId] = {
       botToken: a.botToken,
       allowedUsers: a.allowedUsers.map(String),
@@ -298,6 +312,8 @@ export function validateConfig(raw: unknown): TgccConfig {
       users,
       ...(heartbeat ? { heartbeat } : {}),
       ...(share ? { share } : {}),
+      ...(tracks?.length ? { tracks } : {}),
+      ...(groupContext ? { groupContext } : {}),
     };
   }
 

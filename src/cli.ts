@@ -5,7 +5,8 @@ import { existsSync, readdirSync, readFileSync, writeFileSync, mkdirSync, unlink
 import { join, dirname, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { execSync } from 'node:child_process';
-import type { CtlRequest, CtlResponse } from './ctl-server.js';
+import { createInterface } from 'node:readline';
+import type { CtlRequest, CtlResponse, CtlCliAttachedResponse, CtlCliInjectCommand, CtlCliKillCommand, CtlCliCancelCommand } from './ctl-server.js';
 import { loadConfig, agentForRepo, CONFIG_PATH, updateConfig, isValidRepoName, findRepoOwner, type TgccConfig } from './config.js';
 
 const CTL_DIR = '/tmp/tgcc/ctl';
@@ -1050,6 +1051,184 @@ function cmdLogs(): void {
   }
 }
 
+// ── Attach (interactive CLI session) ──
+
+async function cmdAttach(args: string[]): Promise<void> {
+  let agentName: string | undefined;
+  let sessionId: string | undefined;
+  let resumeSession = false;
+
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--agent' && i + 1 < args.length) {
+      agentName = args[++i];
+    } else if (args[i] === '--session' && i + 1 < args.length) {
+      sessionId = args[++i];
+    } else if (args[i] === '--resume') {
+      resumeSession = true;
+    }
+  }
+
+  const config = loadConfigSafe();
+  const agentId = resolveAgent(agentName, config);
+  const agentConfig = config.agents[agentId];
+  const repo = agentConfig.defaults.repo ?? process.cwd();
+  const ccBinaryPath = config.global.ccBinaryPath ?? 'claude';
+
+  // Connect to daemon ctl socket (persistent, stays open)
+  const socketPath = join(CTL_DIR, `${agentId}.sock`);
+  if (!existsSync(socketPath)) {
+    console.error(`Agent socket not found: ${socketPath}\nIs the TGCC service running?`);
+    process.exit(1);
+  }
+
+  const ctlSocket = createConnection(socketPath);
+  let ctlBuffer = '';
+
+  // Wait for connection and send cli_attach
+  const mcpConfigPath = await new Promise<string>((resolvePromise, reject) => {
+    ctlSocket.on('connect', () => {
+      ctlSocket.write(JSON.stringify({ type: 'cli_attach', agent: agentId, repo }) + '\n');
+    });
+
+    ctlSocket.on('data', (data) => {
+      ctlBuffer += data.toString();
+      const newlineIdx = ctlBuffer.indexOf('\n');
+      if (newlineIdx !== -1) {
+        const line = ctlBuffer.slice(0, newlineIdx);
+        ctlBuffer = ctlBuffer.slice(newlineIdx + 1);
+        try {
+          const resp = JSON.parse(line) as CtlCliAttachedResponse | { type: 'error'; message: string };
+          if (resp.type === 'cli_attached') {
+            resolvePromise(resp.mcpConfigPath);
+          } else if (resp.type === 'error') {
+            reject(new Error(resp.message));
+          }
+        } catch (err) {
+          reject(new Error(`Invalid response from daemon: ${line}`));
+        }
+      }
+    });
+
+    ctlSocket.on('error', (err) => {
+      reject(new Error(`Cannot connect to daemon: ${(err as NodeJS.ErrnoException).message}`));
+    });
+
+    ctlSocket.setTimeout(10_000, () => {
+      ctlSocket.destroy();
+      reject(new Error('Connection timed out'));
+    });
+  });
+
+  // Clear timeout after successful attach
+  ctlSocket.setTimeout(0);
+
+  console.log(`Attached to agent ${agentId} (repo: ${repo})`);
+  console.log(`MCP config: ${mcpConfigPath}`);
+
+  // Build CC args
+  const ccArgs: string[] = [];
+  if (mcpConfigPath) {
+    ccArgs.push('--mcp-config', mcpConfigPath);
+  }
+  if (sessionId) {
+    ccArgs.push('--resume', sessionId);
+  } else if (resumeSession) {
+    ccArgs.push('--continue');
+  }
+  // Add extra args from config
+  if (agentConfig.defaults.ccExtraArgs) {
+    ccArgs.push(...agentConfig.defaults.ccExtraArgs.split(/\s+/).filter(Boolean));
+  }
+
+  // Spawn CC in a PTY
+  const { CliProcess } = await import('./cli-process.js');
+
+  const cliProcess = new CliProcess({
+    ccBinaryPath,
+    repo,
+    args: ccArgs,
+    cols: process.stdout.columns ?? 220,
+    rows: process.stdout.rows ?? 50,
+  });
+
+  // Set terminal to raw mode for pass-through
+  const wasRaw = process.stdin.isRaw;
+  if (process.stdin.isTTY) {
+    process.stdin.setRawMode(true);
+  }
+  process.stdin.resume();
+
+  // Forward real terminal input → PTY
+  process.stdin.on('data', (data) => {
+    cliProcess.write(data.toString());
+  });
+
+  // Forward PTY output → real terminal
+  cliProcess.on('data', (data) => {
+    process.stdout.write(data);
+  });
+
+  // Forward state events to daemon
+  cliProcess.on('state', (state) => {
+    const msg = JSON.stringify({ type: 'cli_event', event: 'state', data: { state } }) + '\n';
+    try { ctlSocket.write(msg); } catch {}
+  });
+
+  // Forward session ID to daemon
+  cliProcess.on('session', (sid) => {
+    const msg = JSON.stringify({ type: 'cli_event', event: 'session', data: { sessionId: sid } }) + '\n';
+    try { ctlSocket.write(msg); } catch {}
+  });
+
+  // Handle terminal resize
+  process.stdout.on('resize', () => {
+    cliProcess.resize(process.stdout.columns, process.stdout.rows);
+  });
+
+  // Listen for daemon commands (injection, kill, cancel)
+  const ctlRl = createInterface({ input: ctlSocket, crlfDelay: Infinity });
+  ctlRl.on('line', (line) => {
+    try {
+      const cmd = JSON.parse(line) as { type: string; text?: string };
+      switch (cmd.type) {
+        case 'cli_inject':
+          cliProcess.inject((cmd as CtlCliInjectCommand).text);
+          break;
+        case 'cli_kill':
+          cliProcess.kill();
+          break;
+        case 'cli_cancel':
+          cliProcess.cancel();
+          break;
+      }
+    } catch {}
+  });
+
+  // Handle CC exit
+  cliProcess.on('exit', (exitCode) => {
+    // Send detach to daemon
+    try { ctlSocket.write(JSON.stringify({ type: 'cli_detach' }) + '\n'); } catch {}
+    setTimeout(() => ctlSocket.destroy(), 500);
+
+    // Restore terminal
+    if (process.stdin.isTTY) {
+      process.stdin.setRawMode(wasRaw ?? false);
+    }
+    process.stdin.pause();
+
+    process.exit(exitCode ?? 0);
+  });
+
+  // Handle ctl socket close (daemon restart)
+  ctlSocket.on('close', () => {
+    // CC keeps running, but TG observation stops
+    // Could add reconnect logic here in the future
+  });
+
+  // Start CC
+  cliProcess.start();
+}
+
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const command = args[0];
@@ -1108,6 +1287,10 @@ async function main(): Promise<void> {
       cmdLogs();
       break;
 
+    case 'attach':
+      await cmdAttach(args.slice(1));
+      break;
+
     case 'help':
     case '--help':
     case '-h':
@@ -1143,6 +1326,7 @@ Service:
 Commands:
   tgcc status [--agent]     Show running agents and active sessions
   tgcc message [--agent] "text"  Send a message to a running agent
+  tgcc attach [--agent]     Run CC interactively with TGCC tracking
   tgcc agent <subcommand>   Manage agent registrations
   tgcc repo <subcommand>    Manage repo registry
   tgcc permissions          View/set agent permission modes

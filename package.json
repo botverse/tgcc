@@ -1,7 +1,7 @@
 {
   "name": "@fonz/tgcc",
   "version": "0.7.0",
-  "description": "Telegram ↔ Claude Code CLI bridge",
+  "description": "Telegram \u2194 Claude Code CLI bridge",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -56,11 +56,12 @@
   },
   "pnpm": {
     "onlyBuiltDependencies": [
-      "esbuild"
+      "esbuild",
+      "node-pty"
     ]
   },
   "bin": {
-    "tgcc": "dist/cli.js"
+    "tgcc": "bin/tgcc.js"
   },
   "author": "fnz",
   "license": "MIT",
@@ -85,6 +86,7 @@
     "@modelcontextprotocol/sdk": "^1.26.0",
     "croner": "^10.0.1",
     "grammy": "^1.40.0",
+    "node-pty": "^1.1.0",
     "pino": "^10.3.1",
     "remark-gfm": "^4.0.1",
     "remark-parse": "^11.0.0",
@@ -102,6 +104,7 @@
   },
   "files": [
     "dist",
+    "bin",
     "README.md"
   ],
   "publishConfig": {
