@@ -439,8 +439,8 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
   /** Push a message from a worker agent into the native supervisor's event queue.
    *  Delegates to SupervisorManager. */
-  private pushSupervisorEvent(sourceAgentId: string, text: string, notifyTg = true, forceTg = false): void {
-    this.supervisorManager?.pushEvent(sourceAgentId, text, notifyTg, forceTg);
+  private pushSupervisorEvent(sourceAgentId: string, text: string, notifyTg = true, forceTg = false, priority: 'routine' | 'high' = 'high'): void {
+    this.supervisorManager?.pushEvent(sourceAgentId, text, notifyTg, forceTg, priority);
   }
 
   /** The effective repo path for session discovery (container agents use a different path). */
@@ -1064,6 +1064,14 @@ ${hbContent}`;
       text = `${wrapSystemReminder('This session was recently active in an IDE (VSCode). IDE messages are in your conversation history but may not appear in this Telegram chat.')}\n\n${text}`;
     }
 
+    // Supervisor receiving a real user message — flush accumulated routine worker telemetry
+    // (turn-complete, spawn, ephemeral create/destroy) as FYI context so the supervisor can
+    // see what its workers have been doing since the last user interaction.
+    if (agentId === this.nativeSupervisorId && source?.spawnSource === 'telegram') {
+      const routine = this.supervisorManager?.flushPendingRoutine();
+      if (routine) text = `${routine}\n\n${text}`;
+    }
+
     let ccMsg;
     if (data.images && data.images.length > 0) {
       ccMsg = createMultiImageMessage(text, data.images);
@@ -1173,7 +1181,7 @@ ${hbContent}`;
       }
       // Native supervisor: notify if worker is tracked
       if (this.supervisorManager?.isTracked(agentId)) {
-        this.pushSupervisorEvent(agentId, `🚀 Spawned (${spawnSource})`);
+        this.pushSupervisorEvent(agentId, `🚀 Spawned (${spawnSource})`, true, false, 'routine');
       }
     }
 
@@ -2060,9 +2068,9 @@ ${hbContent}`;
       }
     }
 
-    // Route turn-complete to native supervisor
+    // Route turn-complete to native supervisor (routine — errors escalate via result error path)
     const cost = event.total_cost_usd ? ` · $${event.total_cost_usd.toFixed(4)}` : '';
-    this.pushSupervisorEvent(agentId, `${event.is_error ? '❌' : '✅'} Turn complete${cost}`, false);
+    this.pushSupervisorEvent(agentId, `${event.is_error ? '❌' : '✅'} Turn complete${cost}`, false, false, 'routine');
 
     // Deliver any waitForIdle-deferred messages now that the turn is done
     this.drainDeferredSends(agentId);
@@ -3695,7 +3703,7 @@ ${hbContent}`;
 
             // Emit agent_created event
             this.sendToSupervisor({ type: 'event', event: 'agent_created', agentId: spawnAgentId, agentType: 'ephemeral', repo });
-            this.pushSupervisorEvent(spawnAgentId, `🆕 Ephemeral agent created (${repo})`);
+            this.pushSupervisorEvent(spawnAgentId, `🆕 Ephemeral agent created (${repo})`, true, false, 'routine');
 
             // If an initial message was provided, send it immediately
             const message = request.params.message as string | undefined;
@@ -4169,7 +4177,7 @@ ${hbContent}`;
 
         // Emit agent_created event
         this.sendToSupervisor({ type: 'event', event: 'agent_created', agentId, agentType: 'ephemeral', repo });
-        this.pushSupervisorEvent(agentId, `🆕 Ephemeral agent created (${repo})`);
+        this.pushSupervisorEvent(agentId, `🆕 Ephemeral agent created (${repo})`, true, false, 'routine');
 
         return { agentId, state: 'idle' };
       }
@@ -4547,7 +4555,7 @@ ${hbContent}`;
     this.agents.delete(agentId);
     this.logger.info({ agentId }, 'Ephemeral agent destroyed');
     this.sendToSupervisor({ type: 'event', event: 'agent_destroyed', agentId });
-    this.pushSupervisorEvent(agentId, `🗑️ Ephemeral agent destroyed`);
+    this.pushSupervisorEvent(agentId, `🗑️ Ephemeral agent destroyed`, true, false, 'routine');
   }
 
   // ── Ralph: spawn completion shepherd ──

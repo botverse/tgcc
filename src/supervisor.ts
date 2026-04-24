@@ -28,6 +28,8 @@ export interface SupervisorDeps {
 
 // ── SupervisorManager ──
 
+export type EventPriority = 'routine' | 'high';
+
 export class SupervisorManager {
   private supervisorId: string;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
@@ -38,27 +40,44 @@ export class SupervisorManager {
   /** Workers whose high-signal events are forwarded to the supervisor's TG chat in real time. */
   readonly trackedWorkers = new Set<string>();
 
+  /** Routine telemetry lines (spawn, turn-complete, etc.) queued until the supervisor's
+   *  next real user message — kept out of CC stdin to avoid waking the supervisor for FYI noise. */
+  private pendingRoutine: string[] = [];
+
   constructor(supervisorId: string, deps: SupervisorDeps, logger: pino.Logger) {
     this.supervisorId = supervisorId;
     this.deps = deps;
     this.logger = logger;
   }
 
-  /** Send an event directly to the supervisor CC process (and optionally to TG).
+  /** Send an event to the supervisor. 'high' priority wakes CC immediately; 'routine' queues
+   *  for inclusion on the next real user message (awareness without cost).
    *  @param notifyTg — whether TG notification is desired at all (false suppresses completely)
-   *  @param forceTg — bypass tracking check (e.g. for explicit notify_parent calls) */
-  pushEvent(sourceAgentId: string, text: string, notifyTg = true, forceTg = false): void {
+   *  @param forceTg — bypass tracking check (e.g. for explicit notify_parent calls)
+   *  @param priority — 'high' (default, live) or 'routine' (queued) */
+  pushEvent(sourceAgentId: string, text: string, notifyTg = true, forceTg = false, priority: EventPriority = 'high'): void {
     if (sourceAgentId === this.supervisorId) return;
     const line = `🤖 [${sourceAgentId}] ${text}`;
 
-    // Send directly to supervisor CC stdin
-    this.deps.setMuteOutput(this.supervisorId, true);
-    this.deps.sendToCC(this.supervisorId, wrapSystemReminder(line));
+    if (priority === 'routine') {
+      this.pendingRoutine.push(line);
+    } else {
+      this.deps.setMuteOutput(this.supervisorId, true);
+      this.deps.sendToCC(this.supervisorId, wrapSystemReminder(line));
+    }
 
-    // TG forwarding for tracked workers
     if (!notifyTg || (!forceTg && !this.trackedWorkers.has(sourceAgentId))) return;
     this.deps.sendTgBlockquote(line).catch(err =>
       this.logger.warn({ err }, 'Failed to push worker event to supervisor TG'),
+    );
+  }
+
+  /** Consume any queued routine telemetry as a single system-reminder block, or null if empty. */
+  flushPendingRoutine(): string | null {
+    if (this.pendingRoutine.length === 0) return null;
+    const lines = this.pendingRoutine.splice(0);
+    return wrapSystemReminder(
+      `Worker activity since your last message (FYI — do not respond unless action is needed):\n${lines.join('\n')}`,
     );
   }
 
