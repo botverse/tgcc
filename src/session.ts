@@ -20,6 +20,9 @@ export interface AgentState {
   model: string;
   permissionMode: string;
   lastActivity: string;
+  /** Most recent CC session ID owned by TGCC — used to resume the right session,
+   *  avoiding accidental pickup of sessions created by `claude` CLI in the same project. */
+  lastSessionId?: string;
 }
 
 /** Old format for migration detection */
@@ -75,7 +78,14 @@ export class SessionStore {
             this.logger.info({ agentId }, 'Migrated agent state from per-user to per-agent format');
           } else if (agentData && typeof agentData.repo === 'string') {
             // Already new format
-            migrated.agents[agentId] = agentData as AgentState;
+            const a = agentData as Partial<AgentState> & Record<string, unknown>;
+            migrated.agents[agentId] = {
+              repo: a.repo ?? '',
+              model: a.model ?? '',
+              permissionMode: a.permissionMode ?? '',
+              lastActivity: a.lastActivity ?? new Date().toISOString(),
+              ...(typeof a.lastSessionId === 'string' ? { lastSessionId: a.lastSessionId } : {}),
+            };
           } else {
             // Unknown format, skip
             migrated.agents[agentId] = {
@@ -146,6 +156,12 @@ export class SessionStore {
   updateLastActivity(agentId: string): void {
     const agent = this.ensureAgent(agentId);
     agent.lastActivity = new Date().toISOString();
+    this.save();
+  }
+
+  setLastSessionId(agentId: string, sessionId: string): void {
+    const agent = this.ensureAgent(agentId);
+    agent.lastSessionId = sessionId;
     this.save();
   }
 

@@ -1293,16 +1293,21 @@ ${hbContent}`;
     }
 
     // Determine session ID and whether to continue
-    const sessionId = agent.pendingSessionId ?? undefined;
+    let sessionId = agent.pendingSessionId ?? undefined;
     agent.pendingSessionId = null; // consumed
     const forceNew = agent.forceNewSession;
     agent.forceNewSession = false; // consumed
 
-    // Auto-continue if no explicit session and last activity was recent (<2h)
-    // forceNew (/new command) overrides the recency check.
+    // Resume only via an explicit sessionId we own. Bare `--continue` picks the newest JSONL
+    // in the project dir by mtime — which may be a `claude` CLI session or another agent
+    // sharing the repo. If we have no tracked sessionId, start fresh instead.
     const STALE_THRESHOLD_MS = 2 * 60 * 60 * 1000;
     const lastActivityMs = new Date(agentState.lastActivity).getTime();
-    const continueSession = !forceNew && (!!sessionId || (Date.now() - lastActivityMs < STALE_THRESHOLD_MS));
+    const isRecent = Date.now() - lastActivityMs < STALE_THRESHOLD_MS;
+    if (!sessionId && !forceNew && isRecent && agentState.lastSessionId) {
+      sessionId = agentState.lastSessionId;
+    }
+    const continueSession = !forceNew && !!sessionId;
 
     // Start MCP socket listener for this agent (bridge-side, receives tool calls from CC's MCP client)
     const mcpSocketPath = join(this.config.global.socketDir, `${agentId}-${agentId}.sock`);
@@ -1406,6 +1411,7 @@ ${hbContent}`;
 
     proc.on('init', (event: InitEvent) => {
       this.sessionStore.updateLastActivity(agentId);
+      this.sessionStore.setLastSessionId(agentId, event.session_id);
       agent.eventBuffer.push({ ts: Date.now(), type: 'system', text: `Session initialized: ${event.session_id}` });
 
       // Update registry key if session ID changed from tentative
