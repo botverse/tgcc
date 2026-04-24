@@ -3653,7 +3653,6 @@ ${hbContent}`;
               defaults: {
                 model: (request.params.model as string) || 'sonnet',
                 repo,
-                maxTurns: 200,
                 idleTimeoutMs: 300_000,
                 hangTimeoutMs: 300_000,
                 permissionMode: permMode,
@@ -4128,7 +4127,6 @@ ${hbContent}`;
           defaults: {
             model: (params.model as string) || 'sonnet',
             repo,
-            maxTurns: 200,
             idleTimeoutMs: 300_000,
             hangTimeoutMs: 300_000,
             permissionMode: permMode,
@@ -4680,7 +4678,6 @@ ${hbContent}`;
       defaults: {
         model: 'sonnet',
         repo: targetAgent.repo,
-        maxTurns: 200,
         idleTimeoutMs: 600_000,
         hangTimeoutMs: 300_000,
         permissionMode: 'dangerously-skip',

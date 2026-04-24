@@ -25,7 +25,6 @@ export interface GlobalConfig {
 export interface AgentDefaults {
   model: string;
   repo: string;
-  maxTurns: number;
   idleTimeoutMs: number;
   hangTimeoutMs: number;
   permissionMode: 'dangerously-skip' | 'acceptEdits' | 'default' | 'plan';
@@ -128,7 +127,6 @@ const DEFAULT_GLOBAL: GlobalConfig = {
 const DEFAULT_AGENT_DEFAULTS: AgentDefaults = {
   model: 'claude-sonnet-4-20250514',
   repo: homedir(),
-  maxTurns: 50,
   idleTimeoutMs: 7_200_000,
   hangTimeoutMs: 300_000,
   permissionMode: 'dangerously-skip',
@@ -225,7 +223,6 @@ export function validateConfig(raw: unknown): TgccConfig {
     const defaults: AgentDefaults = {
       model: typeof defaultsRaw.model === 'string' ? defaultsRaw.model : DEFAULT_AGENT_DEFAULTS.model,
       repo: resolvedRepo,
-      maxTurns: typeof defaultsRaw.maxTurns === 'number' ? defaultsRaw.maxTurns : DEFAULT_AGENT_DEFAULTS.maxTurns,
       idleTimeoutMs: typeof defaultsRaw.idleTimeoutMs === 'number' ? defaultsRaw.idleTimeoutMs : DEFAULT_AGENT_DEFAULTS.idleTimeoutMs,
       hangTimeoutMs: typeof defaultsRaw.hangTimeoutMs === 'number' ? defaultsRaw.hangTimeoutMs : DEFAULT_AGENT_DEFAULTS.hangTimeoutMs,
       permissionMode: ['dangerously-skip', 'acceptEdits', 'default', 'plan'].includes(defaultsRaw.permissionMode as string)
@@ -374,7 +371,6 @@ export function validateConfig(raw: unknown): TgccConfig {
 export interface ResolvedUserConfig {
   model: string;
   repo: string;
-  maxTurns: number;
   idleTimeoutMs: number;
   hangTimeoutMs: number;
   permissionMode: AgentDefaults['permissionMode'];
@@ -386,7 +382,6 @@ export function resolveUserConfig(agent: AgentConfig, userId: string): ResolvedU
   return {
     model: userOverride.model ?? agent.defaults.model,
     repo: userOverride.repo ?? agent.defaults.repo,
-    maxTurns: agent.defaults.maxTurns,
     idleTimeoutMs: agent.defaults.idleTimeoutMs,
     hangTimeoutMs: agent.defaults.hangTimeoutMs,
     permissionMode: agent.defaults.permissionMode,

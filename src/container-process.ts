@@ -203,7 +203,6 @@ export class ContainerCCProcess extends EventEmitter implements ICCProcess {
       '--verbose',
       '--include-partial-messages',
       '--permission-prompt-tool', 'stdio',
-      '--max-turns', String(cfg.maxTurns),
     ];
 
     switch (cfg.permissionMode) {

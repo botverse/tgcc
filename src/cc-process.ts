@@ -27,7 +27,6 @@ import {
 export interface CCUserConfig {
   model: string;
   repo: string;
-  maxTurns: number;
   idleTimeoutMs: number;
   hangTimeoutMs: number;
   permissionMode: 'default' | 'plan' | 'acceptEdits' | 'dangerously-skip';
@@ -288,7 +287,6 @@ export class CCProcess extends EventEmitter implements ICCProcess {
       '--verbose',
       '--include-partial-messages',
       '--permission-prompt-tool', 'stdio',
-      '--max-turns', String(cfg.maxTurns),
     ];
 
 
