@@ -125,6 +125,7 @@ interface AgentInstance {
   lastSendData: { text: string; source?: { chatId?: number; spawnSource?: 'telegram' | 'supervisor' | 'cli' } } | null; // for retry after auth
   claudeConfigDir: string | undefined; // isolated CLAUDE_CONFIG_DIR for docker agents
   pendingCliTmuxAgent: string | null; // waiting for tmux session name reply from /new-cli
+  cliSessionId: string | null; // active CC sessionId inside an attached CLI session (reported via cli_event 'session')
 }
 
 interface SupervisorPendingRequest {
@@ -707,6 +708,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
         ? join(homedir(), '.tgcc', 'agents', agentId, 'repos', computeProjectSlug(agentState.repo || configDefaults.repo), '.claude')
         : undefined,
       pendingCliTmuxAgent: null,
+      cliSessionId: null,
     };
 
     this.agents.set(agentId, instance);
@@ -2307,11 +2309,12 @@ ${hbContent}`;
       case 'sessions': {
         const repo = agent.repo;
         const currentSessionId = agent.ccProcess?.sessionId ?? null;
+        const cliSessionId = agent.cliSessionId;
 
         // Discover sessions from CC's session directory
         const discovered = this.discoverAgentSessions(agent, 5);
 
-        type MergedSession = { id: string; title: string; summary: string | null; age: string; detail: string; isCurrent: boolean };
+        type MergedSession = { id: string; title: string; summary: string | null; age: string; detail: string; isCurrent: boolean; isCli: boolean };
         const merged: MergedSession[] = discovered.map(d => {
           const ctx = d.contextPct !== null ? ` · ${d.contextPct}% ctx` : '';
           const modelTag = d.model ? ` · ${shortModel(d.model)}` : '';
@@ -2321,7 +2324,8 @@ ${hbContent}`;
             summary: d.summary,
             age: formatAge(d.mtime),
             detail: `~${d.lineCount} entries${ctx}${modelTag}`,
-            isCurrent: d.id === currentSessionId,
+            isCurrent: d.id === currentSessionId || d.id === cliSessionId,
+            isCli: cliSessionId !== null && d.id === cliSessionId,
           };
         });
 
@@ -2339,7 +2343,7 @@ ${hbContent}`;
           const kb = new InlineKeyboard();
           const summaryLine = s.summary ? `\n<i>${escapeHtml(s.summary.length > 150 ? s.summary.slice(0, 150) + '…' : s.summary)}</i>` : '';
           if (s.isCurrent) {
-            const cliTag = this.ctlServer.hasCliSession(agentId) ? ' [CLI]' : '';
+            const cliTag = (s.isCli || this.ctlServer.hasCliSession(agentId)) ? ' [CLI]' : '';
             const repoLine = repo ? `\n📂 <code>${escapeHtml(shortenRepoPath(repo))}</code>` : '';
             const sessModel = agent.model;
             const modelLine = sessModel ? `\n🤖 ${escapeHtml(sessModel)}` : '';
@@ -3687,7 +3691,8 @@ ${hbContent}`;
               lastSendData: null,
               claudeConfigDir: undefined,
               pendingCliTmuxAgent: null,
-                    };
+              cliSessionId: null,
+            };
 
             // Auto-destroy timer
             const timeoutMs = request.params.timeoutMs as number | undefined;
@@ -4078,7 +4083,10 @@ ${hbContent}`;
       }
       case 'session': {
         const sessionId = data.sessionId as string;
-        this.logger.info({ agentId, sessionId }, 'CLI session ID detected');
+        agent.cliSessionId = sessionId;
+        this.sessionStore.updateLastActivity(agentId);
+        this.sessionStore.setLastSessionId(agentId, sessionId);
+        this.logger.info({ agentId, sessionId }, 'CLI session tracked');
         break;
       }
     }
@@ -4088,7 +4096,8 @@ ${hbContent}`;
     const agent = this.agents.get(agentId);
     if (!agent) return;
 
-    this.logger.info({ agentId }, 'CLI session detached');
+    this.logger.info({ agentId, cliSessionId: agent.cliSessionId }, 'CLI session detached');
+    agent.cliSessionId = null;
     this.stopTypingIndicator(agent);
 
     // Notify TG
@@ -4161,6 +4170,7 @@ ${hbContent}`;
       lastSendData: null,
       claudeConfigDir: undefined,
       pendingCliTmuxAgent: null,
+      cliSessionId: null,
         };
 
         // Auto-destroy timer
@@ -4712,6 +4722,7 @@ ${hbContent}`;
       lastSendData: null,
       claudeConfigDir: undefined,
       pendingCliTmuxAgent: null,
+      cliSessionId: null,
     };
 
     // Auto-destroy timeout (default 2 hours)
