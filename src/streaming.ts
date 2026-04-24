@@ -567,6 +567,11 @@ export class StreamAccumulator {
       }
     } else if (blockType === 'image' && this.imageBase64Buffer) {
       await this.sendImage();
+    } else if (blockType === 'thinking' && seg?.type === 'thinking' && seg.rawText.length === 0) {
+      // Empty thinking block — drop the placeholder so "💭 Processing…" doesn't stick around.
+      const idx = this.segments.indexOf(seg);
+      if (idx >= 0) this.segments.splice(idx, 1);
+      this.requestRender();
     } else if (blockType === 'thinking' && seg?.type === 'thinking' && seg.rawText.length > 0) {
       const thinkingIdx = this.segments.indexOf(seg);
       if (thinkingIdx < 0) return; // segment already removed (defensive)
