@@ -1054,22 +1054,13 @@ function cmdLogs(): void {
 // ── Attach (interactive CLI session) ──
 
 async function cmdAttach(args: string[]): Promise<void> {
-  let agentName: string | undefined;
-  let sessionId: string | undefined;
-  let resumeSession = false;
-
-  for (let i = 0; i < args.length; i++) {
-    if (args[i] === '--agent' && i + 1 < args.length) {
-      agentName = args[++i];
-    } else if (args[i] === '--session' && i + 1 < args.length) {
-      sessionId = args[++i];
-    } else if (args[i] === '--resume') {
-      resumeSession = true;
-    }
-  }
+  // All flags pass through to CC unchanged — TGCC must not shadow CC's native flags
+  // (--agent, --resume, --session, --dangerously-skip-permissions, etc).
+  // The TGCC agent is resolved from cwd via config; no --agent override.
+  const passthroughArgs = [...args];
 
   const config = loadConfigSafe();
-  const agentId = resolveAgent(agentName, config);
+  const agentId = resolveAgent(undefined, config);
   const agentConfig = config.agents[agentId];
   const repo = agentConfig.defaults.repo ?? process.cwd();
   const ccBinaryPath = config.global.ccBinaryPath ?? 'claude';
@@ -1130,15 +1121,12 @@ async function cmdAttach(args: string[]): Promise<void> {
   if (mcpConfigPath) {
     ccArgs.push('--mcp-config', mcpConfigPath);
   }
-  if (sessionId) {
-    ccArgs.push('--resume', sessionId);
-  } else if (resumeSession) {
-    ccArgs.push('--continue');
-  }
   // Add extra args from config
   if (agentConfig.defaults.ccExtraArgs) {
     ccArgs.push(...agentConfig.defaults.ccExtraArgs.split(/\s+/).filter(Boolean));
   }
+  // Passthrough flags from the CLI invocation — CC handles --agent, --resume, --session, etc
+  ccArgs.push(...passthroughArgs);
 
   // Spawn CC in a PTY
   const { CliProcess } = await import('./cli-process.js');
@@ -1229,30 +1217,39 @@ async function cmdAttach(args: string[]): Promise<void> {
   cliProcess.start();
 }
 
+const KNOWN_COMMANDS = new Set([
+  'message', 'msg', 'status', 'agent', 'repo', 'permissions',
+  'init', 'run', 'start', 'install', 'uninstall', 'stop', 'restart',
+  'logs', 'attach', 'help', '--help', '-h',
+]);
+
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
-  const command = args[0];
+  // Default to `attach` when no command or when first arg is a flag (e.g. `tgcc --dangerously-skip-permissions`)
+  const hasCommand = args.length > 0 && KNOWN_COMMANDS.has(args[0]);
+  const command = hasCommand ? args[0] : 'attach';
+  const commandArgs = hasCommand ? args.slice(1) : args;
 
   switch (command) {
     case 'message':
     case 'msg':
-      await cmdMessage(args.slice(1));
+      await cmdMessage(commandArgs);
       break;
 
     case 'status':
-      await cmdStatus(args.slice(1));
+      await cmdStatus(commandArgs);
       break;
 
     case 'agent':
-      cmdAgent(args.slice(1));
+      cmdAgent(commandArgs);
       break;
 
     case 'repo':
-      cmdRepo(args.slice(1));
+      cmdRepo(commandArgs);
       break;
 
     case 'permissions':
-      cmdPermissions(args.slice(1));
+      cmdPermissions(commandArgs);
       break;
 
     case 'init':
@@ -1288,7 +1285,7 @@ async function main(): Promise<void> {
       break;
 
     case 'attach':
-      await cmdAttach(args.slice(1));
+      await cmdAttach(commandArgs);
       break;
 
     case 'help':
@@ -1298,13 +1295,9 @@ async function main(): Promise<void> {
       break;
 
     default:
-      if (!command) {
-        printHelp();
-      } else {
-        console.error(`Unknown command: ${command}`);
-        printHelp();
-        process.exit(1);
-      }
+      console.error(`Unknown command: ${command}`);
+      printHelp();
+      process.exit(1);
   }
 }
 
@@ -1326,11 +1319,14 @@ Service:
 Commands:
   tgcc status [--agent]     Show running agents and active sessions
   tgcc message [--agent] "text"  Send a message to a running agent
-  tgcc attach [--agent]     Run CC interactively with TGCC tracking
+  tgcc attach [cc-flags...]  Run CC interactively with TGCC tracking (default)
   tgcc agent <subcommand>   Manage agent registrations
   tgcc repo <subcommand>    Manage repo registry
   tgcc permissions          View/set agent permission modes
-  tgcc help                 Show this help message`);
+  tgcc help                 Show this help message
+
+Note: Running \`tgcc\` with no command (or with CC flags) attaches to the agent
+for the current repo. All flags after \`tgcc attach\` pass through to CC.`);
 }
 
 main().catch((err) => {
