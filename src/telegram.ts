@@ -292,6 +292,7 @@ export class TelegramBot {
     const userId = ctx.from?.id;
     const chatId = ctx.chat?.id;
     if (!userId || !chatId) return;
+    if (ctx.from?.is_bot) return;
     if (!this.isAllowed(userId, chatId)) {
       const key = `${userId}:${chatId}`;
       if (!this.rejectedKeys.has(key)) {
@@ -323,6 +324,7 @@ export class TelegramBot {
     const userId = ctx.from?.id;
     const chatId = ctx.chat?.id;
     if (!userId || !chatId) return;
+    if (ctx.from?.is_bot) return;
     if (!this.isAllowed(userId, chatId)) { await this.rejectUnauthorized(ctx, userId, chatId); return; }
 
     const text = ctx.message?.text ?? '';
@@ -341,6 +343,7 @@ export class TelegramBot {
     const userId = ctx.from?.id;
     const chatId = ctx.chat?.id;
     if (!userId || !chatId) return;
+    if (ctx.from?.is_bot) return;
     if (!this.isAllowed(userId, chatId)) { await this.rejectUnauthorized(ctx, userId, chatId); return; }
     if (!ctx.message?.text) return;
 
@@ -371,6 +374,7 @@ export class TelegramBot {
     const userId = ctx.from?.id;
     const chatId = ctx.chat?.id;
     if (!userId || !chatId) return;
+    if (ctx.from?.is_bot) return;
     if (!this.isAllowed(userId, chatId)) { await this.rejectUnauthorized(ctx, userId, chatId); return; }
 
     try {
@@ -410,6 +414,7 @@ export class TelegramBot {
     const userId = ctx.from?.id;
     const chatId = ctx.chat?.id;
     if (!userId || !chatId) return;
+    if (ctx.from?.is_bot) return;
     if (!this.isAllowed(userId, chatId)) { await this.rejectUnauthorized(ctx, userId, chatId); return; }
 
     try {
@@ -468,6 +473,7 @@ export class TelegramBot {
     const userId = ctx.from?.id;
     const chatId = ctx.chat?.id;
     if (!userId || !chatId) return;
+    if (ctx.from?.is_bot) return;
     if (!this.isAllowed(userId, chatId)) { await this.rejectUnauthorized(ctx, userId, chatId); return; }
 
     try {
@@ -504,6 +510,7 @@ export class TelegramBot {
     const userId = ctx.from?.id;
     const chatId = ctx.chat?.id;
     if (!userId || !chatId) return;
+    if (ctx.from?.is_bot) return;
     if (!this.isAllowed(userId, chatId)) { await this.rejectUnauthorized(ctx, userId, chatId); return; }
 
     try {
