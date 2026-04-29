@@ -152,7 +152,7 @@ function renderThinkingBubbles(rawText: string): string[] {
 // ── Segment types (internal) ──
 
 type InternalSegment =
-  | { type: 'thinking'; content: string; rawText: string; splitOff?: boolean; pendingSplit?: boolean }
+  | { type: 'thinking'; content: string; rawText: string; splitOff?: boolean; pendingSplit?: boolean; finalizedEmpty?: boolean }
   | { type: 'text'; content: string; rawText: string }
   | { type: 'tool'; id: string; content: string; toolName: string; status: 'pending' | 'resolved' | 'error'; inputPreview?: string; elapsed?: string; resultStat?: string; startTime: number }
   | { type: 'subagent'; id: string; content: string; toolName: string; label: string; status: 'running' | 'dispatched' | 'completed'; inputPreview?: string; startTime: number; progressLines: string[] }
@@ -178,7 +178,11 @@ function renderSegment(seg: InternalSegment): string {
   switch (seg.type) {
     case 'thinking':
     {
-      if (!seg.rawText) return '<blockquote expandable>💭 Processing…</blockquote>';
+      if (!seg.rawText) {
+        return seg.finalizedEmpty
+          ? '<blockquote>💭 Thought silently</blockquote>'
+          : '<blockquote expandable>💭 Processing…</blockquote>';
+      }
       const html = markdownToTelegramHtml(seg.rawText);
       // Telegram can't nest <pre> inside <blockquote expandable> — collapse code blocks to inline <code>.
       const safeHtml = html.replace(/<pre><code(?:[^>]*)>([\s\S]*?)<\/code><\/pre>/g, (_, code: string) =>
@@ -569,9 +573,12 @@ export class StreamAccumulator {
     } else if (blockType === 'image' && this.imageBase64Buffer) {
       await this.sendImage();
     } else if (blockType === 'thinking' && seg?.type === 'thinking' && seg.rawText.length === 0) {
-      // Empty thinking block — drop the placeholder so "💭 Processing…" doesn't stick around.
-      const idx = this.segments.indexOf(seg);
-      if (idx >= 0) this.segments.splice(idx, 1);
+      // Signature-only thinking (e.g. opus 4.7 hides the reasoning text). Mark as finalized
+      // so the segment renders a static "💭 Thought silently" instead of lingering as
+      // "💭 Processing…" forever. Keeps the user aware that the model thought, without
+      // implying more is coming.
+      seg.finalizedEmpty = true;
+      seg.content = renderSegment(seg);
       this.requestRender();
     } else if (blockType === 'thinking' && seg?.type === 'thinking' && seg.rawText.length > 0) {
       const thinkingIdx = this.segments.indexOf(seg);
