@@ -337,7 +337,9 @@ export class Bridge extends EventEmitter implements CtlHandler {
     // Route deduped events to supervisor queue and TG chat (used as flush target by EventDedup for batched events like git_commit)
     const routeDedupedEvent = (event: import('./high-signal.js').HighSignalEvent): void => {
       if (event.emoji && event.summary) {
-        this.pushSupervisorEvent(event.agentId, `${event.emoji} ${event.summary}`);
+        // Telemetry (commits, milestones, subagent lifecycle, budget) — queue, don't wake CC.
+        // Real escalations should arrive via notify_supervisor with priority='high'.
+        this.pushSupervisorEvent(event.agentId, `${event.emoji} ${event.summary}`, true, false, 'routine');
       }
     };
     this.eventDedup = new EventDedup(routeDedupedEvent);
@@ -353,7 +355,10 @@ export class Bridge extends EventEmitter implements CtlHandler {
         const ROUTED_EVENTS = new Set(['failure_loop', 'stuck', 'task_milestone', 'build_result', 'git_commit', 'subagent_spawn', 'subagent_all_done', 'budget_alert']);
         if (ROUTED_EVENTS.has(event.event) && event.emoji && event.summary) {
           if (this.eventDedup.shouldForward(event)) {
-            this.pushSupervisorEvent(event.agentId, `${event.emoji} ${event.summary}`);
+            // Failure_loop and stuck are genuine escalations — wake CC. The rest are FYI.
+            const wakeEvents = new Set(['failure_loop', 'stuck']);
+            const priority: 'routine' | 'high' = wakeEvents.has(event.event) ? 'high' : 'routine';
+            this.pushSupervisorEvent(event.agentId, `${event.emoji} ${event.summary}`, true, false, priority);
           }
         }
         // Route through EventRouter → delivers to WatcherManager subscribers (ralph) + future consumers
