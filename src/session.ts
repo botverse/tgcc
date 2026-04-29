@@ -617,13 +617,18 @@ export function getSessionEndState(jsonlPath: string, fileSize: number): Session
   return 'unknown';
 }
 
-function getModelContextWindow(model: string): number {
+/** Context window in tokens for a given Claude model name or alias.
+ *  Opus 4.7 (and the "opus" alias which currently resolves to it) ships with 1M tokens.
+ *  Older Opus, all Sonnet, and all Haiku models default to 200k. Sonnet's 1M beta is not
+ *  detectable from the model string alone, so we conservatively return 200k for sonnet. */
+export function getModelContextWindow(model: string | null | undefined): number {
   if (!model) return 200_000;
   const m = model.toLowerCase();
-  if (m.includes('opus')) return 200_000;
-  if (m.includes('sonnet')) return 200_000;
-  if (m.includes('haiku')) return 200_000;
-  return 200_000; // Safe default
+  // Opus alias resolves to the latest Opus (currently 4.7 with 1M)
+  if (m === 'opus') return 1_000_000;
+  // Explicit Opus 4.7 (with or without `claude-` prefix, with - or . separators)
+  if (/opus[-.]?4[-.]?7/.test(m)) return 1_000_000;
+  return 200_000;
 }
 
 // ── Session History Extraction (for Ralph) ──

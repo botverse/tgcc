@@ -1048,10 +1048,22 @@ ${hbContent}`;
     const agent = this.agents.get(agentId);
     if (!agent) return;
 
-    // If this agent has an active CLI session, inject text into the PTY instead of pipe mode
+    // If a CLI session is attached, yank it: TG always wins. Pass the CLI's sessionId
+    // through pendingSessionId so the new stdin CC resumes the same conversation.
     if (this.ctlServer.hasCliSession(agentId)) {
-      this.ctlServer.sendToCliSocket(agentId, { type: 'cli_inject', text: data.text });
-      return;
+      const yankedSessionId = agent.cliSessionId;
+      this.logger.info({ agentId, yankedSessionId }, 'TG message arrived — yanking CLI session');
+      if (yankedSessionId && !agent.pendingSessionId) {
+        agent.pendingSessionId = yankedSessionId;
+      }
+      agent.cliSessionId = null;
+      this.ctlServer.sendToCliSocket(agentId, { type: 'cli_kill' });
+      const yankChatId = source?.chatId ?? this.getAgentChatId(agent);
+      if (yankChatId && agent.tgBot) {
+        agent.tgBot.sendText(yankChatId, '<blockquote>⚡ CLI session yanked — TG taking over.</blockquote>', 'HTML', true)
+          .catch(err => this.logger.warn({ err }, 'Failed to send CLI yank notification'));
+      }
+      // Fall through — normal stdin spawn logic below will start CC fresh and resume the session
     }
 
     // Clear mute if this is a user-facing send (not a wake ping)
@@ -4045,11 +4057,15 @@ ${hbContent}`;
     const agent = this.agents.get(agentId);
     if (!agent) throw new Error(`Unknown agent: ${agentId}`);
 
-    // Kill existing CC process if any (CLI takes over)
+    // Kill any active stdin CC — CLI always wins on attach
     if (agent.ccProcess) {
-      this.logger.info({ agentId }, 'CLI attach: killing existing CC process');
-      agent.ccProcess.kill();
-      agent.ccProcess = null;
+      this.logger.info({ agentId, sessionId: agent.ccProcess.sessionId }, 'CLI attach: yanking stdin CC');
+      this.killAgentProcess(agentId);
+      const tgChatId = this.getAgentChatId(agent);
+      if (tgChatId && agent.tgBot) {
+        agent.tgBot.sendText(tgChatId, '<blockquote>⚡ Stdin CC released — CLI took over this session.</blockquote>', 'HTML', true)
+          .catch(err => this.logger.warn({ err }, 'Failed to send CLI takeover notification'));
+      }
     }
 
     // Update repo if provided

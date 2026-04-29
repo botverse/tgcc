@@ -10,6 +10,7 @@ import type {
   StreamMessageStart,
 } from './cc-protocol.js';
 import { markdownToTelegramHtml } from './telegram-html-remark.js';
+import { getModelContextWindow } from './session.js';
 
 // ── Types ──
 
@@ -1411,13 +1412,12 @@ function formatTokens(n: number): string {
 }
 
 /** Format usage stats as an HTML italic footer line */
-export function formatUsageFooter(usage: TurnUsage, _model?: string): string {
+export function formatUsageFooter(usage: TurnUsage, model?: string): string {
   const ctxInput = usage.ctxInputTokens ?? usage.inputTokens;
   const ctxRead = usage.ctxCacheReadTokens ?? usage.cacheReadTokens;
   const ctxCreation = usage.ctxCacheCreationTokens ?? usage.cacheCreationTokens;
   const totalCtx = ctxInput + ctxRead + ctxCreation;
-  const CONTEXT_WINDOW = 200_000;
-  const ctxPct = Math.round(totalCtx / CONTEXT_WINDOW * 100);
+  const ctxPct = Math.round(totalCtx / getModelContextWindow(model) * 100);
   const overLimit = ctxPct > 90;
   const parts = [
     `${formatTokens(usage.inputTokens)} in`,

@@ -5,6 +5,7 @@
 
 import type { LogLine } from './event-buffer.js';
 import type { StreamInnerEvent, StreamMessageStart } from './cc-protocol.js';
+import { getModelContextWindow } from './session.js';
 
 // ── Types ──
 
@@ -67,7 +68,6 @@ const TODO_TOOLS = new Set(['TodoWrite', 'TodoRead']);
 const BASH_TOOLS = new Set(['Bash', 'shell']);
 
 const CONTEXT_THRESHOLDS = [50, 75, 90];
-const CONTEXT_WINDOW_TOKENS = 200_000;
 const FAILURE_LOOP_THRESHOLD = 3;
 const DEFAULT_STUCK_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 const DEFAULT_BUDGET_THRESHOLDS = [1, 5, 10, 25]; // USD
@@ -332,7 +332,8 @@ export class HighSignalDetector {
     const cacheRead = (usage as Record<string, number>).cache_read_input_tokens ?? 0;
     const cacheCreation = (usage as Record<string, number>).cache_creation_input_tokens ?? 0;
     const totalTokens = inputTokens + cacheRead + cacheCreation;
-    const percent = Math.round((totalTokens / CONTEXT_WINDOW_TOKENS) * 100);
+    const model: string | undefined = (event.message as { model?: string } | undefined)?.model;
+    const percent = Math.round((totalTokens / getModelContextWindow(model)) * 100);
     state.lastContextPercent = percent;
 
     for (const threshold of CONTEXT_THRESHOLDS) {
