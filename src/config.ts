@@ -125,7 +125,7 @@ const DEFAULT_GLOBAL: GlobalConfig = {
 };
 
 const DEFAULT_AGENT_DEFAULTS: AgentDefaults = {
-  model: 'claude-sonnet-4-20250514',
+  model: 'opus',
   repo: homedir(),
   idleTimeoutMs: 7_200_000,
   hangTimeoutMs: 300_000,
