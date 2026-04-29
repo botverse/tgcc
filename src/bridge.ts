@@ -126,7 +126,6 @@ interface AgentInstance {
   claudeConfigDir: string | undefined; // isolated CLAUDE_CONFIG_DIR for docker agents
   pendingCliTmuxAgent: string | null; // waiting for tmux session name reply from /new-cli
   cliSessionId: string | null; // active CC sessionId inside an attached CLI session (reported via cli_event 'session')
-  pendingTgMessages: Array<{ data: { text: string; imageBase64?: string; imageMediaType?: string; images?: Array<{ base64: string; mediaType: string }>; filePath?: string; fileName?: string }; source?: { chatId?: number; spawnSource?: 'telegram' | 'supervisor' | 'cli' } }>;
 }
 
 interface SupervisorPendingRequest {
@@ -715,7 +714,6 @@ export class Bridge extends EventEmitter implements CtlHandler {
         : undefined,
       pendingCliTmuxAgent: null,
       cliSessionId: null,
-      pendingTgMessages: [],
     };
 
     this.agents.set(agentId, instance);
@@ -1049,25 +1047,6 @@ ${hbContent}`;
   ): Promise<void> {
     const agent = this.agents.get(agentId);
     if (!agent) return;
-
-    // Defer TG follow-ups while CC is mid-turn. Sending mid-stream causes CC to abandon the
-    // in-flight response (no result event, partial bubble truncated) — instead we queue and
-    // deliver on the next result, so the user gets the full answer to question 1 plus a
-    // proper turn for question 2.
-    const midTurnProc = agent.ccProcess;
-    if (
-      source?.spawnSource === 'telegram' &&
-      midTurnProc?.state === 'active' &&
-      midTurnProc.ccActivity !== 'idle'
-    ) {
-      this.logger.info({ agentId, ccActivity: midTurnProc.ccActivity, queued: agent.pendingTgMessages.length + 1 }, 'TG message mid-turn — deferring until result');
-      agent.pendingTgMessages.push({ data, source });
-      if (source.chatId && agent.tgBot) {
-        agent.tgBot.sendText(source.chatId, '<blockquote>⏳ Queued — will send after current turn.</blockquote>', 'HTML', true)
-          .catch(err => this.logger.warn({ err }, 'Failed to send defer notification'));
-      }
-      return;
-    }
 
     // If a CLI session is attached, yank it: TG always wins. Pass the CLI's sessionId
     // through pendingSessionId so the new stdin CC resumes the same conversation.
@@ -2082,7 +2061,7 @@ ${hbContent}`;
           cacheReadTokens: event.usage.cache_read_input_tokens ?? 0,
           cacheCreationTokens: event.usage.cache_creation_input_tokens ?? 0,
           costUsd: event.total_cost_usd ?? null,
-          model: (event as { model?: string }).model ?? entry?.model ?? agent.model,
+          model: (event as { model?: string }).model ?? entry?.model,
         });
       }
       await acc.finalize();
@@ -2114,17 +2093,6 @@ ${hbContent}`;
 
     // Deliver any waitForIdle-deferred messages now that the turn is done
     this.drainDeferredSends(agentId);
-
-    // Drain TG follow-ups that arrived mid-turn (queued in sendToCC to avoid interrupting CC).
-    if (agent.pendingTgMessages.length > 0) {
-      const queued = agent.pendingTgMessages.splice(0);
-      this.logger.info({ agentId, queued: queued.length }, 'Draining queued TG messages');
-      for (const { data, source } of queued) {
-        this.sendToCC(agentId, data, source).catch(err =>
-          this.logger.error({ err, agentId }, 'Failed to drain queued TG message'),
-        );
-      }
-    }
 
     // Route to EventRouter → watchers (ralph) + future consumers
     this.eventRouter.routeLifecycle({
@@ -3741,7 +3709,6 @@ ${hbContent}`;
               claudeConfigDir: undefined,
               pendingCliTmuxAgent: null,
               cliSessionId: null,
-              pendingTgMessages: [],
             };
 
             // Auto-destroy timer
@@ -4225,7 +4192,6 @@ ${hbContent}`;
       claudeConfigDir: undefined,
       pendingCliTmuxAgent: null,
       cliSessionId: null,
-      pendingTgMessages: [],
         };
 
         // Auto-destroy timer
@@ -4778,7 +4744,6 @@ ${hbContent}`;
       claudeConfigDir: undefined,
       pendingCliTmuxAgent: null,
       cliSessionId: null,
-      pendingTgMessages: [],
     };
 
     // Auto-destroy timeout (default 2 hours)
