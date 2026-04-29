@@ -97,7 +97,7 @@ async function main(): Promise<void> {
 
   server.tool(
     'send_message',
-    'Send a text message to the user on Telegram. Use this to report findings, alerts, or anything the user should see — especially from background/heartbeat tasks where normal output is suppressed.',
+    'Out-of-band Telegram notification. Your normal assistant text already renders to the user\'s chat automatically — do NOT call this for replies, greetings, summaries, or anything you can just say in your text response. Reserve only for alerts the user must see outside the current interactive turn (e.g. async background work, heartbeat wake-ups, long-running tasks). Calling this during an interactive reply duplicates your output and creates noise.',
     {
       text: z.string().describe('Message text (plain text, no HTML)'),
     },
