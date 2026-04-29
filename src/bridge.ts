@@ -1212,11 +1212,18 @@ ${hbContent}`;
     // Log user message in event buffer
     agent.eventBuffer.push({ ts: Date.now(), type: 'user', text: data.text });
 
-    // If CC is mid-turn, flush any pending content first so the last block isn't lost,
-    // then seal the bubble so the next output starts fresh below this user message
+    // If CC is mid-turn, fully drain pending content into the current bubble before reset,
+    // so the truncated bubble reflects exactly what CC produced up to this moment. CC keeps
+    // emitting events during the await; a single flush captures only the snapshot at call
+    // time, so we loop briefly — yielding the event loop between passes lets queued
+    // handleEvent calls update segments before the next flush captures them.
     if (proc.state === 'active' && agent.accumulator) {
-      await agent.accumulator.flushIfDirty();
-      agent.accumulator.reset();
+      const acc = agent.accumulator;
+      for (let i = 0; i < 3; i++) {
+        await acc.flushIfDirty();
+        await new Promise<void>(resolve => setImmediate(resolve));
+      }
+      acc.reset();
     }
 
     proc.sendMessage(ccMsg);
