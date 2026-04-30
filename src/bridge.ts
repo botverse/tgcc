@@ -122,7 +122,7 @@ interface AgentInstance {
   deferredSends: Array<{ text: string; fromAgentId: string }>; // queued by waitForIdle sends
   muteOutput: boolean; // suppress TG rendering for wake-triggered supervisor turns
   authFlowInProgress: boolean; // prevents re-entrant auth fallback
-  lastSendData: { text: string; source?: { chatId?: number; messageId?: number; spawnSource?: 'telegram' | 'supervisor' | 'cli' } } | null; // for retry after auth
+  lastSendData: { text: string; source?: { chatId?: number; spawnSource?: 'telegram' | 'supervisor' | 'cli' } } | null; // for retry after auth
   claudeConfigDir: string | undefined; // isolated CLAUDE_CONFIG_DIR for docker agents
   pendingCliTmuxAgent: string | null; // waiting for tmux session name reply from /new-cli
   cliSessionId: string | null; // active CC sessionId inside an attached CLI session (reported via cli_event 'session')
@@ -542,7 +542,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
     const whisper = await this.resolveWhisperBin();
     if (!whisper) {
       this.logger.warn({ agentId }, 'Whisper not found — forwarding voice file path to CC');
-      this.sendToCC(agentId, { text: msg.text || '', filePath: msg.filePath, fileName: msg.fileName }, { chatId: msg.chatId, messageId: msg.messageId, spawnSource: 'telegram' });
+      this.sendToCC(agentId, { text: msg.text || '', filePath: msg.filePath, fileName: msg.fileName }, { chatId: msg.chatId, spawnSource: 'telegram' });
       return;
     }
 
@@ -562,7 +562,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
       ? `${msg.text}\n\n[Voice message transcription]\n${transcript}`
       : `[Voice message transcription]\n${transcript}`;
 
-    this.sendToCC(agentId, { text }, { chatId: msg.chatId, messageId: msg.messageId, spawnSource: 'telegram' });
+    this.sendToCC(agentId, { text }, { chatId: msg.chatId, spawnSource: 'telegram' });
   }
 
   // ── Startup ──
@@ -997,7 +997,7 @@ ${hbContent}`;
     if (msg.type === 'voice') {
       this.transcribeVoice(agentId, msg).catch(err => {
         this.logger.error({ err, agentId }, 'Voice transcription failed — falling back to file path');
-        this.sendToCC(agentId, { text: msg.text || '', filePath: msg.filePath, fileName: msg.fileName }, { chatId: msg.chatId, messageId: msg.messageId, spawnSource: 'telegram' });
+        this.sendToCC(agentId, { text: msg.text || '', filePath: msg.filePath, fileName: msg.fileName }, { chatId: msg.chatId, spawnSource: 'telegram' });
       });
       return;
     }
@@ -1043,7 +1043,7 @@ ${hbContent}`;
   private async sendToCC(
     agentId: string,
     data: { text: string; imageBase64?: string; imageMediaType?: string; images?: Array<{ base64: string; mediaType: string }>; filePath?: string; fileName?: string },
-    source?: { chatId?: number; messageId?: number; spawnSource?: 'telegram' | 'supervisor' | 'cli' }
+    source?: { chatId?: number; spawnSource?: 'telegram' | 'supervisor' | 'cli' }
   ): Promise<void> {
     const agent = this.agents.get(agentId);
     if (!agent) return;
@@ -1227,13 +1227,6 @@ ${hbContent}`;
     }
 
     proc.sendMessage(ccMsg);
-
-    // Mark the user's TG message with a "received" reaction now that it's piped to CC.
-    // Gives instant feedback during the API time-to-first-byte gap before any stream events arrive.
-    if (source?.messageId && source.chatId && agent.tgBot) {
-      agent.tgBot.setReaction(source.chatId, source.messageId, '👀')
-        .catch(err => this.logger.debug({ err, agentId, messageId: source.messageId }, 'Failed to set received reaction'));
-    }
   }
 
   // ── Process cleanup helper ──
