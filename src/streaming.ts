@@ -186,7 +186,8 @@ function renderSegment(seg: InternalSegment): string {
             : null;
           return `<blockquote>💭 Thought${durStr ? ` for ${durStr}` : ''}</blockquote>`;
         }
-        return '<blockquote>💭</blockquote>';
+        // Live placeholder: bare emoji, no blockquote — promotes to blockquote once duration is known.
+        return '💭';
       }
       const html = markdownToTelegramHtml(seg.rawText);
       // Telegram can't nest <pre> inside <blockquote expandable> — collapse code blocks to inline <code>.
