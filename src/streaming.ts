@@ -186,7 +186,7 @@ function renderSegment(seg: InternalSegment): string {
             : null;
           return `<blockquote>💭 Thought${durStr ? ` for ${durStr}` : ''}</blockquote>`;
         }
-        return '<blockquote expandable>💭 Processing…</blockquote>';
+        return '<blockquote>💭</blockquote>';
       }
       const html = markdownToTelegramHtml(seg.rawText);
       // Telegram can't nest <pre> inside <blockquote expandable> — collapse code blocks to inline <code>.
@@ -1110,6 +1110,15 @@ export class StreamAccumulator {
       if (s.type === 'tool' && s.status === 'pending') return false;
       return true;
     });
+    // Finalize any in-flight thinking blocks so a steer mid-thinking transitions the
+    // placeholder "💭" to "💭 Thought for X.Xs" rather than leaving it as a live indicator.
+    for (const s of this.segments) {
+      if (s.type === 'thinking' && !s.rawText && !s.finalizedEmpty) {
+        s.finalizedEmpty = true;
+        s.durationMs = s.startTime ? Date.now() - s.startTime : undefined;
+        s.content = renderSegment(s);
+      }
+    }
     const html = this.renderHtml();
     const targetMsgId = this.tgMessageId;
     if (html && html !== '…') {
