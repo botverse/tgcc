@@ -9,6 +9,8 @@ import type { AgentConfig } from './config.js';
 export interface TelegramMessage {
   type: 'text' | 'photo' | 'document' | 'voice' | 'video';
   chatId: number;
+  /** TG message id of the user's incoming message — used to set a "received" reaction once piped to CC. */
+  messageId: number;
   userId: string;
   userName?: string;
   userHandle?: string; // Telegram @username (without @)
@@ -358,6 +360,7 @@ export class TelegramBot {
 
     this.onMessage({
       type: 'text',
+      messageId: ctx.message.message_id,
       chatId,
       userId: String(userId),
       userName: TelegramBot.getUserName(ctx),
@@ -392,6 +395,7 @@ export class TelegramBot {
 
       this.onMessage({
         type: 'photo',
+        messageId: ctx.message?.message_id ?? 0,
         chatId,
         userId: String(userId),
         userName: TelegramBot.getUserName(ctx),
@@ -438,6 +442,7 @@ export class TelegramBot {
         const mediaType = detectImageMediaType(fileName);
         this.onMessage({
           type: 'photo',
+          messageId: ctx.message?.message_id ?? 0,
           chatId,
           userId: String(userId),
           userName,
@@ -451,6 +456,7 @@ export class TelegramBot {
 
       this.onMessage({
         type: 'document',
+        messageId: ctx.message?.message_id ?? 0,
         chatId,
         userId: String(userId),
         userName,
@@ -487,6 +493,7 @@ export class TelegramBot {
 
       this.onMessage({
         type: 'voice',
+        messageId: ctx.message?.message_id ?? 0,
         chatId,
         userId: String(userId),
         userName: TelegramBot.getUserName(ctx),
@@ -523,6 +530,7 @@ export class TelegramBot {
 
       this.onMessage({
         type: 'video',
+        messageId: ctx.message?.message_id ?? 0,
         chatId,
         userId: String(userId),
         userName: TelegramBot.getUserName(ctx),
