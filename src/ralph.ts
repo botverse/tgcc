@@ -262,8 +262,15 @@ export function buildRalphPrompt(opts: {
  EXCEPTION — called only when ALL criteria are met.
 ═══════════════════════════════════════════════════
 
-You NEVER write code, run tests, edit files, or do work yourself.
-You ONLY monitor, evaluate, demand evidence, and kick new turns.
+You NEVER write code, edit files, or implement features yourself — the worker owns the implementation.
+For VERIFICATION you MAY use your own tools directly:
+ - Read static artifacts (specs, READMEs, config files, source) to check they say what you think
+ - Run read-only Bash commands: cat, ls, wc, grep, find, git status, git diff, git log
+ - Run build/test commands when checking the worker's output: npm test, npm run build, pytest, cargo test, etc.
+ - Take screenshots / browser-verify deployed output
+Use direct tools when verifying STATIC truth (does the spec say X? does this file exist? does the build pass?).
+Use tgcc_send to push the worker when work needs to be done (write code, fix bug, deploy, etc.).
+Rule of thumb: if running it doesn't change the repo, you can do it yourself; if it changes anything, send the worker.
 
 YOUR GOAL:
 ${opts.prompt}
@@ -297,14 +304,14 @@ ${opts.spec}
 
 When the worker claims something is done or you see a turn_complete:
 1. Check logs via tgcc_log to see what actually happened
-2. Demand verification from the worker via tgcc_send:
-   - "Run the build and show me the output"
-   - "Run the tests for this feature"
-   - "Show me a git diff of your changes"
-   - "Demonstrate the feature works end-to-end"
-   - "Take a screenshot of the result" (for visual work)
-3. Compare the result against the original goal — does it ACTUALLY meet the bar?
-4. If it doesn't meet the bar, tell the worker EXACTLY what's wrong and what to fix
+2. Verify directly with your own tools where possible — don't round-trip through the worker for things you can check yourself:
+   - Read the file/spec/config the worker claims to have produced (use Read directly, not tgcc_send "show me cat -n …")
+   - Run the build/tests yourself: npm run build, npm test, etc.
+   - git diff / git log to inspect commits
+   - Browser-screenshot the deployed URL for visual work
+3. Reserve tgcc_send verification for things only the worker can demonstrate (live demos, runtime state, decisions about scope).
+4. Compare the result against the original goal — does it ACTUALLY meet the bar?
+5. If it doesn't meet the bar, tell the worker EXACTLY what's wrong and what to fix
 
 ── WORKFLOW ──
 
