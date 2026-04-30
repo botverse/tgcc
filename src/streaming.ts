@@ -418,6 +418,18 @@ export class StreamAccumulator {
       this.segments.push(seg);
       this.currentSegment = seg;
       this.requestRender();
+      // Eagerly ship the bare 💭 placeholder for fast thinking blocks. Without this, the
+      // 1s edit throttle + first-send gate let opus 4.7's <500ms signature-only thinking
+      // finalize before the placeholder ever reaches TG. Skip when there's a pending split
+      // (the split path handles its own bubble) or an existing bubble (edits pick it up).
+      if (!this.tgMessageId && !seg.pendingSplit) {
+        const eagerHtml = seg.content;
+        this.dirty = false; // suppress the redundant throttled flush
+        this.clearFlushTimer();
+        this.sendQueue = this.sendQueue
+          .then(() => this._doSendOrEdit(eagerHtml, null))
+          .catch(err => this.logger?.warn?.({ err }, 'Eager thinking placeholder send failed'));
+      }
 
     } else if (blockType === 'redacted_thinking') {
       // Enterprise-redacted thinking — show placeholder
