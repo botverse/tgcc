@@ -1972,6 +1972,13 @@ ${hbContent}`;
         // Mid-turn tool-use loop → keep same bubble, clear transient state
         agent.accumulator.softReset();
       }
+      // Ensure typing indicator is running whenever CC starts a new message — covers the
+      // gap created by a steer (result event for the abandoned turn stopped typing before
+      // events for the new turn arrive).
+      const tgChatId = agent.typingChatId ?? agent.lastTgChatId;
+      if (tgChatId) {
+        this.startTypingIndicator(agent, tgChatId);
+      }
     }
 
     agent.accumulator?.handleEvent(event).catch(err => {
