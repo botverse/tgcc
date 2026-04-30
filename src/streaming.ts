@@ -294,7 +294,6 @@ export class StreamAccumulator {
   private firstSendReady = true;  // true until first reset() — pre-turn sends are unrestricted
 
   // Tool hide timers (fix: don't flash ⚡ for fast tools that resolve <500ms)
-  private toolHideTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
   // Sealed message IDs — used to detect re-editing of retired/split-off bubbles.
   // 'writing'   = split has claimed this ID for ONE authorized final edit; others are violations
@@ -477,13 +476,9 @@ export class StreamAccumulator {
         seg.content = renderSegment(seg);
         this.segments.push(seg);
         this.currentSegment = seg;
-        // Suppress the ⚡ pending indicator for 500ms. If the tool resolves within that window
-        // the hide timer is cancelled in resolveToolMessage and we render directly as ✅.
-        const toolBlockId = block.id;
-        this.toolHideTimers.set(toolBlockId, setTimeout(() => {
-          this.toolHideTimers.delete(toolBlockId);
-          this.requestRender();
-        }, 500));
+        // Pending tools render only when they have something useful to show — gated by
+        // status (resolved/error) or extracted inputPreview, both event-driven via
+        // input_json_delta and tool_result. No timer.
       }
       this.requestRender();
 
@@ -715,15 +710,6 @@ export class StreamAccumulator {
     }
 
     if (seg.type === 'tool') {
-      // Cancel the hide timer — tool is now visible in its final state.
-      // If it resolved within 500ms the timer was still running; cancelling it means
-      // the ⚡ pending indicator was never shown and we render directly as ✅.
-      const hideTimer = this.toolHideTimers.get(blockId);
-      if (hideTimer !== undefined) {
-        clearTimeout(hideTimer);
-        this.toolHideTimers.delete(blockId);
-      }
-
       // MCP media tools: remove segment on success (media itself is the result)
       if (StreamAccumulator.MCP_MEDIA_TOOLS.has(seg.toolName) && !isError) {
         this.segments.splice(segIdx, 1);
@@ -804,8 +790,11 @@ export class StreamAccumulator {
     const parts = this.segments
       .map(s => {
         if (s.type === 'thinking' && (s.splitOff || s.pendingSplit)) return ''; // already rendered / will be split into its own bubble
-        // Hide pending tool segments until 500ms has elapsed — fast tools go directly to resolved state
-        if (s.type === 'tool' && s.status === 'pending' && this.toolHideTimers.has(s.id)) return '';
+        // Pending tools without an extracted input preview render as nothing — the card
+        // appears only once we have something useful to show (preview from input_json_delta
+        // or status transition from tool_result). Replaces the old 500ms timer with a
+        // proper event-driven gate.
+        if (s.type === 'tool' && s.status === 'pending' && !s.inputPreview) return '';
         return s.content;
       })
       .filter(c => c.length > 0);
@@ -1105,8 +1094,6 @@ export class StreamAccumulator {
     this.turnUsage = null;
     this._lastMsgStartCtx = null;
     this.clearFlushTimer();
-    for (const t of this.toolHideTimers.values()) clearTimeout(t);
-    this.toolHideTimers.clear();
   }
 
   /**
@@ -1171,8 +1158,6 @@ export class StreamAccumulator {
     this.firstTextTime = 0;
     this.firstSendReady = false;
 
-    for (const t of this.toolHideTimers.values()) clearTimeout(t);
-    this.toolHideTimers.clear();
   }
 
   private clearFlushTimer(): void {
