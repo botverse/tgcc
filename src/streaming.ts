@@ -1114,7 +1114,21 @@ export class StreamAccumulator {
    * Call this before reset() when interrupting a mid-turn stream so the last block isn't lost.
    */
   async flushIfDirty(): Promise<void> {
-    if (!this.dirty || this.sealed) return;
+    if (this.sealed) return;
+    // Finalize any in-flight thinking blocks first — this must happen even when !this.dirty
+    // because the eager-send for thinking placeholder clears dirty, and a steer right after
+    // would otherwise early-return before the placeholder transitions to "Thought for X.Xs".
+    let finalizedThinking = false;
+    for (const s of this.segments) {
+      if (s.type === 'thinking' && !s.rawText && !s.finalizedEmpty) {
+        s.finalizedEmpty = true;
+        s.durationMs = s.startTime ? Date.now() - s.startTime : undefined;
+        s.content = renderSegment(s);
+        finalizedThinking = true;
+      }
+    }
+    if (finalizedThinking) this.dirty = true;
+    if (!this.dirty) return;
     this.clearFlushTimer();
     this.firstSendReady = true; // bypass first-send gate
     this.dirty = false;
@@ -1123,8 +1137,7 @@ export class StreamAccumulator {
       if (s.type === 'tool' && s.status === 'pending') return false;
       return true;
     });
-    // Finalize any in-flight thinking blocks so a steer mid-thinking transitions the
-    // placeholder "💭" to "💭 Thought for X.Xs" rather than leaving it as a live indicator.
+    // (Thinking finalization moved above the dirty/sealed gate so it runs on steer-after-eager-send.)
     for (const s of this.segments) {
       if (s.type === 'thinking' && !s.rawText && !s.finalizedEmpty) {
         s.finalizedEmpty = true;
