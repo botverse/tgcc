@@ -152,7 +152,7 @@ function renderThinkingBubbles(rawText: string): string[] {
 // ── Segment types (internal) ──
 
 type InternalSegment =
-  | { type: 'thinking'; content: string; rawText: string; splitOff?: boolean; pendingSplit?: boolean; finalizedEmpty?: boolean }
+  | { type: 'thinking'; content: string; rawText: string; splitOff?: boolean; pendingSplit?: boolean; finalizedEmpty?: boolean; startTime?: number; durationMs?: number }
   | { type: 'text'; content: string; rawText: string }
   | { type: 'tool'; id: string; content: string; toolName: string; status: 'pending' | 'resolved' | 'error'; inputPreview?: string; elapsed?: string; resultStat?: string; startTime: number }
   | { type: 'subagent'; id: string; content: string; toolName: string; label: string; status: 'running' | 'dispatched' | 'completed'; inputPreview?: string; startTime: number; progressLines: string[] }
@@ -179,9 +179,14 @@ function renderSegment(seg: InternalSegment): string {
     case 'thinking':
     {
       if (!seg.rawText) {
-        return seg.finalizedEmpty
-          ? '<blockquote>💭 Thought silently</blockquote>'
-          : '<blockquote expandable>💭 Processing…</blockquote>';
+        if (seg.finalizedEmpty) {
+          const dur = seg.durationMs;
+          const durStr = dur != null
+            ? (dur >= 1000 ? `${(dur / 1000).toFixed(1)}s` : `${dur}ms`)
+            : null;
+          return `<blockquote>💭 Thought${durStr ? ` for ${durStr}` : ''}</blockquote>`;
+        }
+        return '<blockquote expandable>💭 Processing…</blockquote>';
       }
       const html = markdownToTelegramHtml(seg.rawText);
       // Telegram can't nest <pre> inside <blockquote expandable> — collapse code blocks to inline <code>.
@@ -408,7 +413,7 @@ export class StreamAccumulator {
     this.currentBlockType = blockType as typeof this.currentBlockType;
 
     if (blockType === 'thinking') {
-      const seg: InternalSegment = { type: 'thinking', rawText: '', content: '', pendingSplit: this.segments.length > 0 };
+      const seg: InternalSegment = { type: 'thinking', rawText: '', content: '', pendingSplit: this.segments.length > 0, startTime: Date.now() };
       seg.content = renderSegment(seg);
       this.segments.push(seg);
       this.currentSegment = seg;
@@ -573,11 +578,11 @@ export class StreamAccumulator {
     } else if (blockType === 'image' && this.imageBase64Buffer) {
       await this.sendImage();
     } else if (blockType === 'thinking' && seg?.type === 'thinking' && seg.rawText.length === 0) {
-      // Signature-only thinking (e.g. opus 4.7 hides the reasoning text). Mark as finalized
-      // so the segment renders a static "💭 Thought silently" instead of lingering as
-      // "💭 Processing…" forever. Keeps the user aware that the model thought, without
-      // implying more is coming.
+      // Signature-only thinking (opus 4.7 hides the reasoning text). The text isn't available,
+      // but we know how long the model reasoned — render a duration marker instead of an empty
+      // "Thought silently" placeholder.
       seg.finalizedEmpty = true;
+      seg.durationMs = seg.startTime ? Date.now() - seg.startTime : undefined;
       seg.content = renderSegment(seg);
       this.requestRender();
     } else if (blockType === 'thinking' && seg?.type === 'thinking' && seg.rawText.length > 0) {
