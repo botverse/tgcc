@@ -318,18 +318,28 @@ export function validateConfig(raw: unknown): TgccConfig {
     throw new Error('Config must have at least one agent');
   }
 
-  // Supervisor: explicit string, null to disable, or default to first agent
+  // Supervisor resolution. Refuses silent fallback — must be explicit, with one
+  // permitted exception: if there is exactly one agent it is unambiguously the supervisor.
   let supervisor: string | null;
+  const agentIds = Object.keys(agents);
   if (obj.supervisor === null) {
+    // Explicit opt-out: no native supervisor (legitimate for fully-flat deployments).
     supervisor = null;
   } else if (typeof obj.supervisor === 'string') {
     if (!agents[obj.supervisor]) {
       throw new Error(`Supervisor agent "${obj.supervisor}" not found in agents`);
     }
     supervisor = obj.supervisor;
+  } else if (agentIds.length === 1) {
+    // Single-agent config: unambiguous, no need to declare.
+    supervisor = agentIds[0];
   } else {
-    // Default to first agent
-    supervisor = Object.keys(agents)[0] ?? null;
+    throw new Error(
+      `Multiple agents configured but no top-level "supervisor" field. ` +
+      `Add \`"supervisor": "<agentId>"\` to ~/.tgcc/config.json (sibling of "agents") ` +
+      `pointing at the agent that owns supervision. Available agentIds: ${agentIds.join(', ')}. ` +
+      `Set \`"supervisor": null\` if you genuinely want no native supervisor.`,
+    );
   }
 
   // Cron jobs (optional, top-level)

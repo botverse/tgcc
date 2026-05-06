@@ -263,7 +263,7 @@ async function main(): Promise<void> {
 
   server.tool(
     'tgcc_agents',
-    'List all registered agents (id, repo, model, state, ephemeral, isSupervisor). The supervisor is sorted first; check `isSupervisor: true` on each entry. To address the supervisor specifically, prefer `notify_supervisor` over `tgcc_send` — it resolves the target automatically and avoids agentId mistakes. Call this first when you need to send to a worker (non-supervisor) agent.',
+    'List all registered agents (id, repo, model, state, ephemeral, isSupervisor). Exactly one entry has `isSupervisor: true` (the configured supervisor) and is sorted first. To address the supervisor, ALWAYS use `notify_supervisor` — it routes by configured id and bypasses the picker. Use this list only to discover WORKER agentIds for `tgcc_send` / `tgcc_spawn`.',
     {},
     async () => {
       const request: McpToolRequest = {

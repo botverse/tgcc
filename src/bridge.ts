@@ -331,7 +331,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
       (req) => this.handleMcpToolRequest(req),
       this.logger,
     );
-    this.ctlServer = new CtlServer(this, this.logger, config.supervisor ?? Object.keys(config.agents)[0] ?? null);
+    this.ctlServer = new CtlServer(this, this.logger, config.supervisor);
     this.scheduler = new Scheduler(this.logger);
 
     // Route deduped events to supervisor queue and TG chat (used as flush target by EventDedup for batched events like git_commit)
