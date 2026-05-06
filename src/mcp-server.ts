@@ -367,11 +367,13 @@ Call tgcc_agents first to discover available agents and repos.`,
       timeoutMs: z.number().optional().describe('Auto-destroy after this many milliseconds (default 120s for waitForResult)'),
       permissionMode: z.string().optional().describe('Permission mode: dangerously-skip, acceptEdits, default, plan'),
       waitForResult: z.boolean().optional().describe('Block until agent completes and return its text output. Auto-destroys after. Default timeout 120s.'),
+      allowedTools: z.array(z.string()).optional().describe('Restrict the child to ONLY these tools (CC --allowed-tools). Names are tool ids like "Read", "Bash", or MCP-prefixed "mcp__server__tool". Useful for L1 scorers in fanout — block write tools and further recursion.'),
+      disallowedTools: z.array(z.string()).optional().describe('Block these specific tools in the child (CC --disallowed-tools). Use to prevent recursion ("tgcc_spawn"), block write side-effects, or mask user-scope MCP tools the child shouldn\'t see.'),
     },
-    async ({ agentId, repo, model, message, timeoutMs, permissionMode, waitForResult }) => {
+    async ({ agentId, repo, model, message, timeoutMs, permissionMode, waitForResult, allowedTools, disallowedTools }) => {
       const request: McpToolRequest = {
         id: uuidv4(), tool: 'tgcc_spawn', agentId: AGENT_ID, userId: USER_ID,
-        params: { agentId, repo, model, message, timeoutMs, permissionMode, waitForResult },
+        params: { agentId, repo, model, message, timeoutMs, permissionMode, waitForResult, allowedTools, disallowedTools },
       };
       const socketTimeout = waitForResult ? ((timeoutMs || 120_000) + 15_000) : 15_000;
       try {

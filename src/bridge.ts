@@ -3684,6 +3684,22 @@ ${hbContent}`;
             else if (reqPerm === 'acceptEdits') permMode = 'acceptEdits';
             else if (reqPerm === 'plan') permMode = 'plan';
 
+            // Compose --allowed-tools / --disallowed-tools from spawn params. These pass
+            // through the existing ccExtraArgs plumbing into cc-process.ts buildArgs, so
+            // the child CC's tool surface is restricted at the CC permission layer (not
+            // just by prompt instruction). Critical for L1 scorers handling adversarial
+            // user-message corpus where prompt obedience isn't a safe restriction.
+            const allowedTools = Array.isArray(request.params.allowedTools) ? request.params.allowedTools as string[] : undefined;
+            const disallowedTools = Array.isArray(request.params.disallowedTools) ? request.params.disallowedTools as string[] : undefined;
+            const extraArgsParts: string[] = [];
+            if (allowedTools && allowedTools.length > 0) {
+              extraArgsParts.push('--allowed-tools', allowedTools.join(','));
+            }
+            if (disallowedTools && disallowedTools.length > 0) {
+              extraArgsParts.push('--disallowed-tools', disallowedTools.join(','));
+            }
+            const ccExtraArgs = extraArgsParts.length > 0 ? extraArgsParts.join(' ') : undefined;
+
             const ephemeralConfig: AgentConfig = {
               botToken: '',
               allowedUsers: [],
@@ -3693,6 +3709,7 @@ ${hbContent}`;
                 idleTimeoutMs: 300_000,
                 hangTimeoutMs: 300_000,
                 permissionMode: permMode,
+                ...(ccExtraArgs ? { ccExtraArgs } : {}),
               },
             };
 
