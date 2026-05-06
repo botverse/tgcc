@@ -3505,6 +3505,9 @@ ${hbContent}`;
                 isSupervisor: aid === this.nativeSupervisorId,
               });
             }
+            // Supervisor first so callers scanning the list top-down see the right
+            // target for escalation before reaching for tgcc_send with a guessed agentId.
+            agents.sort((a, b) => Number(b.isSupervisor) - Number(a.isSupervisor));
             return { id: request.id, success: true, result: agents };
           }
 

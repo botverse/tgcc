@@ -162,7 +162,7 @@ async function main(): Promise<void> {
 
   server.tool(
     'notify_supervisor',
-    'Send a message to the supervisor that manages this agent. Use for asking questions, reporting blockers, or progress updates.',
+    'Send a message to the supervisor that manages this agent. Bidirectional: the supervisor receives your message, can reply, and you are automatically woken when their turn completes — same wake-on-complete mechanism as tgcc_send. PREFER THIS over tgcc_send when addressing the supervisor: it resolves the supervisor\'s agentId automatically (tgcc_send requires you to know it). Use for asking questions, reporting blockers, escalations, or progress updates.',
     {
       message: z.string().describe('Message to send to the supervisor'),
       priority: z.enum(['info', 'question', 'blocker']).default('info').describe('Message priority'),
@@ -263,7 +263,7 @@ async function main(): Promise<void> {
 
   server.tool(
     'tgcc_agents',
-    'List all registered agents with IDs, repos, models, and current state. Call this first to discover available agents before using tgcc_send or tgcc_spawn.',
+    'List all registered agents (id, repo, model, state, ephemeral, isSupervisor). The supervisor is sorted first; check `isSupervisor: true` on each entry. To address the supervisor specifically, prefer `notify_supervisor` over `tgcc_send` — it resolves the target automatically and avoids agentId mistakes. Call this first when you need to send to a worker (non-supervisor) agent.',
     {},
     async () => {
       const request: McpToolRequest = {
@@ -303,7 +303,7 @@ async function main(): Promise<void> {
 
   server.tool(
     'tgcc_send',
-    'Send a message to an agent. Spawns CC if not running. The calling agent is automatically woken when the target\'s turn completes, with the sent message and reply included in the wake context. Use tgcc_agents to discover available agents.',
+    'Send a message to a specific WORKER agent by id. Spawns CC if not running. The calling agent is automatically woken when the target\'s turn completes, with the sent message and reply included in the wake context. To address the SUPERVISOR, use `notify_supervisor` instead — it has the same wake-on-complete reply mechanism and resolves the supervisor\'s id automatically (avoids picking the wrong agent). Use `tgcc_agents` to discover worker agentIds.',
     {
       agentId: z.string().describe('Target worker agent ID'),
       text: z.string().describe('Message or task to send'),
