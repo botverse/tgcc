@@ -2641,7 +2641,7 @@ ${hbContent}`;
 
       case 'ralph': {
         const prompt = cmd.args?.trim() || 'Ensure the worker completes its current task successfully. Infer the goal from the session history and event log below.';
-        const { ralphId, error: ralphError } = this.spawnRalph({
+        const { ralphId, error: ralphError } = await this.spawnRalph({
           targetAgentId: agentId,
           prompt,
           invokerAgentId: agentId,
@@ -3006,6 +3006,12 @@ ${hbContent}`;
           await agent.tgBot.answerCallbackQuery(query.callbackQueryId, 'Permission expired');
           break;
         }
+        // AskUserQuestion needs answers in updatedInput; a bare allow makes CC
+        // fall back to original input (no answers) and emit empty answersText.
+        if (pending.toolName === 'AskUserQuestion') {
+          await agent.tgBot.answerCallbackQuery(query.callbackQueryId, 'Pick options above');
+          break;
+        }
         if (agent.ccProcess) {
           agent.ccProcess.respondToPermission(requestId, true);
         }
@@ -3030,9 +3036,11 @@ ${hbContent}`;
       }
 
       case 'perm_allow_all': {
-        // Allow all pending permissions for this agent
+        // Allow all pending permissions for this agent. Skip AskUserQuestion —
+        // bare allow drops the user's answers and CC emits empty answersText.
         const toAllow: string[] = [];
-        for (const [reqId] of agent.pendingPermissions) {
+        for (const [reqId, pending] of agent.pendingPermissions) {
+          if (pending.toolName === 'AskUserQuestion') continue;
           toAllow.push(reqId);
         }
         for (const reqId of toAllow) {
@@ -3825,7 +3833,7 @@ ${hbContent}`;
             const invokerAgent = this.agents.get(request.agentId);
             const invokerChatId = invokerAgent ? (this.getAgentChatId(invokerAgent) ?? 0) : 0;
 
-            const { ralphId, error } = this.spawnRalph({
+            const { ralphId, error } = await this.spawnRalph({
               targetAgentId: targetId,
               prompt,
               spec,
@@ -4407,6 +4415,12 @@ ${hbContent}`;
         const pending = agent.pendingPermissions.get(permissionRequestId);
         if (!pending) throw new Error(`No pending permission with id: ${permissionRequestId}`);
 
+        // AskUserQuestion needs answers in updatedInput; route bare allow/deny
+        // back through ask_submit/ask_other in TG so the user picks options.
+        if (pending.toolName === 'AskUserQuestion') {
+          throw new Error('AskUserQuestion must be answered via TG question card, not bare permission_response');
+        }
+
         const allow = decision === 'allow';
         if (agent.ccProcess) {
           agent.ccProcess.respondToPermission(permissionRequestId, allow);
@@ -4649,7 +4663,7 @@ ${hbContent}`;
       }
 
       // Re-spawn ralph with the original prompt (will get fresh session history)
-      const { ralphId, error } = this.spawnRalph({
+      const { ralphId, error } = await this.spawnRalph({
         targetAgentId: pr.meta.targetAgentId,
         prompt: pr.prompt,
         spec: pr.spec,
@@ -4695,7 +4709,7 @@ ${hbContent}`;
     }
   }
 
-  private spawnRalph(opts: {
+  private async spawnRalph(opts: {
     targetAgentId: string;
     prompt: string;
     spec?: string;
@@ -4705,7 +4719,7 @@ ${hbContent}`;
     minTurns?: number;
     ralphIdOverride?: string;
     restored?: boolean;
-  }): { ralphId: string; error?: string } {
+  }): Promise<{ ralphId: string; error?: string }> {
     const { targetAgentId, prompt, invokerAgentId, invokerChatId } = opts;
     const targetAgent = this.agents.get(targetAgentId);
     if (!targetAgent) return { ralphId: '', error: `Unknown agent: ${targetAgentId}` };
@@ -4730,7 +4744,7 @@ ${hbContent}`;
     let sessionHistory = '';
     if (status.sessionId) {
       const jsonlPath = getSessionJsonlPath(status.sessionId, targetAgent.repo, targetAgent.claudeConfigDir);
-      sessionHistory = extractRecentConversation(jsonlPath, 16, 10000);
+      sessionHistory = await extractRecentConversation(jsonlPath, 16, 10000);
     }
 
     const systemPrompt = buildRalphPrompt({ targetAgentId, prompt, spec: opts.spec, status, recentLog: logText, sessionHistory, restored: opts.restored, minTurns: opts.minTurns });

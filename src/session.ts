@@ -2,6 +2,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSy
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { createHash } from 'node:crypto';
+import { spawn } from 'node:child_process';
 import type pino from 'pino';
 
 // ── Types ──
@@ -642,7 +643,7 @@ interface ConversationMessage {
  * Extract the most recent user/assistant messages from a session JSONL file.
  * Returns a formatted conversation transcript for ralph context injection.
  */
-export function extractRecentConversation(jsonlPath: string, maxMessages = 8, maxChars = 6000): string {
+export async function extractRecentConversation(jsonlPath: string, maxMessages = 8, maxChars = 6000): Promise<string> {
   if (!existsSync(jsonlPath)) return '(no session history available)';
 
   try {
@@ -687,20 +688,102 @@ export function extractRecentConversation(jsonlPath: string, maxMessages = 8, ma
     // Take last N messages
     const recent = messages.slice(-maxMessages);
 
-    // Format with truncation
+    // Format: summarize long messages with Haiku, verbatim for short ones.
+    // Run summaries in parallel for speed.
+    const prepared = await Promise.all(
+      recent.map(async msg => ({ role: msg.role, text: await compactMessage(msg.text) })),
+    );
+
     let totalChars = 0;
     const formatted: string[] = [];
-    for (const msg of recent) {
-      const truncated = msg.text.length > 1000 ? msg.text.slice(0, 1000) + '…' : msg.text;
-      totalChars += truncated.length;
+    for (const msg of prepared) {
+      totalChars += msg.text.length;
       if (totalChars > maxChars) break;
-      formatted.push(`[${msg.role}]: ${truncated}`);
+      formatted.push(`[${msg.role}]: ${msg.text}`);
     }
 
     return formatted.join('\n\n');
   } catch {
     return '(failed to read session history)';
   }
+}
+
+/**
+ * Compact a message proportional to its length. Short messages pass through
+ * verbatim; longer ones go to a cheap Haiku summary call. Cached on disk by
+ * sha1 of the input so repeat ralph wakes don't re-bill or re-block.
+ *
+ * Tiers:
+ *   < 1000     → verbatim
+ *   1k–5k      → ~400 char summary
+ *   5k–20k     → ~800 char summary
+ *   > 20k      → ~1200 char summary
+ *
+ * Falls back to surrogate-safe slice if the summary call fails or times out.
+ */
+async function compactMessage(text: string): Promise<string> {
+  const len = text.length;
+  if (len <= 1000) return text;
+
+  const target = len < 5000 ? 400 : len < 20000 ? 800 : 1200;
+
+  const cacheKey = createHash('sha1').update(`${target}\n${text}`).digest('hex');
+  const cacheDir = join(homedir(), '.tgcc', 'summary-cache');
+  const cachePath = join(cacheDir, `${cacheKey}.txt`);
+  if (existsSync(cachePath)) {
+    try { return readFileSync(cachePath, 'utf-8'); } catch { /* fall through */ }
+  }
+
+  try {
+    const summary = await haikuSummarize(text, target);
+    if (summary && summary.length > 0) {
+      try {
+        mkdirSync(cacheDir, { recursive: true });
+        writeFileSync(cachePath, summary);
+      } catch { /* cache write failure is non-fatal */ }
+      return summary;
+    }
+  } catch { /* fall through to safeSlice */ }
+
+  return safeSlice(text, target) + '…';
+}
+
+/** Spawn `claude --print --model haiku` to summarize text. 30s timeout. */
+function haikuSummarize(text: string, targetChars: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const prompt = `Summarize the message below in ~${targetChars} characters. Preserve concrete claims, decisions, file paths, command names, and numbers. Drop pleasantries and repetition. Output the summary only — no preamble, no quotes.\n\n---\n${text}\n---`;
+
+    const child = spawn('claude', ['--print', '--model', 'claude-haiku-4-5-20251001', '--output-format', 'text'], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    let stdout = '';
+    let stderr = '';
+    const timer = setTimeout(() => {
+      child.kill('SIGTERM');
+      reject(new Error('haikuSummarize timeout'));
+    }, 30_000);
+
+    child.stdout.on('data', (d: Buffer) => { stdout += d.toString('utf-8'); });
+    child.stderr.on('data', (d: Buffer) => { stderr += d.toString('utf-8'); });
+    child.on('error', err => { clearTimeout(timer); reject(err); });
+    child.on('exit', code => {
+      clearTimeout(timer);
+      if (code === 0) resolve(stdout.trim());
+      else reject(new Error(`claude --print exited ${code}: ${stderr.slice(0, 200)}`));
+    });
+
+    child.stdin.write(prompt);
+    child.stdin.end();
+  });
+}
+
+/** Slice that won't split a UTF-16 surrogate pair (would produce invalid JSON). */
+function safeSlice(s: string, n: number): string {
+  if (s.length <= n) return s;
+  const code = s.charCodeAt(n - 1);
+  const end = code >= 0xD800 && code <= 0xDBFF ? n - 1 : n;
+  return s.slice(0, end);
 }
 
 function extractTextFromContent(content: unknown): string {

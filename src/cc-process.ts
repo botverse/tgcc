@@ -695,7 +695,7 @@ export class CCProcess extends EventEmitter implements ICCProcess {
     const resp = createPermissionResponse(requestId, allowed, updatedInput);
     const line = JSON.stringify(resp) + '\n';
     this.process.stdin.write(line);
-    this.logger.info({ requestId, allowed }, 'Sent permission response');
+    this.logger.info({ requestId, allowed, hasUpdatedInput: updatedInput !== undefined }, 'Sent permission response');
   }
 
   /** Send SIGINT to cancel current turn without killing process */
