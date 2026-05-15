@@ -309,13 +309,12 @@ async function main(): Promise<void> {
       text: z.string().describe('Message or task to send'),
       newSession: z.boolean().optional().describe('Clear session before sending'),
       followUp: z.boolean().optional().describe('Only send if CC is already active (no spawn)'),
-      waitForIdle: z.boolean().optional().describe('Queue message and deliver after the agent finishes its current turn. If already idle, sends immediately.'),
       sessionId: z.string().optional().describe('Session ID to target'),
     },
-    async ({ agentId, text, newSession, followUp, waitForIdle, sessionId }) => {
+    async ({ agentId, text, newSession, followUp, sessionId }) => {
       const request: McpToolRequest = {
         id: uuidv4(), tool: 'tgcc_send', agentId: AGENT_ID, userId: USER_ID,
-        params: { agentId, text, newSession, followUp, waitForIdle, sessionId },
+        params: { agentId, text, newSession, followUp, sessionId },
       };
       try {
         const response = await client.sendRequest(request, 10000);

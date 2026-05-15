@@ -160,6 +160,7 @@ export class TelegramBot {
     const key = `${userId}:${chatId}`;
     if (this.rejectedKeys.has(key)) return; // silently ignore subsequent messages
     this.rejectedKeys.add(key);
+    this.logger.info({ userId, chatId, username: ctx.from?.username, firstName: ctx.from?.first_name }, 'Rejected unauthorized user');
     try {
       await ctx.reply("You're not authorized to use this bot. Contact the admin for access.", {
         reply_parameters: ctx.message ? { message_id: ctx.message.message_id } : undefined,

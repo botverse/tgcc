@@ -119,7 +119,6 @@ interface AgentInstance {
   destroyTimer: ReturnType<typeof setTimeout> | null; // auto-destroy for ephemeral
   eventBuffer: EventBuffer;               // ring buffer for observability
   awaitingAskCleanup: boolean;            // true when AskUserQuestion was detected this turn → delete fallback bubble on result
-  deferredSends: Array<{ text: string; fromAgentId: string }>; // queued by waitForIdle sends
   muteOutput: boolean; // suppress TG rendering for wake-triggered supervisor turns
   authFlowInProgress: boolean; // prevents re-entrant auth fallback
   lastSendData: { text: string; source?: { chatId?: number; spawnSource?: 'telegram' | 'supervisor' | 'cli' } } | null; // for retry after auth
@@ -477,17 +476,6 @@ export class Bridge extends EventEmitter implements CtlHandler {
     }
   }
 
-  /** Drain the deferred-send queue for an agent (fires on turn complete or process exit). */
-  private drainDeferredSends(agentId: string): void {
-    const agent = this.agents.get(agentId);
-    if (!agent || agent.deferredSends.length === 0) return;
-    const queued = agent.deferredSends.splice(0);
-    for (const { text, fromAgentId } of queued) {
-      this.logger.info({ agentId, fromAgentId }, 'Delivering deferred send');
-      this.sendSupervisorMessage(agentId, text, fromAgentId);
-    }
-  }
-
   // ── Cron isolated spawn ──
 
   private spawnCronIsolated(job: CronJobConfig): void {
@@ -705,7 +693,6 @@ export class Bridge extends EventEmitter implements CtlHandler {
       destroyTimer: null,
       eventBuffer: new EventBuffer(),
       awaitingAskCleanup: false,
-      deferredSends: [],
       muteOutput: false,
       authFlowInProgress: false,
       lastSendData: null,
@@ -1771,7 +1758,7 @@ ${hbContent}`;
       this.stopTypingIndicator(agent);
       // Auto-destroy ephemeral agents when their CC session ends naturally
       // Skip ralph/watcher agents — they stay alive waiting for events and have their own timeout
-      if (agent.ephemeral && agent.deferredSends.length === 0 && !this.ralphManager.isRalph(agentId)) {
+      if (agent.ephemeral && !this.ralphManager.isRalph(agentId)) {
         this.logger.info({ agentId }, 'Ephemeral agent session idle — auto-destroying');
         this.destroyEphemeralAgent(agentId);
       }
@@ -1870,11 +1857,9 @@ ${hbContent}`;
       agent.ccProcess = null;
       // Process exited — next message should start a fresh session
       agent.forceNewSession = true;
-      // Process exited — deliver any deferred messages (will spawn a new process)
-      this.drainDeferredSends(agentId);
-      // Auto-destroy ephemeral agents on process exit (if no deferred sends spawned a new process)
+      // Auto-destroy ephemeral agents on process exit
       // Skip ralph/watcher agents — they stay alive waiting for events and have their own timeout
-      if (agent.ephemeral && agent.deferredSends.length === 0 && !agent.ccProcess && !this.ralphManager.isRalph(agentId)) {
+      if (agent.ephemeral && !this.ralphManager.isRalph(agentId)) {
         this.logger.info({ agentId }, 'Ephemeral agent process exited — auto-destroying');
         this.destroyEphemeralAgent(agentId);
       }
@@ -2104,9 +2089,6 @@ ${hbContent}`;
     // Route turn-complete to native supervisor (routine — errors escalate via result error path)
     const cost = event.total_cost_usd ? ` · $${event.total_cost_usd.toFixed(4)}` : '';
     this.pushSupervisorEvent(agentId, `${event.is_error ? '❌' : '✅'} Turn complete${cost}`, false, false, 'routine');
-
-    // Deliver any waitForIdle-deferred messages now that the turn is done
-    this.drainDeferredSends(agentId);
 
     // Route to EventRouter → watchers (ralph) + future consumers
     this.eventRouter.routeLifecycle({
@@ -3556,11 +3538,6 @@ ${hbContent}`;
             if (request.params.followUp && (!targetAgent.ccProcess || targetAgent.ccProcess.state === 'idle')) {
               return { id: request.id, success: false, error: `Agent ${targetId} is not active (followUp=true)` };
             }
-            // waitForIdle: queue if agent is mid-turn, deliver on next turn complete
-            if (request.params.waitForIdle && targetAgent.ccProcess) {
-              targetAgent.deferredSends.push({ text, fromAgentId: request.agentId });
-              return { id: request.id, success: true, result: { agentId: targetId, state: 'deferred' } };
-            }
             this.sendSupervisorMessage(targetId, text, request.agentId);
             return { id: request.id, success: true, result: { agentId: targetId, state: targetAgent.ccProcess?.state ?? 'spawning' } };
           }
@@ -3744,7 +3721,6 @@ ${hbContent}`;
               destroyTimer: null,
               eventBuffer: new EventBuffer(),
               awaitingAskCleanup: false,
-              deferredSends: [],
               muteOutput: false,
               authFlowInProgress: false,
               lastSendData: null,
@@ -4227,7 +4203,6 @@ ${hbContent}`;
           destroyTimer: null,
           eventBuffer: new EventBuffer(),
           awaitingAskCleanup: false,
-          deferredSends: [],
           muteOutput: false,
       authFlowInProgress: false,
       lastSendData: null,
@@ -4785,7 +4760,6 @@ ${hbContent}`;
       destroyTimer: null,
       eventBuffer: new EventBuffer(),
       awaitingAskCleanup: false,
-      deferredSends: [],
       muteOutput: false,
       authFlowInProgress: false,
       lastSendData: null,

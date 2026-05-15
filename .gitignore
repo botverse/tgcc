@@ -4,3 +4,4 @@ dist/
 .env
 .local/
 /tmp/
+.playwright-mcp/
