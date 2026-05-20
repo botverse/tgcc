@@ -139,19 +139,10 @@ interface AgentInstance {
   repo: string;                            // resolved repo path (from config or /repo command)
   model: string;                           // resolved model (from config or /model command)
   chatSessions: Map<number, ChatSession>;  // chatId → per-chat CC process + session state
-  ccProcess: ICCProcess | null; // single CC process per agent
-  accumulator: StreamAccumulator | null;   // single accumulator per agent
-  subAgentTracker: SubAgentTracker | null; // single tracker per agent
-  batcher: MessageBatcher | null;          // single batcher per agent
   pendingPermissions: Map<string, PendingPermission>; // requestId → pending permission
   pendingExecApprovals: Map<string, PendingExecApproval>; // id → pending supervisor_exec approval
-  typingInterval: ReturnType<typeof setInterval> | null; // single typing interval
-  typingChatId: number | null;             // chat currently showing typing indicator
   lastTgChatId: number | null;             // most recent TG chat that sent a message (for batcher closure)
   lastTgUserId: number | null;             // most recent TG user that sent a message (for group exec permissions)
-  pendingSessionId: string | null;         // for /resume: sessionId to use on next spawn
-  forceNewSession: boolean;               // /new was used — don't auto-continue on next spawn
-  pendingIdeAwareness: boolean;           // true when resuming a session that was active in an IDE
   destroyTimer: ReturnType<typeof setTimeout> | null; // auto-destroy for ephemeral
   eventBuffer: EventBuffer;               // ring buffer for observability
   awaitingAskCleanup: boolean;            // true when AskUserQuestion was detected this turn → delete fallback bubble on result
@@ -160,7 +151,6 @@ interface AgentInstance {
   lastSendData: { text: string; source?: { chatId?: number; spawnSource?: 'telegram' | 'supervisor' | 'cli' } } | null; // for retry after auth
   claudeConfigDir: string | undefined; // isolated CLAUDE_CONFIG_DIR for docker agents
   pendingCliTmuxAgent: string | null; // waiting for tmux session name reply from /new-cli
-  cliSessionId: string | null; // active CC sessionId inside an attached CLI session (reported via cli_event 'session')
 }
 
 /** Look up a chat's session state, or undefined if that chat has never messaged. */
@@ -400,7 +390,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
     this.highSignalDetector = new HighSignalDetector({
       emitSupervisorEvent: (event) => {
         // External supervisor (OpenClaw plugin) — always forward unfiltered
-        if (this.isSupervisorSubscribed(event.agentId, this.agents.get(event.agentId)?.ccProcess?.sessionId ?? null)) {
+        if (this.isSupervisorSubscribed(event.agentId, this.agentPrimarySessionId(event.agentId))) {
           this.sendToSupervisor(event);
         }
         // Native supervisor queue — tier 1+2 events, filtered through dedup layer
@@ -432,14 +422,14 @@ export class Bridge extends EventEmitter implements CtlHandler {
         },
         getSupervisorState: () => {
           const a = this.agents.get(this.nativeSupervisorId!);
-          return a?.ccProcess?.state;
+          return a ? this.getPrimaryChatSession(a)?.ccProcess?.state : undefined;
         },
         sendTgBlockquote: async (line) => {
           const supAgent = this.agents.get(this.nativeSupervisorId!);
           if (!supAgent?.tgBot) return;
           const chatId = this.getAgentChatId(supAgent);
           if (!chatId) return;
-          const acc = supAgent.accumulator;
+          const acc = this.getPrimaryChatSession(supAgent)?.accumulator;
           if (acc?.hasActiveBubble) { await acc.flushIfDirty(); acc.reset(); }
           await supAgent.tgBot.sendText(chatId, `<blockquote>${escapeHtml(line)}</blockquote>`, 'HTML', true);
         },
@@ -447,7 +437,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
           const a = this.agents.get(agentId);
           const agentState = this.sessionStore.getAgent(agentId);
           return {
-            state: a?.ccProcess?.state ?? 'idle',
+            state: (a ? this.getPrimaryChatSession(a)?.ccProcess?.state : undefined) ?? 'idle',
             cost: this.highSignalDetector.getSessionCost(agentId),
             contextPct: this.highSignalDetector.getContextPercent(agentId),
             lastActivity: agentState.lastActivity ?? null,
@@ -465,7 +455,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
         if (!agent?.tgBot) return;
         const chatId = this.getAgentChatId(agent);
         if (!chatId) return;
-        const acc = agent.accumulator;
+        const acc = this.getPrimaryChatSession(agent)?.accumulator;
         if (acc?.hasActiveBubble) { await acc.flushIfDirty(); acc.reset(); }
         await agent.tgBot.sendText(chatId, `<blockquote>${escapeHtml(text)}</blockquote>`, 'HTML', true);
       },
@@ -507,8 +497,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
   }
 
   /** Format ` · {sid8}` or ` · {sid8} "{title}"` for blockquote suffixes. Empty if no session. */
-  private formatSessionTag(agent: AgentInstance): string {
-    const sid = agent.ccProcess?.sessionId;
+  private formatSessionTag(agent: AgentInstance, sid: string | null | undefined): string {
     if (!sid) return '';
     const short = sid.slice(0, 8);
     let title = this.sessionTitleCache.get(sid);
@@ -702,9 +691,16 @@ export class Bridge extends EventEmitter implements CtlHandler {
           continue;
         }
 
-        // Set up session resume for next interaction
-        agent.pendingSessionId = session.id;
-        agent.forceNewSession = false;
+        // Set up session resume for next interaction on the agent's primary chat.
+        // No originating chat at startup, so fall back to getAgentChatId.
+        const resumeChatId = this.getAgentChatId(agent);
+        if (resumeChatId == null) {
+          this.logger.info({ agentId, sessionId: session.id }, 'Auto-resume: no chat to attach session — skipping');
+          continue;
+        }
+        const cs = getOrCreateChatSession(agent, resumeChatId);
+        cs.pendingSessionId = session.id;
+        cs.forceNewSession = false;
 
         this.logger.info({ agentId, sessionId: session.id, endState: session.endState, ageMs }, 'Auto-resume: session prepared');
 
@@ -745,19 +741,10 @@ export class Bridge extends EventEmitter implements CtlHandler {
       repo: agentState.repo || configDefaults.repo,
       model: agentState.model || configDefaults.model,
       chatSessions: new Map(),
-      ccProcess: null,
-      accumulator: null,
-      subAgentTracker: null,
-      batcher: null,
       pendingPermissions: new Map(),
       pendingExecApprovals: new Map(),
-      typingInterval: null,
-      typingChatId: null,
       lastTgChatId: null,
       lastTgUserId: null,
-      pendingSessionId: null,
-      forceNewSession: false,
-      pendingIdeAwareness: false,
       destroyTimer: null,
       eventBuffer: new EventBuffer(),
       awaitingAskCleanup: false,
@@ -768,7 +755,6 @@ export class Bridge extends EventEmitter implements CtlHandler {
         ? join(homedir(), '.tgcc', 'agents', agentId, 'repos', computeProjectSlug(agentState.repo || configDefaults.repo), '.claude')
         : undefined,
       pendingCliTmuxAgent: null,
-      cliSessionId: null,
     };
 
     this.agents.set(agentId, instance);
@@ -779,7 +765,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
       this.scheduler.startHeartbeat(
         agentId,
         agentConfig.heartbeat,
-        () => this.agents.get(agentId)?.ccProcess?.state === 'idle' || !this.agents.get(agentId)?.ccProcess,
+        () => this.agentIsIdle(agentId),
         (aid) => {
           const a = this.agents.get(aid);
           if (!a) return;
@@ -855,7 +841,7 @@ ${hbContent}`;
         this.scheduler.startHeartbeat(
           agentId,
           newAgentConfig.heartbeat,
-          () => this.agents.get(agentId)?.ccProcess?.state === 'idle' || !this.agents.get(agentId)?.ccProcess,
+          () => this.agentIsIdle(agentId),
           (aid) => {
             const a = this.agents.get(aid);
             if (!a) return;
@@ -921,57 +907,57 @@ ${hbContent}`;
       agent.destroyTimer = null;
     }
 
-    // Kill CC process if active
-    if (agent.ccProcess) {
-      const proc = agent.ccProcess;
-      const exitPromise = new Promise<void>((resolve) => {
-        const onExit = () => {
-          proc.off('exit', onExit);
-          resolve();
-        };
-        proc.on('exit', onExit);
-        const timeoutId = setTimeout(() => {
-          proc.off('exit', onExit);
-          resolve();
-        }, 3000);
-        proc.on('exit', () => clearTimeout(timeoutId));
-      });
-      proc.destroy();
-      await exitPromise;
-
-      // Unsubscribe from registry
-      const clientRef: ClientRef = { agentId, userId: agentId, chatId: 0 };
-      this.processRegistry.unsubscribe(clientRef);
+    // Kill every chat's CC process and clean up its per-chat state
+    for (const cs of agent.chatSessions.values()) {
+      const proc = cs.ccProcess;
+      if (proc) {
+        const exitPromise = new Promise<void>((resolve) => {
+          const onExit = () => {
+            proc.off('exit', onExit);
+            resolve();
+          };
+          proc.on('exit', onExit);
+          const timeoutId = setTimeout(() => {
+            proc.off('exit', onExit);
+            resolve();
+          }, 3000);
+          proc.on('exit', () => clearTimeout(timeoutId));
+        });
+        proc.destroy();
+        await exitPromise;
+      }
+      // Cancel batcher
+      if (cs.batcher) {
+        cs.batcher.cancel();
+        cs.batcher.destroy();
+      }
+      // Clean up accumulator
+      if (cs.accumulator) {
+        cs.accumulator.finalize();
+        cs.accumulator = null;
+      }
+      // Clean up sub-agent tracker
+      if (cs.subAgentTracker) {
+        cs.subAgentTracker.reset();
+        cs.subAgentTracker = null;
+      }
+      // Clear typing indicator
+      if (cs.typingInterval) {
+        clearInterval(cs.typingInterval);
+        cs.typingInterval = null;
+      }
+      cs.ccProcess = null;
+      cs.batcher = null;
     }
+    agent.chatSessions.clear();
 
-    // Cancel batcher
-    if (agent.batcher) {
-      agent.batcher.cancel();
-      agent.batcher.destroy();
-    }
+    // Unsubscribe from registry
+    const clientRef: ClientRef = { agentId, userId: agentId, chatId: 0 };
+    this.processRegistry.unsubscribe(clientRef);
 
     // Close MCP socket
     const socketPath = join(this.config.global.socketDir, `${agentId}.sock`);
     this.mcpServer.close(socketPath);
-
-    // Clean up accumulator
-    if (agent.accumulator) {
-      agent.accumulator.finalize();
-      agent.accumulator = null;
-    }
-
-    // Clean up sub-agent tracker
-    if (agent.subAgentTracker) {
-      agent.subAgentTracker.reset();
-      agent.subAgentTracker = null;
-    }
-
-    // Clear typing indicator
-    if (agent.typingInterval) {
-      clearInterval(agent.typingInterval);
-      agent.typingInterval = null;
-    }
-    agent.typingChatId = null;
 
     agent.pendingPermissions.clear();
     for (const [id, pending] of agent.pendingExecApprovals) {
@@ -979,8 +965,6 @@ ${hbContent}`;
       pending.resolve(false);
     }
     agent.pendingExecApprovals.clear();
-    agent.ccProcess = null;
-    agent.batcher = null;
 
     // Close control socket
     const ctlSocketPath = join(this.config.global.ctlSocketDir, `${agentId}.sock`);
@@ -1006,7 +990,10 @@ ${hbContent}`;
           const answers = { ...(pending.questionAnswers ?? {}), [String(qi)]: [msg.text] };
           const allAnswered = questions.every((_, i) => answers[String(i)]?.length);
           if (allAnswered) {
-            if (agent.ccProcess) submitAskAnswer(pending, agent.ccProcess, questions, answers);
+            const askProc = pending.questionChatId != null
+              ? getChatSession(agent, pending.questionChatId)?.ccProcess
+              : undefined;
+            if (askProc) submitAskAnswer(pending, askProc, questions, answers);
             agent.pendingPermissions.delete(reqId);
             if (pending.questionMsgId && pending.questionChatId) {
               const summary = questions.map((q, i) => `<b>${escapeHtml(q.question)}</b>\n→ ${escapeHtml(answers[String(i)]?.[0] ?? '')}`).join('\n\n');
@@ -1057,13 +1044,13 @@ ${hbContent}`;
       return;
     }
 
-    // Ensure batcher exists (one per agent, not per user)
-    // Track the most recent chatId so the flush callback uses the right one
+    // Ensure a per-chat batcher exists — each chat batches independently.
     agent.lastTgChatId = msg.chatId;
     agent.lastTgUserId = msg.userId ? Number(msg.userId) : null;
-    if (!agent.batcher) {
-      agent.batcher = new MessageBatcher(2000, (combined) => {
-        this.sendToCC(agentId, combined, { chatId: agent.lastTgChatId!, spawnSource: 'telegram' });
+    const cs = getOrCreateChatSession(agent, msg.chatId);
+    if (!cs.batcher) {
+      cs.batcher = new MessageBatcher(2000, (combined) => {
+        this.sendToCC(agentId, combined, { chatId: msg.chatId, spawnSource: 'telegram' });
       });
     }
 
@@ -1085,7 +1072,7 @@ ${hbContent}`;
       }
     }
 
-    agent.batcher.add({
+    cs.batcher.add({
       text,
       imageBase64: msg.imageBase64,
       imageMediaType: msg.imageMediaType,
@@ -1103,19 +1090,26 @@ ${hbContent}`;
     const agent = this.agents.get(agentId);
     if (!agent) return;
 
+    // Resolve the chat this message belongs to and its per-chat session state.
+    const chatId = source?.chatId ?? this.getAgentChatId(agent);
+    if (chatId == null) {
+      this.logger.warn({ agentId }, 'sendToCC: no chat ID resolvable — dropping message');
+      return;
+    }
+    const cs = getOrCreateChatSession(agent, chatId);
+
     // If a CLI session is attached, yank it: TG always wins. Pass the CLI's sessionId
     // through pendingSessionId so the new stdin CC resumes the same conversation.
     if (this.ctlServer.hasCliSession(agentId)) {
-      const yankedSessionId = agent.cliSessionId;
+      const yankedSessionId = cs.cliSessionId;
       this.logger.info({ agentId, yankedSessionId }, 'TG message arrived — yanking CLI session');
-      if (yankedSessionId && !agent.pendingSessionId) {
-        agent.pendingSessionId = yankedSessionId;
+      if (yankedSessionId && !cs.pendingSessionId) {
+        cs.pendingSessionId = yankedSessionId;
       }
-      agent.cliSessionId = null;
+      cs.cliSessionId = null;
       this.ctlServer.sendToCliSocket(agentId, { type: 'cli_kill' });
-      const yankChatId = source?.chatId ?? this.getAgentChatId(agent);
-      if (yankChatId && agent.tgBot) {
-        agent.tgBot.sendText(yankChatId, '<blockquote>⚡ CLI session yanked — TG taking over.</blockquote>', 'HTML', true)
+      if (agent.tgBot) {
+        agent.tgBot.sendText(chatId, '<blockquote>⚡ CLI session yanked — TG taking over.</blockquote>', 'HTML', true)
           .catch(err => this.logger.warn({ err }, 'Failed to send CLI yank notification'));
       }
       // Fall through — normal stdin spawn logic below will start CC fresh and resume the session
@@ -1133,8 +1127,8 @@ ${hbContent}`;
     let text = data.text;
 
     // Prepend IDE awareness context to the first message after an IDE session takeover
-    if (agent.pendingIdeAwareness) {
-      agent.pendingIdeAwareness = false;
+    if (cs.pendingIdeAwareness) {
+      cs.pendingIdeAwareness = false;
       text = `${wrapSystemReminder('This session was recently active in an IDE (VSCode). IDE messages are in your conversation history but may not appear in this Telegram chat.')}\n\n${text}`;
     }
 
@@ -1161,13 +1155,13 @@ ${hbContent}`;
       ccMsg = createTextMessage(text);
     }
 
-    let proc = agent.ccProcess;
+    let proc = cs.ccProcess;
 
     if (proc?.takenOver) {
       // Session was taken over externally — discard old process
       const entry = this.processRegistry.findByProcess(proc);
       if (entry) this.processRegistry.destroy(entry.repo, entry.sessionId);
-      agent.ccProcess = null;
+      cs.ccProcess = null;
       proc = null;
     }
 
@@ -1176,49 +1170,43 @@ ${hbContent}`;
 
     if (!proc || (proc.state === 'idle' && !isContainerIdle)) {
       // Warn if no repo is configured
-      if (agent.repo === homedir()) {
-        const chatId = source?.chatId;
-        if (chatId && agent.tgBot) {
-          agent.tgBot.sendText(
-            chatId,
-            formatSystemMessage('status', 'No project selected. Use /repo to pick one, or CC will run in your home directory.'),
-            'HTML',
-            true, // silent
-          ).catch(err => this.logger.error({ err }, 'Failed to send no-repo warning'));
-        }
+      if (agent.repo === homedir() && agent.tgBot) {
+        agent.tgBot.sendText(
+          chatId,
+          formatSystemMessage('status', 'No project selected. Use /repo to pick one, or CC will run in your home directory.'),
+          'HTML',
+          true, // silent
+        ).catch(err => this.logger.error({ err }, 'Failed to send no-repo warning'));
       }
 
       // Notify if spawning a genuinely stale session (no pending session, last activity >2h ago,
       // and activity was during this run — not a restart scenario already notified at shutdown)
-      if (!agent.pendingSessionId) {
+      if (!cs.pendingSessionId) {
         const agentState = this.sessionStore.getAgent(agentId);
         const lastActivityMs = new Date(agentState.lastActivity).getTime();
         const isStale = Date.now() - lastActivityMs >= 2 * 60 * 60 * 1000;
         const isFromThisRun = lastActivityMs >= this.startedAt;
         if (isStale && isFromThisRun) {
-          const staleChatId = source?.chatId;
-          if (staleChatId && agent.tgBot) {
-            agent.tgBot.sendText(staleChatId, '<blockquote>Starting a new session. Use /sessions to resume a previous one.</blockquote>', 'HTML', true)
+          if (agent.tgBot) {
+            agent.tgBot.sendText(chatId, '<blockquote>Starting a new session. Use /sessions to resume a previous one.</blockquote>', 'HTML', true)
               .catch(err => this.logger.error({ err }, 'Failed to send stale session notification'));
           }
-        } else if (!isStale && agent.forceNewSession) {
+        } else if (!isStale && cs.forceNewSession) {
           // Process exited (restart, crash, etc.) — notify that a new session is starting
-          const fsChatId = source?.chatId;
-          if (fsChatId && agent.tgBot) {
-            agent.tgBot.sendText(fsChatId, '<blockquote>Previous session ended. Starting fresh.</blockquote>', 'HTML', true)
+          if (agent.tgBot) {
+            agent.tgBot.sendText(chatId, '<blockquote>Previous session ended. Starting fresh.</blockquote>', 'HTML', true)
               .catch(err => this.logger.error({ err }, 'Failed to send forceNewSession notification'));
           }
-        } else if (!isStale && !agent.forceNewSession) {
+        } else if (!isStale && !cs.forceNewSession) {
           // Auto-continuing a recent session — check if it came from an IDE (e.g. VSCode)
-          const ideChatId = source?.chatId;
-          if (ideChatId && agent.tgBot) {
+          if (agent.tgBot) {
             const recent = this.discoverAgentSessions(agent, 1);
             if (recent.length > 0) {
               const jsonlPath = getSessionJsonlPath(recent[0].id, this.agentSessionRepo(agent), agent.claudeConfigDir);
               if (hasIDEContent(jsonlPath)) {
-                agent.tgBot.sendText(ideChatId, formatSystemMessage('status', 'Resuming a session previously active in VSCode IDE.'), 'HTML', true)
+                agent.tgBot.sendText(chatId, formatSystemMessage('status', 'Resuming a session previously active in VSCode IDE.'), 'HTML', true)
                   .catch(err => this.logger.error({ err }, 'Failed to send IDE origin notification'));
-                agent.pendingIdeAwareness = true;
+                cs.pendingIdeAwareness = true;
               }
             }
           }
@@ -1226,20 +1214,19 @@ ${hbContent}`;
       }
 
       // Explicit session resume — also check for IDE origin
-      if (agent.pendingSessionId && !agent.forceNewSession) {
-        const ideChatId = source?.chatId;
-        if (ideChatId && agent.tgBot) {
-          const jsonlPath = getSessionJsonlPath(agent.pendingSessionId, agent.repo);
+      if (cs.pendingSessionId && !cs.forceNewSession) {
+        if (agent.tgBot) {
+          const jsonlPath = getSessionJsonlPath(cs.pendingSessionId, agent.repo);
           if (hasIDEContent(jsonlPath)) {
-            agent.tgBot.sendText(ideChatId, formatSystemMessage('status', 'Resuming a session previously active in VSCode IDE.'), 'HTML', true)
+            agent.tgBot.sendText(chatId, formatSystemMessage('status', 'Resuming a session previously active in VSCode IDE.'), 'HTML', true)
               .catch(err => this.logger.error({ err }, 'Failed to send IDE origin notification'));
-            agent.pendingIdeAwareness = true;
+            cs.pendingIdeAwareness = true;
           }
         }
       }
 
-      proc = this.spawnCCProcess(agentId);
-      agent.ccProcess = proc;
+      proc = this.spawnCCProcess(agentId, chatId);
+      cs.ccProcess = proc;
 
       // Emit cc_spawned event to supervisor
       const spawnSource = source?.spawnSource ?? 'telegram';
@@ -1260,9 +1247,7 @@ ${hbContent}`;
     }
 
     // Show typing indicator
-    if (source?.chatId) {
-      this.startTypingIndicator(agent, source.chatId);
-    }
+    this.startTypingIndicator(agent, chatId);
 
     // Log user message in event buffer
     agent.eventBuffer.push({ ts: Date.now(), type: 'user', text: data.text });
@@ -1272,8 +1257,8 @@ ${hbContent}`;
     // emitting events during the await; a single flush captures only the snapshot at call
     // time, so we loop briefly — yielding the event loop between passes lets queued
     // handleEvent calls update segments before the next flush captures them.
-    if (proc.state === 'active' && agent.accumulator) {
-      const acc = agent.accumulator;
+    if (proc.state === 'active' && cs.accumulator) {
+      const acc = cs.accumulator;
       for (let i = 0; i < 3; i++) {
         await acc.flushIfDirty();
         await new Promise<void>(resolve => setImmediate(resolve));
@@ -1287,7 +1272,41 @@ ${hbContent}`;
   // ── Process cleanup helper ──
 
   /**
-   * Kill the agent's CC process and clean up.
+   * Kill one chat's CC process and clean up its per-chat state.
+   */
+  private killChatProcess(agentId: string, chatId: number): void {
+    const agent = this.agents.get(agentId);
+    if (!agent) return;
+    const cs = getChatSession(agent, chatId);
+    if (!cs) return;
+
+    const proc = cs.ccProcess;
+    if (proc) {
+      const entry = this.processRegistry.findByProcess(proc);
+      if (entry) {
+        this.processRegistry.destroy(entry.repo, entry.sessionId);
+      } else {
+        proc.destroy();
+      }
+    }
+    cs.ccProcess = null;
+
+    // Clean up accumulator & tracker
+    if (cs.accumulator) {
+      cs.accumulator.finalize();
+      cs.accumulator = null;
+    }
+    if (cs.subAgentTracker) {
+      cs.subAgentTracker.reset();
+      cs.subAgentTracker = null;
+    }
+    this.stopTypingIndicator(agent, chatId);
+
+    agent.chatSessions.delete(chatId);
+  }
+
+  /**
+   * Kill ALL of an agent's CC processes (every chat) and clean up.
    */
   private killAgentProcess(agentId: string): void {
     const agent = this.agents.get(agentId);
@@ -1298,27 +1317,9 @@ ${hbContent}`;
       this.ctlServer.sendToCliSocket(agentId, { type: 'cli_kill' });
     }
 
-    const proc = agent.ccProcess;
-    if (proc) {
-      const entry = this.processRegistry.findByProcess(proc);
-      if (entry) {
-        this.processRegistry.destroy(entry.repo, entry.sessionId);
-      } else {
-        proc.destroy();
-      }
+    for (const chatId of [...agent.chatSessions.keys()]) {
+      this.killChatProcess(agentId, chatId);
     }
-    agent.ccProcess = null;
-
-    // Clean up accumulator & tracker
-    if (agent.accumulator) {
-      agent.accumulator.finalize();
-      agent.accumulator = null;
-    }
-    if (agent.subAgentTracker) {
-      agent.subAgentTracker.reset();
-      agent.subAgentTracker = null;
-    }
-    this.stopTypingIndicator(agent);
   }
 
   // ── Typing indicator management ──
@@ -1332,46 +1333,77 @@ ${hbContent}`;
   }
 
   private getAgentChatId(agent: AgentInstance): number | null {
-    // Active typing indicator (set during CC processing)
-    if (agent.typingChatId) return agent.typingChatId;
-    // Last TG chat that sent a message (survives typing indicator stop)
+    // Last TG chat that sent a message
     if (agent.lastTgChatId) return agent.lastTgChatId;
     // Fall back to first allowed user (DM chatId == userId for private chats)
     const firstUser = agent.config.allowedUsers[0];
     return firstUser ? Number(firstUser) : null;
   }
 
+  /** Resolve an agent's "primary" ChatSession for agent-level contexts (supervisor wakes,
+   *  cron, heartbeat) where there is no originating chat. Uses getAgentChatId as the fallback. */
+  private getPrimaryChatSession(agent: AgentInstance): ChatSession | undefined {
+    const chatId = this.getAgentChatId(agent);
+    if (chatId == null) return undefined;
+    return getChatSession(agent, chatId);
+  }
+
+  /** True if the agent has no CC process actively mid-turn across any of its chats. */
+  private agentIsIdle(agentId: string): boolean {
+    const agent = this.agents.get(agentId);
+    if (!agent) return true;
+    for (const cs of agent.chatSessions.values()) {
+      const st = cs.ccProcess?.state;
+      if (st && st !== 'idle') return false;
+    }
+    return true;
+  }
+
+  /** The CC session id of an agent's primary chat (for supervisor subscription checks).
+   *  Falls back to any chat's active CC process if the primary chat has none. */
+  private agentPrimarySessionId(agentId: string): string | null {
+    const agent = this.agents.get(agentId);
+    if (!agent) return null;
+    const primary = this.getPrimaryChatSession(agent);
+    if (primary?.ccProcess?.sessionId) return primary.ccProcess.sessionId;
+    for (const cs of agent.chatSessions.values()) {
+      if (cs.ccProcess?.sessionId) return cs.ccProcess.sessionId;
+    }
+    return null;
+  }
+
   private startTypingIndicator(agent: AgentInstance, chatId: number): void {
+    const cs = getOrCreateChatSession(agent, chatId);
     // Don't create duplicate intervals
-    if (agent.typingInterval) {
+    if (cs.typingInterval) {
       this.logger.info({ agentId: agent.id, chatId }, 'startTypingIndicator: already running, skipping');
       return;
     }
     if (!agent.tgBot) return;
     this.logger.info({ agentId: agent.id, chatId }, 'startTypingIndicator: starting');
-    agent.typingChatId = chatId;
     // Send immediately, then repeat every 4s (TG typing badge lasts ~5s)
     agent.tgBot.sendTyping(chatId);
     const interval = setInterval(() => {
-      if (agent.typingChatId) agent.tgBot?.sendTyping(agent.typingChatId);
+      agent.tgBot?.sendTyping(chatId);
     }, 4_000);
-    agent.typingInterval = interval;
+    cs.typingInterval = interval;
   }
 
-  private stopTypingIndicator(agent: AgentInstance): void {
-    if (agent.typingInterval) {
-      this.logger.info({ agentId: agent.id }, 'stopTypingIndicator: stopping');
-      clearInterval(agent.typingInterval);
-      agent.typingInterval = null;
-      agent.typingChatId = null;
+  private stopTypingIndicator(agent: AgentInstance, chatId: number): void {
+    const cs = getChatSession(agent, chatId);
+    if (cs?.typingInterval) {
+      this.logger.info({ agentId: agent.id, chatId }, 'stopTypingIndicator: stopping');
+      clearInterval(cs.typingInterval);
+      cs.typingInterval = null;
     } else {
-      this.logger.info({ agentId: agent.id }, 'stopTypingIndicator: no interval (already stopped)');
+      this.logger.info({ agentId: agent.id, chatId }, 'stopTypingIndicator: no interval (already stopped)');
     }
   }
 
-  private spawnCCProcess(agentId: string): ICCProcess {
+  private spawnCCProcess(agentId: string, chatId: number): ICCProcess {
     const agent = this.agents.get(agentId)!;
     const agentState = this.sessionStore.getAgent(agentId);
+    const cs = getOrCreateChatSession(agent, chatId);
 
     // Build userConfig from agent-level state
     const userConfig = resolveUserConfig(agent.config, agent.config.allowedUsers[0] || 'default');
@@ -1382,19 +1414,17 @@ ${hbContent}`;
     }
 
     // Determine session ID and whether to continue
-    let sessionId = agent.pendingSessionId ?? undefined;
-    agent.pendingSessionId = null; // consumed
-    const forceNew = agent.forceNewSession;
-    agent.forceNewSession = false; // consumed
+    let sessionId = cs.pendingSessionId ?? undefined;
+    cs.pendingSessionId = null; // consumed
+    const forceNew = cs.forceNewSession;
+    cs.forceNewSession = false; // consumed
 
-    // Resume only via an explicit sessionId we own. Bare `--continue` picks the newest JSONL
-    // in the project dir by mtime — which may be a `claude` CLI session or another agent
-    // sharing the repo. If we have no tracked sessionId, start fresh instead.
-    const STALE_THRESHOLD_MS = 2 * 60 * 60 * 1000;
-    const lastActivityMs = new Date(agentState.lastActivity).getTime();
-    const isRecent = Date.now() - lastActivityMs < STALE_THRESHOLD_MS;
-    if (!sessionId && !forceNew && isRecent && agentState.lastSessionId) {
-      sessionId = agentState.lastSessionId;
+    // Resume only via an explicit sessionId we own. Never use bare `--continue` — it picks
+    // the newest JSONL in the project dir by mtime, which may be a `claude` CLI session or
+    // another chat/agent sharing the repo. If we have no tracked sessionId for this chat,
+    // start fresh instead.
+    if (!sessionId && !forceNew) {
+      sessionId = this.sessionStore.getSessionForChat(agentId, chatId);
     }
     // Lock check: if our chosen sessionId is being actively written by some other process
     // (e.g. you started `claude` in a terminal on the same project), don't yank it —
@@ -1403,8 +1433,7 @@ ${hbContent}`;
       const jsonlPath = getSessionJsonlPath(sessionId, this.agentSessionRepo(agent), agent.claudeConfigDir);
       if (isSessionExternallyActive(sessionId, jsonlPath)) {
         this.logger.info({ agentId, sessionId }, 'Session externally active — spawning fresh instead of resuming');
-        const chatId = this.getAgentChatId(agent);
-        if (chatId && agent.tgBot) {
+        if (agent.tgBot) {
           agent.tgBot.sendText(chatId, '<blockquote>📎 Detected active <code>claude</code> on this project — starting fresh session for TG.</blockquote>', 'HTML', true)
             .catch(err => this.logger.warn({ err }, 'Failed to send external-session notification'));
         }
@@ -1464,6 +1493,7 @@ ${hbContent}`;
       proc = new ContainerCCProcess({
         agentId,
         userId: agentId,
+        chatId,
         socketPath: relaySocketPath,
         userConfig,
         mcpConfigPath: containerMcpConfigPath,
@@ -1487,6 +1517,7 @@ ${hbContent}`;
       proc = new CCProcess({
         agentId,
         userId: agentId,
+        chatId,
         ccBinaryPath: this.config.global.ccBinaryPath,
         userConfig,
         mcpConfigPath,
@@ -1515,7 +1546,7 @@ ${hbContent}`;
 
     proc.on('init', (event: InitEvent) => {
       this.sessionStore.updateLastActivity(agentId);
-      this.sessionStore.setLastSessionId(agentId, event.session_id);
+      this.sessionStore.setSessionForChat(agentId, chatId, event.session_id);
       agent.eventBuffer.push({ ts: Date.now(), type: 'system', text: `Session initialized: ${event.session_id}` });
 
       // Update registry key if session ID changed from tentative
@@ -1530,7 +1561,7 @@ ${hbContent}`;
 
     proc.on('stream_event', (event: StreamInnerEvent) => {
       this.highSignalDetector.handleStreamEvent(agentId, event);
-      this.handleStreamEvent(agentId, event);
+      this.handleStreamEvent(agentId, chatId, event);
     });
 
     proc.on('tool_result', (event: ToolResultEvent) => {
@@ -1545,7 +1576,7 @@ ${hbContent}`;
       this.highSignalDetector.handleToolResult(agentId, event.tool_use_id, toolContent, isToolErr, toolName !== 'unknown' ? toolName : undefined);
 
       // Resolve tool indicator message with success/failure status
-      const acc = agent.accumulator;
+      const acc = cs.accumulator;
       if (acc && event.tool_use_id) {
         const isError = event.is_error === true;
         const contentStr = typeof event.content === 'string' ? event.content : JSON.stringify(event.content);
@@ -1553,7 +1584,7 @@ ${hbContent}`;
         acc.resolveToolMessage(event.tool_use_id, isError, errorMsg, contentStr, event.tool_use_result);
       }
 
-      const tracker = agent.subAgentTracker;
+      const tracker = cs.subAgentTracker;
       if (!tracker) return;
 
       const resultText = typeof event.content === 'string' ? event.content : JSON.stringify(event.content);
@@ -1604,43 +1635,42 @@ ${hbContent}`;
 
     // System events for background task tracking
     proc.on('task_started', (event: TaskStartedEvent) => {
-      if (agent.subAgentTracker) {
-        agent.subAgentTracker.handleTaskStarted(event.tool_use_id, event.description, event.task_type);
+      if (cs.subAgentTracker) {
+        cs.subAgentTracker.handleTaskStarted(event.tool_use_id, event.description, event.task_type);
       }
       // Update the in-turn sub-agent segment in the main bubble
-      if (agent.accumulator && event.tool_use_id) {
-        agent.accumulator.updateSubAgentSegment(event.tool_use_id, 'dispatched', event.description);
+      if (cs.accumulator && event.tool_use_id) {
+        cs.accumulator.updateSubAgentSegment(event.tool_use_id, 'dispatched', event.description);
       }
     });
 
     proc.on('task_progress', (event: TaskProgressEvent) => {
-      if (agent.subAgentTracker) {
-        agent.subAgentTracker.handleTaskProgress(event.tool_use_id, event.description, event.last_tool_name);
+      if (cs.subAgentTracker) {
+        cs.subAgentTracker.handleTaskProgress(event.tool_use_id, event.description, event.last_tool_name);
       }
       // Update the in-turn sub-agent segment in the main bubble with progress
-      if (agent.accumulator && event.tool_use_id) {
-        agent.accumulator.appendSubAgentProgress(event.tool_use_id, event.description, event.last_tool_name);
+      if (cs.accumulator && event.tool_use_id) {
+        cs.accumulator.appendSubAgentProgress(event.tool_use_id, event.description, event.last_tool_name);
       }
     });
 
     proc.on('task_completed', (event: TaskCompletedEvent) => {
-      if (agent.subAgentTracker) {
-        agent.subAgentTracker.handleTaskCompleted(event.tool_use_id);
+      if (cs.subAgentTracker) {
+        cs.subAgentTracker.handleTaskCompleted(event.tool_use_id);
       }
       // Update the in-turn sub-agent segment in the main bubble
-      if (agent.accumulator && event.tool_use_id) {
-        agent.accumulator.updateSubAgentSegment(event.tool_use_id, 'completed');
+      if (cs.accumulator && event.tool_use_id) {
+        cs.accumulator.updateSubAgentSegment(event.tool_use_id, 'completed');
       }
     });
 
     // Media from tool results (images, PDFs, etc.)
     proc.on('media', async (media: { kind: string; media_type: string; data: string }) => {
       const buf = Buffer.from(media.data, 'base64');
-      const chatId = this.getAgentChatId(agent);
-      if (!chatId || !agent.tgBot) return;
+      if (!agent.tgBot) return;
 
       // Seal the current bubble so subsequent text starts a new one below the media
-      if (agent.accumulator) agent.accumulator.reset();
+      if (cs.accumulator) cs.accumulator.reset();
 
       try {
         if (media.kind === 'image') {
@@ -1674,14 +1704,14 @@ ${hbContent}`;
     });
 
     proc.on('result', (event: ResultEvent) => {
-      this.stopTypingIndicator(agent);
+      this.stopTypingIndicator(agent, chatId);
       this.highSignalDetector.handleTurnEnd(agentId);
       // Track cumulative session cost and check budget thresholds
       if (event.total_cost_usd != null) {
         this.highSignalDetector.handleCostUpdate(agentId, event.total_cost_usd);
       }
       agent.eventBuffer.push({ ts: Date.now(), type: 'system', text: `Turn complete${event.is_error ? ' (error)' : ''}${event.total_cost_usd ? ` · $${event.total_cost_usd.toFixed(4)}` : ''}` });
-      void this.handleResult(agentId, event);
+      void this.handleResult(agentId, chatId, event);
 
       // Forward to supervisor
       if (this.isSupervisorSubscribed(agentId, proc.sessionId)) {
@@ -1703,10 +1733,9 @@ ${hbContent}`;
       const tokenInfo = preTokens ? ` (was ${Math.round(preTokens / 1000)}k tokens)` : '';
       const label = trigger === 'auto' ? '🗜️ Auto-compacted' : '🗜️ Compacted';
       agent.eventBuffer.push({ ts: Date.now(), type: 'system', text: label + tokenInfo });
-      const chatId = this.getAgentChatId(agent);
-      if (chatId && agent.tgBot) {
+      if (agent.tgBot) {
         // Finalize the current streaming bubble so the compact notice appears below it
-        const acc = agent.accumulator;
+        const acc = cs.accumulator;
         const flush = acc?.hasActiveBubble ? acc.flushIfDirty().then(() => acc.reset()) : Promise.resolve();
         flush
           .then(() => agent.tgBot!.sendText(
@@ -1731,15 +1760,15 @@ ${hbContent}`;
       };
       agent.pendingPermissions.set(requestId, pending);
 
-      const permChatId = this.getAgentChatId(agent);
+      const permChatId = chatId;
 
       if (req.tool_name === 'AskUserQuestion' && permChatId && agent.tgBot) {
         // Show interactive question UI instead of generic Allow/Deny
         // Flush current bubble first so the question appears after the assistant text
         const flushAndSend = async () => {
-          if (agent.accumulator) {
-            await agent.accumulator.flushIfDirty();
-            agent.accumulator.reset();
+          if (cs.accumulator) {
+            await cs.accumulator.flushIfDirty();
+            cs.accumulator.reset();
           }
           const questions = (req.input?.questions ?? []) as AskQuestion[];
           pending.questionAnswers = {};
@@ -1752,9 +1781,9 @@ ${hbContent}`;
       } else if (req.tool_name === 'ExitPlanMode' && permChatId && agent.tgBot) {
         // Show plan approval UI — flush current bubble first so it appears in correct order
         const flushAndSendPlan = async () => {
-          if (agent.accumulator) {
-            await agent.accumulator.flushIfDirty();
-            agent.accumulator.reset();
+          if (cs.accumulator) {
+            await cs.accumulator.flushIfDirty();
+            cs.accumulator.reset();
           }
           // Send plan content as a .md document if available
           const planContent = req.input?.plan as string | undefined;
@@ -1829,16 +1858,15 @@ ${hbContent}`;
         ? formatSystemMessage('error', `API overloaded, retrying...${retryInfo}`)
         : formatSystemMessage('error', `${escapeHtml(errMsg)}${retryInfo}`);
 
-      const errChatId = this.getAgentChatId(agent);
-      if (errChatId && agent.tgBot) {
-        agent.tgBot.sendText(errChatId, text, 'HTML', true) // silent
+      if (agent.tgBot) {
+        agent.tgBot.sendText(chatId, text, 'HTML', true) // silent
           .catch(err => this.logger.error({ err }, 'Failed to send API error notification'));
       }
     });
 
     proc.on('idle', () => {
-      agent.pendingSessionId = proc.sessionId ?? null;
-      this.stopTypingIndicator(agent);
+      cs.pendingSessionId = proc.sessionId ?? null;
+      this.stopTypingIndicator(agent, chatId);
       // Auto-destroy ephemeral agents when their CC session ends naturally
       // Skip ralph/watcher agents — they stay alive waiting for events and have their own timeout
       if (agent.ephemeral && !this.ralphManager.isRalph(agentId)) {
@@ -1848,11 +1876,10 @@ ${hbContent}`;
     });
 
     proc.on('hang', () => {
-      agent.pendingSessionId = proc.sessionId ?? null;
-      this.stopTypingIndicator(agent);
-      const hangChatId = this.getAgentChatId(agent);
-      if (hangChatId && agent.tgBot) {
-        agent.tgBot.sendText(hangChatId, '<blockquote>⚠️ Session killed — Claude was unresponsive. Send a message to resume.</blockquote>', 'HTML', true)
+      cs.pendingSessionId = proc.sessionId ?? null;
+      this.stopTypingIndicator(agent, chatId);
+      if (agent.tgBot) {
+        agent.tgBot.sendText(chatId, '<blockquote>⚠️ Session killed — Claude was unresponsive. Send a message to resume.</blockquote>', 'HTML', true)
           .catch(err => this.logger.error({ err }, 'Failed to send hang notification'));
       }
     });
@@ -1871,12 +1898,12 @@ ${hbContent}`;
         this.suppressExitForProcess.add(proc.sessionId ?? '');
       }
 
-      this.stopTypingIndicator(agent);
+      this.stopTypingIndicator(agent, chatId);
       const entry = getEntry();
       if (entry) {
         this.processRegistry.remove(entry.repo, entry.sessionId);
       }
-      agent.ccProcess = null;
+      if (cs.ccProcess === proc) cs.ccProcess = null;
       proc.destroy();
     });
 
@@ -1894,8 +1921,7 @@ ${hbContent}`;
       }
 
       // Notify TG about process exit (skip ephemeral agents and user-initiated kills like /new)
-      const chatId = this.getAgentChatId(agent);
-      if (chatId && agent.tgBot && !agent.ephemeral && !wasKilledByUs) {
+      if (agent.tgBot && !agent.ephemeral && !wasKilledByUs) {
         const msg = wasActive
           ? 'Session ended unexpectedly (process exited mid-turn). Next message starts a new session.'
           : 'Session ended. Next message starts a new session — use /sessions to resume a previous one.';
@@ -1922,24 +1948,24 @@ ${hbContent}`;
         });
       }
 
-      this.stopTypingIndicator(agent);
+      this.stopTypingIndicator(agent, chatId);
 
-      if (agent.accumulator) {
-        agent.accumulator.finalize();
-        agent.accumulator = null;
+      if (cs.accumulator) {
+        cs.accumulator.finalize();
+        cs.accumulator = null;
       }
-      if (agent.subAgentTracker) {
-        agent.subAgentTracker.stopMailboxWatch();
-        agent.subAgentTracker = null;
+      if (cs.subAgentTracker) {
+        cs.subAgentTracker.stopMailboxWatch();
+        cs.subAgentTracker = null;
       }
 
       const entry = getEntry();
       if (entry) {
         this.processRegistry.remove(entry.repo, entry.sessionId);
       }
-      agent.ccProcess = null;
+      if (cs.ccProcess === proc) cs.ccProcess = null;
       // Process exited — next message should start a fresh session
-      agent.forceNewSession = true;
+      cs.forceNewSession = true;
       // Auto-destroy ephemeral agents on process exit
       // Skip ralph/watcher agents — they stay alive waiting for events and have their own timeout
       if (agent.ephemeral && !this.ralphManager.isRalph(agentId)) {
@@ -1950,10 +1976,9 @@ ${hbContent}`;
 
     proc.on('error', (err: Error) => {
       agent.eventBuffer.push({ ts: Date.now(), type: 'error', text: err.message });
-      this.stopTypingIndicator(agent);
-      const errChatId = this.getAgentChatId(agent);
-      if (errChatId && agent.tgBot) {
-        agent.tgBot.sendText(errChatId, formatSystemMessage('error', escapeHtml(String(err.message))), 'HTML', true) // silent
+      this.stopTypingIndicator(agent, chatId);
+      if (agent.tgBot) {
+        agent.tgBot.sendText(chatId, formatSystemMessage('error', escapeHtml(String(err.message))), 'HTML', true) // silent
           .catch(err2 => this.logger.error({ err: err2 }, 'Failed to send process error notification'));
       }
     });
@@ -1963,20 +1988,13 @@ ${hbContent}`;
 
   // ── Stream event handling ──
 
-  private handleStreamEvent(agentId: string, event: StreamInnerEvent): void {
+  private handleStreamEvent(agentId: string, chatId: number, event: StreamInnerEvent): void {
     const agent = this.agents.get(agentId);
     if (!agent) return;
 
-    const chatId = this.getAgentChatId(agent);
-    if (!chatId) return;
+    const cs = getOrCreateChatSession(agent, chatId);
 
-    // Recreate accumulator if the active chat changed (e.g. DM → group or vice versa)
-    if (agent.accumulator && agent.accumulator.activeChatId !== chatId) {
-      agent.accumulator.flushIfDirty().then(() => agent.accumulator?.reset()).catch(() => {});
-      agent.accumulator = null;
-    }
-
-    if (!agent.accumulator && agent.tgBot) {
+    if (!cs.accumulator && agent.tgBot) {
       const tgBot = agent.tgBot; // capture for closures (non-null here)
       const sender: TelegramSender = {
         sendMessage: (cid, text, parseMode) => {
@@ -1995,10 +2013,10 @@ ${hbContent}`;
         this.logger.error({ err, context, agentId }, 'Stream accumulator error');
         tgBot.sendText(chatId, formatSystemMessage('error', escapeHtml(context)), 'HTML', true).catch(() => {}); // silent
       };
-      agent.accumulator = new StreamAccumulator({ chatId, sender, logger: this.logger, onError });
+      cs.accumulator = new StreamAccumulator({ chatId, sender, logger: this.logger, onError });
     }
 
-    if (!agent.subAgentTracker && agent.tgBot) {
+    if (!cs.subAgentTracker && agent.tgBot) {
       const tgBot = agent.tgBot; // capture for closures (non-null here)
       const subAgentSender: SubAgentSender = {
         sendMessage: (cid, text, parseMode) =>
@@ -2008,10 +2026,10 @@ ${hbContent}`;
         setReaction: (cid, msgId, emoji) =>
           tgBot.setReaction(cid, msgId, emoji),
       };
-      agent.subAgentTracker = new SubAgentTracker({
+      cs.subAgentTracker = new SubAgentTracker({
         chatId,
         sender: subAgentSender,
-        onEditAttempt: (msgId, preview) => agent.accumulator?.logIfSealed(msgId, preview),
+        onEditAttempt: (msgId, preview) => cs.accumulator?.logIfSealed(msgId, preview),
         onAllDone: ({ count, elapsedMs }) => {
           const elapsed = elapsedMs > 0 ? `${Math.round(elapsedMs / 1000)}s` : '';
           this.highSignalDetector.emitEvent(agentId, {
@@ -2029,30 +2047,27 @@ ${hbContent}`;
     // (i.e. a result event finalized it). CC sends message_start on every tool-use
     // loop within the same turn — those must reuse the same bubble via softReset.
     if (event.type === 'message_start') {
-      if (agent.accumulator?.sealed) {
+      if (cs.accumulator?.sealed) {
         // Previous turn is done (result event sealed it) → new bubble
         agent.awaitingAskCleanup = false;
-        agent.accumulator.reset();
-        if (agent.subAgentTracker && !agent.subAgentTracker.hasDispatchedAgents) {
-          agent.subAgentTracker.reset();
+        cs.accumulator.reset();
+        if (cs.subAgentTracker && !cs.subAgentTracker.hasDispatchedAgents) {
+          cs.subAgentTracker.reset();
         }
-      } else if (agent.accumulator) {
+      } else if (cs.accumulator) {
         // Mid-turn tool-use loop → keep same bubble, clear transient state
-        agent.accumulator.softReset();
+        cs.accumulator.softReset();
       }
       // Ensure typing indicator is running whenever CC starts a new message — covers the
       // gap created by a steer (result event for the abandoned turn stopped typing before
       // events for the new turn arrive).
-      const tgChatId = agent.typingChatId ?? agent.lastTgChatId;
-      if (tgChatId) {
-        this.startTypingIndicator(agent, tgChatId);
-      }
+      this.startTypingIndicator(agent, chatId);
     }
 
-    agent.accumulator?.handleEvent(event).catch(err => {
+    cs.accumulator?.handleEvent(event).catch(err => {
       this.logger.error({ err: err instanceof Error ? { message: err.message, stack: err.stack } : err, agentId }, 'Stream accumulator handleEvent error');
     });
-    agent.subAgentTracker?.handleEvent(event).catch(err => {
+    cs.subAgentTracker?.handleEvent(event).catch(err => {
       this.logger.error({ err: err instanceof Error ? { message: err.message, stack: err.stack } : err, agentId }, 'Sub-agent tracker handleEvent error');
     });
   }
@@ -2074,10 +2089,8 @@ ${hbContent}`;
 
     agent.authFlowInProgress = true;
 
-    // Kill the current CC process (it's in an auth-error state)
-    if (agent.ccProcess) {
-      agent.ccProcess.kill();
-    }
+    // Kill all CC processes for this agent (auth error is account-wide, not chat-specific)
+    this.killAgentProcess(agentId);
 
     this.logger.info({ agentId }, 'Auth error detected — starting OAuth fallback flow');
     agent.eventBuffer.push({ ts: Date.now(), type: 'system', text: '🔑 Auth error detected — starting OAuth fallback' });
@@ -2096,7 +2109,11 @@ ${hbContent}`;
       // Retry the last message
       const { text, source } = agent.lastSendData;
       agent.lastSendData = null;
-      agent.forceNewSession = true;
+      // Pin a fresh session for the retry chat (auth error invalidated the old process)
+      const retryChatId = source?.chatId ?? this.getAgentChatId(agent);
+      if (retryChatId != null) {
+        getOrCreateChatSession(agent, retryChatId).forceNewSession = true;
+      }
       this.logger.info({ agentId }, 'Auth successful — retrying last message');
       await this.sendToCC(agentId, { text }, source);
     } else if (!result.success) {
@@ -2105,9 +2122,10 @@ ${hbContent}`;
     }
   }
 
-  private async handleResult(agentId: string, event: ResultEvent): Promise<void> {
+  private async handleResult(agentId: string, chatId: number, event: ResultEvent): Promise<void> {
     const agent = this.agents.get(agentId);
     if (!agent) return;
+    const cs = getOrCreateChatSession(agent, chatId);
 
     // waitForResult: resolve the pending promise and auto-destroy
     const pendingWait = this.pendingWaitForResult.get(agentId);
@@ -2129,13 +2147,11 @@ ${hbContent}`;
     // so any stale value cleared from a pre-upgrade state doesn't persist.
     agent.muteOutput = false;
 
-    const chatId = this.getAgentChatId(agent);
-
     // Set usage stats on the accumulator before finalizing
-    const acc = agent.accumulator;
+    const acc = cs.accumulator;
     if (acc) {
       if (event.usage) {
-        const proc = agent.ccProcess;
+        const proc = cs.ccProcess;
         const entry = proc ? this.processRegistry.findByProcess(proc) : null;
         acc.setTurnUsage({
           inputTokens: event.usage.input_tokens ?? 0,
@@ -2153,9 +2169,8 @@ ${hbContent}`;
       if (agent.awaitingAskCleanup && agent.tgBot) {
         agent.awaitingAskCleanup = false;
         const bubbleId = acc.lastBubbleId;
-        const delChatId = this.getAgentChatId(agent);
-        if (bubbleId && delChatId) {
-          agent.tgBot.deleteMessage(delChatId, bubbleId)
+        if (bubbleId) {
+          agent.tgBot.deleteMessage(chatId, bubbleId)
             .catch(err => this.logger.warn({ err, bubbleId }, 'Failed to delete AskUserQuestion fallback bubble'));
         }
       }
@@ -2171,7 +2186,7 @@ ${hbContent}`;
 
     // Route turn-complete to native supervisor (routine — errors escalate via result error path)
     const cost = event.total_cost_usd ? ` · $${event.total_cost_usd.toFixed(4)}` : '';
-    const sessionTag = this.formatSessionTag(agent);
+    const sessionTag = this.formatSessionTag(agent, cs.ccProcess?.sessionId);
     this.pushSupervisorEvent(agentId, `${event.is_error ? '❌' : '✅'} Turn complete${cost}${sessionTag}`, false, false, 'routine');
 
     // Route to EventRouter → watchers (ralph) + future consumers
@@ -2183,7 +2198,7 @@ ${hbContent}`;
     });
 
     // Handle errors (only send to TG if bot available)
-    if (event.is_error && chatId && agent.tgBot) {
+    if (event.is_error && agent.tgBot) {
       // Check if result errors contain auth failures — trigger auth fallback instead of showing error
       if (resultHasAuthError(event.errors) && !agent.authFlowInProgress) {
         void this.triggerAuthFallback(agentId);
@@ -2199,10 +2214,10 @@ ${hbContent}`;
     }
 
     // If background sub-agents are still running, mailbox watcher handles them.
-    const tracker = agent.subAgentTracker;
+    const tracker = cs.subAgentTracker;
     if (tracker?.hasDispatchedAgents && tracker.currentTeamName) {
       this.logger.info({ agentId }, 'Turn ended with background sub-agents still running');
-      const ccProcess = agent.ccProcess;
+      const ccProcess = cs.ccProcess;
       if (ccProcess) ccProcess.clearIdleTimer();
       // Create standalone post-turn status bubble (main bubble is now sealed)
       tracker.startPostTurnTracking().catch(err => this.logger.error({ err, agentId }, 'Failed to start post-turn tracking'));
@@ -2214,7 +2229,7 @@ ${hbContent}`;
         tracker.hasPendingFollowUp = true;
         setTimeout(() => {
           if (!tracker.hasDispatchedAgents) return;
-          const proc = agent.ccProcess;
+          const proc = cs.ccProcess;
           if (!proc) return;
           this.logger.info({ agentId }, 'Mailbox timeout — sending single follow-up for remaining agents');
           for (const info of tracker.activeAgents) {
@@ -2237,11 +2252,14 @@ ${hbContent}`;
 
     this.logger.debug({ agentId, command: cmd.command, args: cmd.args }, 'Slash command');
 
+    // Per-chat session state for the chat this command came from.
+    const cs = getOrCreateChatSession(agent, cmd.chatId);
+
     switch (cmd.command) {
       case 'start': {
         const repo = agent.repo;
         const model = agent.model;
-        const session = agent.ccProcess?.sessionId;
+        const session = cs.ccProcess?.sessionId;
         const lines = ['👋 <b>TGCC</b> — Telegram ↔ Claude Code bridge'];
         if (repo) lines.push(`📂 <code>${escapeHtml(shortenRepoPath(repo))}</code>`);
         if (model) lines.push(`🤖 ${escapeHtml(model)}`);
@@ -2261,13 +2279,13 @@ ${hbContent}`;
         break;
 
       case 'ping': {
-        const state = agent.ccProcess?.state ?? 'idle';
+        const state = cs.ccProcess?.state ?? 'idle';
         await agent.tgBot.sendText(cmd.chatId, `pong — process: <b>${state.toUpperCase()}</b>`, 'HTML');
         break;
       }
 
       case 'status': {
-        const proc = agent.ccProcess;
+        const proc = cs.ccProcess;
         const uptime = proc?.spawnedAt
           ? formatDuration(Date.now() - proc.spawnedAt.getTime())
           : 'N/A';
@@ -2285,14 +2303,15 @@ ${hbContent}`;
       }
 
       case 'cost': {
-        await agent.tgBot.sendText(cmd.chatId, `<b>Session cost:</b> $${(agent.ccProcess?.totalCostUsd ?? 0).toFixed(4)}`, 'HTML');
+        await agent.tgBot.sendText(cmd.chatId, `<b>Session cost:</b> $${(cs.ccProcess?.totalCostUsd ?? 0).toFixed(4)}`, 'HTML');
         break;
       }
 
       case 'new': {
-        this.killAgentProcess(agentId);
-        agent.pendingSessionId = null;
-        agent.forceNewSession = true; // next message spawns fresh regardless of recency
+        this.killChatProcess(agentId, cmd.chatId);
+        this.sessionStore.clearSessionForChat(agentId, cmd.chatId);
+        // killChatProcess deleted the ChatSession — recreate it and pin a fresh session.
+        getOrCreateChatSession(agent, cmd.chatId).forceNewSession = true;
         const newPrompt = cmd.args?.trim();
         if (newPrompt) {
           // Immediately send the prompt — spawns a fresh session
@@ -2375,8 +2394,9 @@ ${hbContent}`;
 
       case 'continue': {
         // Remember the current session before killing
-        const contSession = agent.ccProcess?.sessionId;
-        this.killAgentProcess(agentId);
+        const contSession = cs.ccProcess?.sessionId
+          ?? this.sessionStore.getSessionForChat(agentId, cmd.chatId) ?? undefined;
+        this.killChatProcess(agentId, cmd.chatId);
 
         // Resolve session to resume and look up its title in one pass
         let sessionToResume = contSession;
@@ -2391,7 +2411,7 @@ ${hbContent}`;
           }
         }
         if (sessionToResume) {
-          agent.pendingSessionId = sessionToResume;
+          getOrCreateChatSession(agent, cmd.chatId).pendingSessionId = sessionToResume;
         }
 
         const contLines = ['Process respawned. Session kept.'];
@@ -2405,8 +2425,8 @@ ${hbContent}`;
 
       case 'sessions': {
         const repo = agent.repo;
-        const currentSessionId = agent.ccProcess?.sessionId ?? null;
-        const cliSessionId = agent.cliSessionId;
+        const currentSessionId = cs.ccProcess?.sessionId ?? null;
+        const cliSessionId = cs.cliSessionId;
 
         // Discover sessions from CC's session directory
         const discovered = this.discoverAgentSessions(agent, 5);
@@ -2462,14 +2482,15 @@ ${hbContent}`;
           await agent.tgBot.sendText(cmd.chatId, '<blockquote>Usage: /resume &lt;session-id&gt;</blockquote>', 'HTML');
           break;
         }
-        this.killAgentProcess(agentId);
-        agent.pendingSessionId = cmd.args.trim();
+        this.killChatProcess(agentId, cmd.chatId);
+        getOrCreateChatSession(agent, cmd.chatId).pendingSessionId = cmd.args.trim();
         await agent.tgBot.sendText(cmd.chatId, `Will resume session <code>${escapeHtml(cmd.args.trim().slice(0, 8))}</code> on next message.`, 'HTML');
         break;
       }
 
       case 'session': {
-        const currentSessionId = agent.ccProcess?.sessionId;
+        const currentSessionId = cs.ccProcess?.sessionId
+          ?? this.sessionStore.getSessionForChat(agentId, cmd.chatId);
         if (!currentSessionId) {
           await agent.tgBot.sendText(cmd.chatId, '<blockquote>No active session.</blockquote>', 'HTML');
           break;
@@ -2511,7 +2532,7 @@ ${hbContent}`;
         const oldModel = agent.model;
         agent.model = newModel;
         this.sessionStore.setModel(agentId, newModel);
-        this.killAgentProcess(agentId);
+        this.killChatProcess(agentId, cmd.chatId);
         await agent.tgBot.sendText(cmd.chatId, `<blockquote>Model set to <code>${escapeHtml(newModel)}</code>. Process respawned.</blockquote>`, 'HTML');
         // Emit state_changed event
         this.emitStateChanged(agentId, 'model', oldModel, newModel, 'telegram');
@@ -2667,11 +2688,11 @@ ${hbContent}`;
           await agent.tgBot.sendText(cmd.chatId, `Path not found: <code>${escapeHtml(repoPath)}</code>`, 'HTML');
           break;
         }
-        // Kill current process (different CWD needs new process)
+        // Kill all chats' processes (repo change = different CWD, affects every chat)
         const oldRepo = agent.repo;
         this.killAgentProcess(agentId);
         agent.repo = repoPath;
-        agent.pendingSessionId = null; // clear session when repo changes
+        this.sessionStore.clearSessionForChat(agentId, cmd.chatId); // clear this chat's session
         this.sessionStore.setRepo(agentId, repoPath);
         await agent.tgBot.sendText(cmd.chatId, `<blockquote>Repo set to <code>${escapeHtml(shortenRepoPath(repoPath))}</code>. Session cleared.</blockquote>`, 'HTML');
         // Emit state_changed event
@@ -2683,8 +2704,8 @@ ${hbContent}`;
         if (this.ctlServer.hasCliSession(agentId)) {
           this.ctlServer.sendToCliSocket(agentId, { type: 'cli_cancel' });
           await agent.tgBot.sendText(cmd.chatId, '<blockquote>Cancelled (CLI session).</blockquote>', 'HTML');
-        } else if (agent.ccProcess && agent.ccProcess.state === 'active') {
-          agent.ccProcess.cancel();
+        } else if (cs.ccProcess && cs.ccProcess.state === 'active') {
+          cs.ccProcess.cancel();
           await agent.tgBot.sendText(cmd.chatId, '<blockquote>Cancelled.</blockquote>', 'HTML');
         } else {
           await agent.tgBot.sendText(cmd.chatId, '<blockquote>No active turn to cancel.</blockquote>', 'HTML');
@@ -2693,7 +2714,7 @@ ${hbContent}`;
       }
 
       case 'compact': {
-        if (!agent.ccProcess || agent.ccProcess.state !== 'active') {
+        if (!cs.ccProcess || cs.ccProcess.state !== 'active') {
           await agent.tgBot.sendText(cmd.chatId, '<blockquote>No active session to compact. Start one first.</blockquote>', 'HTML');
           break;
         }
@@ -2701,7 +2722,7 @@ ${hbContent}`;
           ? `/compact ${cmd.args.trim()}`
           : '/compact';
         await agent.tgBot.sendText(cmd.chatId, formatSystemMessage('status', 'Compacting…'), 'HTML');
-        agent.ccProcess.sendMessage(createTextMessage(compactMsg));
+        cs.ccProcess.sendMessage(createTextMessage(compactMsg));
         break;
       }
 
@@ -2963,11 +2984,14 @@ ${hbContent}`;
 
     this.logger.debug({ agentId, action: query.action, data: query.data }, 'Callback query');
 
+    // Per-chat session state for the chat this callback came from.
+    const cs = getOrCreateChatSession(agent, query.chatId);
+
     switch (query.action) {
       case 'resume': {
         const sessionId = query.data;
-        this.killAgentProcess(agentId);
-        agent.pendingSessionId = sessionId;
+        this.killChatProcess(agentId, query.chatId);
+        getOrCreateChatSession(agent, query.chatId).pendingSessionId = sessionId;
         await agent.tgBot.answerCallbackQuery(query.callbackQueryId, 'Session set');
         await agent.tgBot.sendText(
           query.chatId,
@@ -2979,9 +3003,9 @@ ${hbContent}`;
 
       case 'delete': {
         const sessionId = query.data;
-        // Kill process if it's running this session
-        if (agent.ccProcess?.sessionId === sessionId) {
-          this.killAgentProcess(agentId);
+        // Kill process if this chat is running this session
+        if (cs.ccProcess?.sessionId === sessionId) {
+          this.killChatProcess(agentId, query.chatId);
         }
         await agent.tgBot.answerCallbackQuery(query.callbackQueryId, 'Session cleared');
         await agent.tgBot.sendText(query.chatId, `Session <code>${escapeHtml(sessionId.slice(0, 8))}</code> cleared.`, 'HTML');
@@ -2998,7 +3022,7 @@ ${hbContent}`;
         const oldRepoCb = agent.repo;
         this.killAgentProcess(agentId);
         agent.repo = repoPath;
-        agent.pendingSessionId = null;
+        this.sessionStore.clearSessionForChat(agentId, query.chatId);
         this.sessionStore.setRepo(agentId, repoPath);
         await agent.tgBot.answerCallbackQuery(query.callbackQueryId, `Repo: ${repoName}`);
         await agent.tgBot.sendText(query.chatId, `<blockquote>Repo set to <code>${escapeHtml(shortenRepoPath(repoPath))}</code>. Session cleared.</blockquote>`, 'HTML');
@@ -3078,8 +3102,8 @@ ${hbContent}`;
           await agent.tgBot.answerCallbackQuery(query.callbackQueryId, 'Pick options above');
           break;
         }
-        if (agent.ccProcess) {
-          agent.ccProcess.respondToPermission(requestId, true);
+        if (cs.ccProcess) {
+          cs.ccProcess.respondToPermission(requestId, true);
         }
         agent.pendingPermissions.delete(requestId);
         await agent.tgBot.answerCallbackQuery(query.callbackQueryId, '✅ Allowed');
@@ -3093,8 +3117,8 @@ ${hbContent}`;
           await agent.tgBot.answerCallbackQuery(query.callbackQueryId, 'Permission expired');
           break;
         }
-        if (agent.ccProcess) {
-          agent.ccProcess.respondToPermission(requestId, false);
+        if (cs.ccProcess) {
+          cs.ccProcess.respondToPermission(requestId, false);
         }
         agent.pendingPermissions.delete(requestId);
         await agent.tgBot.answerCallbackQuery(query.callbackQueryId, '❌ Denied');
@@ -3110,7 +3134,7 @@ ${hbContent}`;
           toAllow.push(reqId);
         }
         for (const reqId of toAllow) {
-          if (agent.ccProcess) agent.ccProcess.respondToPermission(reqId, true);
+          if (cs.ccProcess) cs.ccProcess.respondToPermission(reqId, true);
           agent.pendingPermissions.delete(reqId);
         }
         await agent.tgBot.answerCallbackQuery(
@@ -3137,7 +3161,7 @@ ${hbContent}`;
         // Check if all questions are answered
         const allAnswered = questions.every((_, i) => answers[String(i)]?.length);
         if (allAnswered) {
-          if (agent.ccProcess) submitAskAnswer(pending, agent.ccProcess, questions, answers);
+          if (cs.ccProcess) submitAskAnswer(pending, cs.ccProcess, questions, answers);
           agent.pendingPermissions.delete(askReqId);
           // Show confirmation on the message
           if (pending.questionMsgId && pending.questionChatId) {
@@ -3191,7 +3215,7 @@ ${hbContent}`;
         }
         const questions = (pending.input?.questions ?? []) as AskQuestion[];
         const answers = pending.questionAnswers ?? {};
-        if (agent.ccProcess) submitAskAnswer(pending, agent.ccProcess, questions, answers);
+        if (cs.ccProcess) submitAskAnswer(pending, cs.ccProcess, questions, answers);
         agent.pendingPermissions.delete(askReqId);
         if (pending.questionMsgId && pending.questionChatId) {
           const summary = questions.map((q, i) => `<b>${escapeHtml(q.question)}</b>\n→ ${escapeHtml((answers[String(i)] ?? []).join(', ') || '(none)')}`).join('\n\n');
@@ -3229,7 +3253,7 @@ ${hbContent}`;
           await agent.tgBot.answerCallbackQuery(query.callbackQueryId, 'Plan request expired');
           break;
         }
-        if (agent.ccProcess) agent.ccProcess.sendToolResult(toolUseId, 'approved');
+        if (cs.ccProcess) cs.ccProcess.sendToolResult(toolUseId, 'approved');
         agent.pendingPermissions.delete(toolUseId);
         await agent.tgBot.answerCallbackQuery(query.callbackQueryId, '✅ Plan approved');
         break;
@@ -3242,7 +3266,7 @@ ${hbContent}`;
           await agent.tgBot.answerCallbackQuery(query.callbackQueryId, 'Plan request expired');
           break;
         }
-        if (agent.ccProcess) agent.ccProcess.sendToolResult(toolUseId, 'rejected');
+        if (cs.ccProcess) cs.ccProcess.sendToolResult(toolUseId, 'rejected');
         agent.pendingPermissions.delete(toolUseId);
         await agent.tgBot.answerCallbackQuery(query.callbackQueryId, '❌ Plan rejected');
         break;
@@ -3328,9 +3352,13 @@ ${hbContent}`;
       throw new Error(`Unknown agent: ${agentId}`);
     }
 
+    // CLI has no originating chat — fall back to the agent's primary chat.
+    const chatId = this.getAgentChatId(agent);
+    const cs = chatId != null ? getOrCreateChatSession(agent, chatId) : undefined;
+
     // If explicit session requested, set it as pending
-    if (sessionId) {
-      agent.pendingSessionId = sessionId;
+    if (sessionId && cs) {
+      cs.pendingSessionId = sessionId;
     }
 
     // Route through the same sendToCC path as Telegram
@@ -3338,8 +3366,8 @@ ${hbContent}`;
 
     return {
       type: 'ack',
-      sessionId: agent.ccProcess?.sessionId ?? null,
-      state: agent.ccProcess?.state ?? 'idle',
+      sessionId: cs?.ccProcess?.sessionId ?? null,
+      state: cs?.ccProcess?.state ?? 'idle',
     };
   }
 
@@ -3353,12 +3381,13 @@ ${hbContent}`;
       const agent = this.agents.get(id);
       if (!agent) continue;
 
-      const state = agent.ccProcess?.state ?? 'idle';
+      const primaryCs = this.getPrimaryChatSession(agent);
+      const state = primaryCs?.ccProcess?.state ?? 'idle';
 
       agents.push({
         id,
         state,
-        sessionId: agent.ccProcess?.sessionId ?? null,
+        sessionId: primaryCs?.ccProcess?.sessionId ?? null,
         repo: agent.repo,
       });
 
@@ -3574,7 +3603,7 @@ ${hbContent}`;
                 id: aid,
                 repo: a.repo,
                 model: a.model,
-                state: a.ccProcess?.state ?? 'idle',
+                state: this.getPrimaryChatSession(a)?.ccProcess?.state ?? 'idle',
                 ephemeral: a.ephemeral,
                 isSupervisor: aid === this.nativeSupervisorId,
               });
@@ -3591,7 +3620,7 @@ ${hbContent}`;
             for (const [aid, a] of this.agents) {
               if (aid === this.nativeSupervisorId) continue;
               if (targetId && aid !== targetId) continue;
-              const proc = a.ccProcess;
+              const proc = this.getPrimaryChatSession(a)?.ccProcess;
               const agentState = this.sessionStore.getAgent(aid);
               const lastLog = a.eventBuffer.query({ limit: 1, offset: Math.max(0, a.eventBuffer.totalLines - 1) }).lines[0];
               result[aid] = {
@@ -3617,13 +3646,16 @@ ${hbContent}`;
             if (!targetAgent) return { id: request.id, success: false, error: `Unknown agent: ${targetId}` };
             // Implicitly track this worker so its high-signal events are forwarded to supervisor TG
             this.supervisorManager?.track(targetId);
-            if (request.params.newSession) targetAgent.forceNewSession = true;
-            if (request.params.sessionId) targetAgent.pendingSessionId = request.params.sessionId as string;
-            if (request.params.followUp && (!targetAgent.ccProcess || targetAgent.ccProcess.state === 'idle')) {
+            // Agent-level MCP send — operate on the agent's primary chat session.
+            const sendChatId = this.getAgentChatId(targetAgent);
+            const sendCs = sendChatId != null ? getOrCreateChatSession(targetAgent, sendChatId) : undefined;
+            if (request.params.newSession && sendCs) sendCs.forceNewSession = true;
+            if (request.params.sessionId && sendCs) sendCs.pendingSessionId = request.params.sessionId as string;
+            if (request.params.followUp && (!sendCs?.ccProcess || sendCs.ccProcess.state === 'idle')) {
               return { id: request.id, success: false, error: `Agent ${targetId} is not active (followUp=true)` };
             }
             this.sendSupervisorMessage(targetId, text, request.agentId);
-            return { id: request.id, success: true, result: { agentId: targetId, state: targetAgent.ccProcess?.state ?? 'spawning' } };
+            return { id: request.id, success: true, result: { agentId: targetId, state: sendCs?.ccProcess?.state ?? 'spawning' } };
           }
 
           case 'tgcc_kill': {
@@ -3651,6 +3683,10 @@ ${hbContent}`;
             const targetAgent = this.agents.get(targetId);
             if (!targetAgent) return { id: request.id, success: false, error: `Unknown agent: ${targetId}` };
 
+            // Agent-level MCP tool — operate on the agent's primary chat session.
+            const targetChatId = this.getAgentChatId(targetAgent);
+            const targetCs = targetChatId != null ? getOrCreateChatSession(targetAgent, targetChatId) : undefined;
+
             switch (action) {
               case 'list': {
                 const sessions = this.discoverAgentSessions(targetAgent, (request.params.limit as number) ?? 10);
@@ -3658,8 +3694,10 @@ ${hbContent}`;
               }
               case 'new': {
                 this.killAgentProcess(targetId);
-                targetAgent.pendingSessionId = null;
-                targetAgent.forceNewSession = true;
+                if (targetChatId != null) {
+                  this.sessionStore.clearSessionForChat(targetId, targetChatId);
+                  getOrCreateChatSession(targetAgent, targetChatId).forceNewSession = true;
+                }
                 const prompt = request.params.prompt as string | undefined;
                 if (prompt) {
                   this.sendToCC(targetId, { text: prompt });
@@ -3667,7 +3705,7 @@ ${hbContent}`;
                 return { id: request.id, success: true, result: { prompt: prompt ?? null } };
               }
               case 'cancel': {
-                targetAgent.ccProcess?.cancel();
+                targetCs?.ccProcess?.cancel();
                 return { id: request.id, success: true };
               }
               case 'set_model': {
@@ -3680,32 +3718,36 @@ ${hbContent}`;
                 return { id: request.id, success: true, result: { model, previousModel } };
               }
               case 'continue': {
-                const contSession = targetAgent.ccProcess?.sessionId ?? null;
+                const contSession = targetCs?.ccProcess?.sessionId
+                  ?? (targetChatId != null ? this.sessionStore.getSessionForChat(targetId, targetChatId) : undefined)
+                  ?? null;
                 this.killAgentProcess(targetId);
                 let sessionToResume = contSession;
                 if (!sessionToResume && targetAgent.repo) {
                   const discovered = this.discoverAgentSessions(targetAgent, 1);
                   if (discovered.length > 0) sessionToResume = discovered[0].id;
                 }
-                if (sessionToResume) {
-                  targetAgent.pendingSessionId = sessionToResume;
+                if (sessionToResume && targetChatId != null) {
+                  getOrCreateChatSession(targetAgent, targetChatId).pendingSessionId = sessionToResume;
                 }
-                return { id: request.id, success: true, result: { sessionId: targetAgent.pendingSessionId ?? null } };
+                return { id: request.id, success: true, result: { sessionId: sessionToResume } };
               }
               case 'resume': {
                 const sessionId = request.params.sessionId as string;
                 if (!sessionId) return { id: request.id, success: false, error: 'sessionId is required' };
                 this.killAgentProcess(targetId);
-                targetAgent.pendingSessionId = sessionId;
-                return { id: request.id, success: true, result: { pendingSessionId: targetAgent.pendingSessionId } };
+                if (targetChatId != null) {
+                  getOrCreateChatSession(targetAgent, targetChatId).pendingSessionId = sessionId;
+                }
+                return { id: request.id, success: true, result: { pendingSessionId: sessionId } };
               }
               case 'compact': {
-                if (!targetAgent.ccProcess || targetAgent.ccProcess.state !== 'active') {
+                if (!targetCs?.ccProcess || targetCs.ccProcess.state !== 'active') {
                   return { id: request.id, success: false, error: 'No active CC process to compact' };
                 }
                 const instructions = request.params.instructions as string | undefined;
                 const compactMsg = instructions ? `/compact ${instructions}` : '/compact';
-                targetAgent.ccProcess.sendMessage(createTextMessage(compactMsg));
+                targetCs.ccProcess.sendMessage(createTextMessage(compactMsg));
                 return { id: request.id, success: true, result: { sent: true } };
               }
               case 'set_repo': {
@@ -3714,7 +3756,7 @@ ${hbContent}`;
                 const previousRepo = targetAgent.repo ?? '';
                 const repoPath = resolveRepoPath(this.config.repos, repo);
                 targetAgent.repo = repoPath;
-                targetAgent.pendingSessionId = null;
+                if (targetChatId != null) this.sessionStore.clearSessionForChat(targetId, targetChatId);
                 this.sessionStore.setRepo(targetId, repoPath);
                 this.killAgentProcess(targetId);
                 return { id: request.id, success: true, result: { repo: repoPath, previousRepo } };
@@ -3790,19 +3832,10 @@ ${hbContent}`;
               repo,
               model: ephemeralConfig.defaults.model,
               chatSessions: new Map(),
-              ccProcess: null,
-              accumulator: null,
-              subAgentTracker: null,
-              batcher: null,
               pendingPermissions: new Map(),
       pendingExecApprovals: new Map(),
-              typingInterval: null,
-              typingChatId: null,
       lastTgChatId: null,
       lastTgUserId: null,
-              pendingSessionId: null,
-              forceNewSession: true,
-              pendingIdeAwareness: false,
               destroyTimer: null,
               eventBuffer: new EventBuffer(),
               awaitingAskCleanup: false,
@@ -3811,7 +3844,6 @@ ${hbContent}`;
               lastSendData: null,
               claudeConfigDir: undefined,
               pendingCliTmuxAgent: null,
-              cliSessionId: null,
             };
 
             // Auto-destroy timer
@@ -4059,20 +4091,21 @@ ${hbContent}`;
         }
       }
 
-      // TG tools (need chatId and tgBot)
+      // TG tools (need chatId and tgBot) — agent-level fallback to the primary chat.
       const chatId = this.getAgentChatId(agent);
       if (!chatId || !agent.tgBot) {
         return { id: request.id, success: false, error: `No chat ID for agent: ${request.agentId}` };
       }
+      const toolCs = getChatSession(agent, chatId);
 
       switch (request.tool) {
         case 'send_file':
-          if (agent.accumulator) { await agent.accumulator.flushIfDirty(); agent.accumulator.reset(); }
+          if (toolCs?.accumulator) { await toolCs.accumulator.flushIfDirty(); toolCs.accumulator.reset(); }
           await agent.tgBot.sendFile(chatId, request.params.path, request.params.caption);
           return { id: request.id, success: true };
 
         case 'send_image':
-          if (agent.accumulator) { await agent.accumulator.flushIfDirty(); agent.accumulator.reset(); }
+          if (toolCs?.accumulator) { await toolCs.accumulator.flushIfDirty(); toolCs.accumulator.reset(); }
           await agent.tgBot.sendImage(chatId, request.params.path, request.params.caption);
           return { id: request.id, success: true };
 
@@ -4081,7 +4114,7 @@ ${hbContent}`;
           return { id: request.id, success: true };
 
         case 'send_voice':
-          if (agent.accumulator) { await agent.accumulator.flushIfDirty(); agent.accumulator.reset(); }
+          if (toolCs?.accumulator) { await toolCs.accumulator.flushIfDirty(); toolCs.accumulator.reset(); }
           await agent.tgBot.sendVoice(chatId, request.params.path, request.params.caption);
           return { id: request.id, success: true };
 
@@ -4160,9 +4193,10 @@ ${hbContent}`;
     const agent = this.agents.get(agentId);
     if (!agent) throw new Error(`Unknown agent: ${agentId}`);
 
-    // Kill any active stdin CC — CLI always wins on attach
-    if (agent.ccProcess) {
-      this.logger.info({ agentId, sessionId: agent.ccProcess.sessionId }, 'CLI attach: yanking stdin CC');
+    // Kill any active stdin CC across all chats — CLI always wins on attach
+    const hadProcess = [...agent.chatSessions.values()].some(c => c.ccProcess);
+    if (hadProcess) {
+      this.logger.info({ agentId }, 'CLI attach: yanking stdin CC');
       this.killAgentProcess(agentId);
       const tgChatId = this.getAgentChatId(agent);
       if (tgChatId && agent.tgBot) {
@@ -4200,16 +4234,20 @@ ${hbContent}`;
         // Update typing indicator based on CLI state
         if (state === 'thinking' && agent.tgBot && agent.lastTgChatId) {
           this.startTypingIndicator(agent, agent.lastTgChatId);
-        } else if (state === 'idle') {
-          this.stopTypingIndicator(agent);
+        } else if (state === 'idle' && agent.lastTgChatId) {
+          this.stopTypingIndicator(agent, agent.lastTgChatId);
         }
         break;
       }
       case 'session': {
         const sessionId = data.sessionId as string;
-        agent.cliSessionId = sessionId;
+        // CLI has no originating chat — track on the agent's primary chat session.
+        const cliChatId = this.getAgentChatId(agent);
+        if (cliChatId != null) {
+          getOrCreateChatSession(agent, cliChatId).cliSessionId = sessionId;
+          this.sessionStore.setSessionForChat(agentId, cliChatId, sessionId);
+        }
         this.sessionStore.updateLastActivity(agentId);
-        this.sessionStore.setLastSessionId(agentId, sessionId);
         this.logger.info({ agentId, sessionId }, 'CLI session tracked');
         break;
       }
@@ -4220,9 +4258,11 @@ ${hbContent}`;
     const agent = this.agents.get(agentId);
     if (!agent) return;
 
-    this.logger.info({ agentId, cliSessionId: agent.cliSessionId }, 'CLI session detached');
-    agent.cliSessionId = null;
-    this.stopTypingIndicator(agent);
+    const detachChatId = this.getAgentChatId(agent);
+    const detachCs = detachChatId != null ? getChatSession(agent, detachChatId) : undefined;
+    this.logger.info({ agentId, cliSessionId: detachCs?.cliSessionId }, 'CLI session detached');
+    if (detachCs) detachCs.cliSessionId = null;
+    if (detachChatId != null) this.stopTypingIndicator(agent, detachChatId);
 
     // Notify TG
     if (agent.tgBot && agent.lastTgChatId) {
@@ -4273,19 +4313,10 @@ ${hbContent}`;
           repo,
           model: ephemeralConfig.defaults.model,
           chatSessions: new Map(),
-          ccProcess: null,
-          accumulator: null,
-          subAgentTracker: null,
-          batcher: null,
           pendingPermissions: new Map(),
       pendingExecApprovals: new Map(),
-          typingInterval: null,
-          typingChatId: null,
       lastTgChatId: null,
       lastTgUserId: null,
-          pendingSessionId: null,
-          forceNewSession: false,
-          pendingIdeAwareness: false,
           destroyTimer: null,
           eventBuffer: new EventBuffer(),
           awaitingAskCleanup: false,
@@ -4294,7 +4325,6 @@ ${hbContent}`;
       lastSendData: null,
       claudeConfigDir: undefined,
       pendingCliTmuxAgent: null,
-      cliSessionId: null,
         };
 
         // Auto-destroy timer
@@ -4341,26 +4371,29 @@ ${hbContent}`;
         // Auto-subscribe supervisor
         this.supervisorSubscriptions.add(`${agentId}:*`);
 
+        // Agent-level supervisor message — route to the agent's primary chat session.
+        const smChatId = this.getAgentChatId(agent);
+        const smCs = smChatId != null ? getChatSession(agent, smChatId) : undefined;
+
         // For persistent agents: route supervisor message through the accumulator so it
         // appears inline in the current bubble. Fall back to a standalone silent message
         // if no accumulator is active or the previous turn is already sealed (agent idle).
-        if (agent.accumulator && !agent.accumulator.sealed) {
-          agent.accumulator.addSupervisorMessage(text);
+        if (smCs?.accumulator && !smCs.accumulator.sealed) {
+          smCs.accumulator.addSupervisorMessage(text);
         } else {
-          const tgChatId = this.getAgentChatId(agent);
-          if (tgChatId && agent.tgBot) {
+          if (smChatId != null && agent.tgBot) {
             const preview = text.length > 500 ? text.slice(0, 500) + '…' : text;
-            agent.tgBot.sendText(tgChatId, `<blockquote>🦞 ${escapeHtml(preview)}</blockquote>`, 'HTML', true) // silent
+            agent.tgBot.sendText(smChatId, `<blockquote>🦞 ${escapeHtml(preview)}</blockquote>`, 'HTML', true) // silent
               .catch(err => this.logger.error({ err, agentId }, 'Failed to send supervisor TG notification'));
           }
         }
 
-        // Send to agent's single CC process
+        // Send to the agent's primary chat CC process
         this.sendToCC(agentId, { text }, { spawnSource: 'supervisor' });
 
         return {
-          sessionId: agent.ccProcess?.sessionId ?? null,
-          state: agent.ccProcess?.state ?? 'spawning',
+          sessionId: smCs?.ccProcess?.sessionId ?? null,
+          state: smCs?.ccProcess?.state ?? 'spawning',
           subscribed: true,
         };
       }
@@ -4373,11 +4406,13 @@ ${hbContent}`;
         const agent = this.agents.get(agentId);
         if (!agent) throw new Error(`Unknown agent: ${agentId}`);
 
-        if (!agent.ccProcess || agent.ccProcess.state === 'idle') {
+        const stcChatId = this.getAgentChatId(agent);
+        const stcCs = stcChatId != null ? getChatSession(agent, stcChatId) : undefined;
+        if (!stcCs?.ccProcess || stcCs.ccProcess.state === 'idle') {
           throw new Error(`No active CC process for agent ${agentId}`);
         }
 
-        agent.ccProcess.sendMessage(createTextMessage(text));
+        stcCs.ccProcess.sendMessage(createTextMessage(text));
         return { sent: true };
       }
 
@@ -4413,15 +4448,16 @@ ${hbContent}`;
           const agent = this.agents.get(id);
           if (!agent) continue;
 
-          const state = agent.ccProcess?.state ?? 'idle';
-          const sessionId = agent.ccProcess?.sessionId ?? null;
+          const statusCs = this.getPrimaryChatSession(agent);
+          const state = statusCs?.ccProcess?.state ?? 'idle';
+          const sessionId = statusCs?.ccProcess?.sessionId ?? null;
 
           agents.push({
             id,
             type: agent.ephemeral ? 'ephemeral' : 'persistent',
             state,
             repo: agent.repo,
-            process: agent.ccProcess ? { sessionId, model: agent.model } : null,
+            process: statusCs?.ccProcess ? { sessionId, model: agent.model } : null,
             supervisorSubscribed: this.isSupervisorSubscribed(id, sessionId),
           });
         }
@@ -4436,7 +4472,7 @@ ${hbContent}`;
         const agent = this.agents.get(agentId);
         if (!agent) throw new Error(`Unknown agent: ${agentId}`);
 
-        const killed = agent.ccProcess != null && agent.ccProcess.state !== 'idle';
+        const killed = !this.agentIsIdle(agentId);
         if (killed) {
           this.killAgentProcess(agentId);
         }
@@ -4483,8 +4519,13 @@ ${hbContent}`;
         }
 
         const allow = decision === 'allow';
-        if (agent.ccProcess) {
-          agent.ccProcess.respondToPermission(permissionRequestId, allow);
+        // Permission belongs to a specific chat — use the question's chat if recorded,
+        // else fall back to the agent's primary chat.
+        const permCs = pending.questionChatId != null
+          ? getChatSession(agent, pending.questionChatId)
+          : this.getPrimaryChatSession(agent);
+        if (permCs?.ccProcess) {
+          permCs.ccProcess.respondToPermission(permissionRequestId, allow);
         }
         agent.pendingPermissions.delete(permissionRequestId);
 
@@ -4499,8 +4540,12 @@ ${hbContent}`;
         const agent = this.agents.get(agentId);
         if (!agent) throw new Error(`Unknown agent: ${agentId}`);
         this.killAgentProcess(agentId);
-        agent.pendingSessionId = null;
-        agent.forceNewSession = true;
+        // Agent-level — pin a fresh session on the agent's primary chat.
+        const snChatId = this.getAgentChatId(agent);
+        if (snChatId != null) {
+          this.sessionStore.clearSessionForChat(agentId, snChatId);
+          getOrCreateChatSession(agent, snChatId).forceNewSession = true;
+        }
         return { cleared: true };
       }
 
@@ -4509,17 +4554,20 @@ ${hbContent}`;
         if (!agentId) throw new Error('Missing agentId');
         const agent = this.agents.get(agentId);
         if (!agent) throw new Error(`Unknown agent: ${agentId}`);
-        const contSession = agent.ccProcess?.sessionId ?? null;
+        const scChatId = this.getAgentChatId(agent);
+        const contSession = (scChatId != null ? getChatSession(agent, scChatId)?.ccProcess?.sessionId : null)
+          ?? (scChatId != null ? this.sessionStore.getSessionForChat(agentId, scChatId) : undefined)
+          ?? null;
         this.killAgentProcess(agentId);
         let sessionToResume = contSession;
         if (!sessionToResume && agent.repo) {
           const discovered = this.discoverAgentSessions(agent, 1);
           if (discovered.length > 0) sessionToResume = discovered[0].id;
         }
-        if (sessionToResume) {
-          agent.pendingSessionId = sessionToResume;
+        if (sessionToResume && scChatId != null) {
+          getOrCreateChatSession(agent, scChatId).pendingSessionId = sessionToResume;
         }
-        return { sessionId: agent.pendingSessionId ?? null };
+        return { sessionId: sessionToResume };
       }
 
       case 'session_resume': {
@@ -4530,8 +4578,11 @@ ${hbContent}`;
         const agent = this.agents.get(agentId);
         if (!agent) throw new Error(`Unknown agent: ${agentId}`);
         this.killAgentProcess(agentId);
-        agent.pendingSessionId = sessionId;
-        return { pendingSessionId: agent.pendingSessionId };
+        const srChatId = this.getAgentChatId(agent);
+        if (srChatId != null) {
+          getOrCreateChatSession(agent, srChatId).pendingSessionId = sessionId;
+        }
+        return { pendingSessionId: sessionId };
       }
 
       case 'session_list': {
@@ -4540,7 +4591,7 @@ ${hbContent}`;
         const agent = this.agents.get(agentId);
         if (!agent) throw new Error(`Unknown agent: ${agentId}`);
         const limit = (params.limit as number | undefined) ?? 10;
-        const currentSessionId = agent.ccProcess?.sessionId ?? null;
+        const currentSessionId = this.getPrimaryChatSession(agent)?.ccProcess?.sessionId ?? null;
         const discovered = this.discoverAgentSessions(agent, limit);
         const sessions = discovered.map(d => ({
           id: d.id,
@@ -4579,7 +4630,8 @@ ${hbContent}`;
         const previousRepo = agent.repo ?? '';
         const repoPath = resolveRepoPath(this.config.repos, repo);
         agent.repo = repoPath;
-        agent.pendingSessionId = null;
+        const srpChatId = this.getAgentChatId(agent);
+        if (srpChatId != null) this.sessionStore.clearSessionForChat(agentId, srpChatId);
         this.sessionStore.setRepo(agentId, repoPath);
         this.killAgentProcess(agentId);
         return { repo: repoPath, previousRepo };
@@ -4594,9 +4646,10 @@ ${hbContent}`;
           this.ctlServer.sendToCliSocket(agentId, { type: 'cli_cancel' });
           return { cancelled: true };
         }
-        const cancelled = agent.ccProcess?.state === 'active';
+        const ctCs = this.getPrimaryChatSession(agent);
+        const cancelled = ctCs?.ccProcess?.state === 'active';
         if (cancelled) {
-          agent.ccProcess!.cancel();
+          ctCs!.ccProcess!.cancel();
         }
         return { cancelled };
       }
@@ -4606,12 +4659,13 @@ ${hbContent}`;
         if (!agentId) throw new Error('Missing agentId');
         const agent = this.agents.get(agentId);
         if (!agent) throw new Error(`Unknown agent: ${agentId}`);
-        if (!agent.ccProcess || agent.ccProcess.state !== 'active') {
+        const cmpCs = this.getPrimaryChatSession(agent);
+        if (!cmpCs?.ccProcess || cmpCs.ccProcess.state !== 'active') {
           throw new Error('No active CC process to compact');
         }
         const instructions = params.instructions as string | undefined;
         const compactMsg = instructions ? `/compact ${instructions}` : '/compact';
-        agent.ccProcess.sendMessage(createTextMessage(compactMsg));
+        cmpCs.ccProcess.sendMessage(createTextMessage(compactMsg));
         return { sent: true };
       }
 
@@ -4644,7 +4698,7 @@ ${hbContent}`;
     if (agent) {
       agent.eventBuffer.push({ ts: Date.now(), type: 'system', text: `State changed: ${field} → ${newValue}` });
     }
-    if (this.isSupervisorSubscribed(agentId, agent?.ccProcess?.sessionId ?? null)) {
+    if (this.isSupervisorSubscribed(agentId, this.agentPrimarySessionId(agentId))) {
       this.sendToSupervisor({
         type: 'event',
         event: 'state_changed',
@@ -4788,8 +4842,8 @@ ${hbContent}`;
     const ralphId = opts.ralphIdOverride ?? `ralph-${randomUUID().slice(0, 8)}`;
     if (this.agents.has(ralphId)) return { ralphId: '', error: 'Ralph ID collision — try again' };
 
-    // Gather context
-    const proc = targetAgent.ccProcess;
+    // Gather context — ralph watches the agent, use its primary chat's CC process.
+    const proc = this.getPrimaryChatSession(targetAgent)?.ccProcess;
     const status = {
       state: proc?.state ?? 'idle',
       model: targetAgent.model,
@@ -4831,19 +4885,10 @@ ${hbContent}`;
       repo: targetAgent.repo,
       model: 'sonnet',
       chatSessions: new Map(),
-      ccProcess: null,
-      accumulator: null,
-      subAgentTracker: null,
-      batcher: null,
       pendingPermissions: new Map(),
       pendingExecApprovals: new Map(),
-      typingInterval: null,
-      typingChatId: null,
       lastTgChatId: null,
       lastTgUserId: null,
-      pendingSessionId: null,
-      forceNewSession: true,
-      pendingIdeAwareness: false,
       destroyTimer: null,
       eventBuffer: new EventBuffer(),
       awaitingAskCleanup: false,
@@ -4852,7 +4897,6 @@ ${hbContent}`;
       lastSendData: null,
       claudeConfigDir: undefined,
       pendingCliTmuxAgent: null,
-      cliSessionId: null,
     };
 
     // Auto-destroy timeout (default 2 hours)
