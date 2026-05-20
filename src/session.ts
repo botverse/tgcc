@@ -21,9 +21,12 @@ export interface AgentState {
   model: string;
   permissionMode: string;
   lastActivity: string;
-  /** Most recent CC session ID owned by TGCC — used to resume the right session,
-   *  avoiding accidental pickup of sessions created by `claude` CLI in the same project. */
+  /** @deprecated Most recent CC session ID owned by TGCC. Superseded by sessionsByChat;
+   *  kept for migration and as a fallback for agents that predate per-chat sessions. */
   lastSessionId?: string;
+  /** chatId → CC session ID. Each Telegram chat tracks its own session so multiple
+   *  people DMing the same bot resume separate conversations. */
+  sessionsByChat?: Record<string, string>;
 }
 
 /** Old format for migration detection */
@@ -86,6 +89,9 @@ export class SessionStore {
               permissionMode: a.permissionMode ?? '',
               lastActivity: a.lastActivity ?? new Date().toISOString(),
               ...(typeof a.lastSessionId === 'string' ? { lastSessionId: a.lastSessionId } : {}),
+              ...(a.sessionsByChat && typeof a.sessionsByChat === 'object'
+                ? { sessionsByChat: { ...(a.sessionsByChat as Record<string, string>) } }
+                : {}),
             };
           } else {
             // Unknown format, skip
@@ -164,6 +170,29 @@ export class SessionStore {
     const agent = this.ensureAgent(agentId);
     agent.lastSessionId = sessionId;
     this.save();
+  }
+
+  /** Get the CC session a specific chat should resume, if one is tracked. */
+  getSessionForChat(agentId: string, chatId: number): string | undefined {
+    const agent = this.ensureAgent(agentId);
+    return agent.sessionsByChat?.[String(chatId)];
+  }
+
+  /** Record the CC session a chat is now on, so its next message resumes it. */
+  setSessionForChat(agentId: string, chatId: number, sessionId: string): void {
+    const agent = this.ensureAgent(agentId);
+    if (!agent.sessionsByChat) agent.sessionsByChat = {};
+    agent.sessionsByChat[String(chatId)] = sessionId;
+    this.save();
+  }
+
+  /** Forget a chat's tracked session (e.g. /new before a fresh session is assigned). */
+  clearSessionForChat(agentId: string, chatId: number): void {
+    const agent = this.ensureAgent(agentId);
+    if (agent.sessionsByChat) {
+      delete agent.sessionsByChat[String(chatId)];
+      this.save();
+    }
   }
 
   getFullState(): StateStore {

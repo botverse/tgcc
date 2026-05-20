@@ -98,6 +98,39 @@ interface PendingExecApproval {
   chatId?: number;
 }
 
+/**
+ * Per-chat session state. Each Telegram chat talking to an agent gets its own
+ * CC process, accumulator and session tracking, so multiple people DMing the
+ * same bot never collapse onto a shared conversation.
+ */
+interface ChatSession {
+  chatId: number;
+  ccProcess: ICCProcess | null;
+  accumulator: StreamAccumulator | null;
+  subAgentTracker: SubAgentTracker | null;
+  batcher: MessageBatcher | null;
+  typingInterval: ReturnType<typeof setInterval> | null;
+  pendingSessionId: string | null;         // for /resume: sessionId to use on next spawn
+  forceNewSession: boolean;                // /new was used — don't auto-continue on next spawn
+  pendingIdeAwareness: boolean;            // resuming a session that was active in an IDE
+  cliSessionId: string | null;             // active CC sessionId inside an attached CLI session
+}
+
+function createChatSession(chatId: number): ChatSession {
+  return {
+    chatId,
+    ccProcess: null,
+    accumulator: null,
+    subAgentTracker: null,
+    batcher: null,
+    typingInterval: null,
+    pendingSessionId: null,
+    forceNewSession: false,
+    pendingIdeAwareness: false,
+    cliSessionId: null,
+  };
+}
+
 interface AgentInstance {
   id: string;
   config: AgentConfig;
@@ -105,6 +138,7 @@ interface AgentInstance {
   ephemeral: boolean;
   repo: string;                            // resolved repo path (from config or /repo command)
   model: string;                           // resolved model (from config or /model command)
+  chatSessions: Map<number, ChatSession>;  // chatId → per-chat CC process + session state
   ccProcess: ICCProcess | null; // single CC process per agent
   accumulator: StreamAccumulator | null;   // single accumulator per agent
   subAgentTracker: SubAgentTracker | null; // single tracker per agent
@@ -127,6 +161,21 @@ interface AgentInstance {
   claudeConfigDir: string | undefined; // isolated CLAUDE_CONFIG_DIR for docker agents
   pendingCliTmuxAgent: string | null; // waiting for tmux session name reply from /new-cli
   cliSessionId: string | null; // active CC sessionId inside an attached CLI session (reported via cli_event 'session')
+}
+
+/** Look up a chat's session state, or undefined if that chat has never messaged. */
+function getChatSession(agent: AgentInstance, chatId: number): ChatSession | undefined {
+  return agent.chatSessions.get(chatId);
+}
+
+/** Look up a chat's session state, creating an empty one if absent. */
+function getOrCreateChatSession(agent: AgentInstance, chatId: number): ChatSession {
+  let cs = agent.chatSessions.get(chatId);
+  if (!cs) {
+    cs = createChatSession(chatId);
+    agent.chatSessions.set(chatId, cs);
+  }
+  return cs;
 }
 
 interface SupervisorPendingRequest {
@@ -695,6 +744,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
       ephemeral: false,
       repo: agentState.repo || configDefaults.repo,
       model: agentState.model || configDefaults.model,
+      chatSessions: new Map(),
       ccProcess: null,
       accumulator: null,
       subAgentTracker: null,
@@ -3739,6 +3789,7 @@ ${hbContent}`;
               ephemeral: true,
               repo,
               model: ephemeralConfig.defaults.model,
+              chatSessions: new Map(),
               ccProcess: null,
               accumulator: null,
               subAgentTracker: null,
@@ -4221,6 +4272,7 @@ ${hbContent}`;
           ephemeral: true,
           repo,
           model: ephemeralConfig.defaults.model,
+          chatSessions: new Map(),
           ccProcess: null,
           accumulator: null,
           subAgentTracker: null,
@@ -4778,6 +4830,7 @@ ${hbContent}`;
       ephemeral: true,
       repo: targetAgent.repo,
       model: 'sonnet',
+      chatSessions: new Map(),
       ccProcess: null,
       accumulator: null,
       subAgentTracker: null,
