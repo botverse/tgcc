@@ -1426,12 +1426,16 @@ ${hbContent}`;
     if (!sessionId && !forceNew) {
       sessionId = this.sessionStore.getSessionForChat(agentId, chatId);
     }
-    // Lock check: if our chosen sessionId is being actively written by some other process
-    // (e.g. you started `claude` in a terminal on the same project), don't yank it —
-    // spawn a fresh session instead and notify the TG chat.
     if (sessionId) {
       const jsonlPath = getSessionJsonlPath(sessionId, this.agentSessionRepo(agent), agent.claudeConfigDir);
-      if (isSessionExternallyActive(sessionId, jsonlPath)) {
+      if (!existsSync(jsonlPath)) {
+        // Tracked session's JSONL is gone (deleted, or never persisted) — start fresh.
+        this.logger.info({ agentId, chatId, sessionId }, 'Tracked session JSONL missing — starting fresh');
+        sessionId = undefined;
+      } else if (isSessionExternallyActive(sessionId, jsonlPath)) {
+        // Lock check: the session is being actively written by some other process
+        // (e.g. you started `claude` in a terminal on the same project) — don't yank it,
+        // spawn a fresh session instead and notify the TG chat.
         this.logger.info({ agentId, sessionId }, 'Session externally active — spawning fresh instead of resuming');
         if (agent.tgBot) {
           agent.tgBot.sendText(chatId, '<blockquote>📎 Detected active <code>claude</code> on this project — starting fresh session for TG.</blockquote>', 'HTML', true)
