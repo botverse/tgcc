@@ -3630,6 +3630,11 @@ ${hbContent}`;
               const proc = this.getPrimaryChatSession(a)?.ccProcess;
               const agentState = this.sessionStore.getAgent(aid);
               const lastLog = a.eventBuffer.query({ limit: 1, offset: Math.max(0, a.eventBuffer.totalLines - 1) }).lines[0];
+              const chats = [...a.chatSessions.values()].map(cs => ({
+                chatId: cs.chatId,
+                sessionId: cs.ccProcess?.sessionId ?? null,
+                state: cs.ccProcess?.state ?? 'idle',
+              }));
               result[aid] = {
                 state: proc?.state ?? 'idle',
                 sessionId: proc?.sessionId ?? null,
@@ -3641,6 +3646,7 @@ ${hbContent}`;
                 sessionCost: this.highSignalDetector.getSessionCost(aid),
                 contextPct: this.highSignalDetector.getContextPercent(aid),
                 tracked: this.supervisorManager?.isTracked(aid) ?? false,
+                chats,
               };
             }
             return { id: request.id, success: true, result };

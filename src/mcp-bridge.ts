@@ -40,8 +40,11 @@ export class McpBridgeServer extends EventEmitter {
     this.logger = logger;
   }
 
-  /** Start listening on a socket path for a specific agent-user pair */
+  /** Start listening on a socket path for a specific agent-user pair.
+   *  Idempotent — the socket is per-agent and shared by all its per-chat CC
+   *  processes, so repeated spawns must reuse the existing server. */
   listen(socketPath: string): void {
+    if (this.servers.has(socketPath)) return;
     // Clean up stale socket
     if (existsSync(socketPath)) {
       unlinkSync(socketPath);
