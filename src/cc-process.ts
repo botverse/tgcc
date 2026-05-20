@@ -66,6 +66,8 @@ export function hasActiveChildren(pid: number | undefined): boolean {
 export interface CCProcessOptions {
   agentId: string;
   userId: string;
+  /** Telegram chat this CC process belongs to (one CC process per chat per agent). */
+  chatId: number;
   ccBinaryPath: string;
   userConfig: CCUserConfig;
   mcpConfigPath?: string;
@@ -131,6 +133,7 @@ function parseShellArgs(s: string): string[] {
 export interface ICCProcess extends EventEmitter {
   readonly agentId: string;
   readonly userId: string;
+  readonly chatId: number;
   readonly state: ProcessState;
   readonly ccActivity: CCActivityState;
   readonly sessionId: string | null;
@@ -157,6 +160,7 @@ export interface ICCProcess extends EventEmitter {
 export class CCProcess extends EventEmitter implements ICCProcess {
   readonly agentId: string;
   readonly userId: string;
+  readonly chatId: number;
 
   private process: ChildProcess | null = null;
   private _state: ProcessState = 'idle';
@@ -183,6 +187,7 @@ export class CCProcess extends EventEmitter implements ICCProcess {
     super();
     this.agentId = options.agentId;
     this.userId = options.userId;
+    this.chatId = options.chatId;
     this.options = options;
     this.logger = options.logger
       ? options.logger.child({ agentId: options.agentId, userId: options.userId })

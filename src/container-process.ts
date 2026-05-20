@@ -63,6 +63,8 @@ type RelayInbound =
 export interface ContainerCCProcessOptions {
   agentId: string;
   userId: string;
+  /** Telegram chat this CC process belongs to (one CC process per chat per agent). */
+  chatId: number;
   socketPath: string;
   userConfig: CCUserConfig;
   mcpConfigPath?: string;
@@ -77,6 +79,7 @@ export interface ContainerCCProcessOptions {
 export class ContainerCCProcess extends EventEmitter implements ICCProcess {
   readonly agentId: string;
   readonly userId: string;
+  readonly chatId: number;
 
   private socket: Socket | null = null;
   private _state: ProcessState = 'idle';
@@ -104,6 +107,7 @@ export class ContainerCCProcess extends EventEmitter implements ICCProcess {
     super();
     this.agentId = options.agentId;
     this.userId = options.userId;
+    this.chatId = options.chatId;
     this.options = options;
     this.logger = options.logger
       ? options.logger.child({ agentId: options.agentId, userId: options.userId, container: true })
