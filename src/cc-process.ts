@@ -87,6 +87,7 @@ export function generateMcpConfig(
   mcpServerPath: string,
   capabilities: string[] = [],
   mcpConfigDir = '/tmp/tgcc',
+  chatId?: number,
 ): string {
   const config = {
     mcpServers: {
@@ -99,6 +100,7 @@ export function generateMcpConfig(
           TGCC_AGENT_ID: agentId,
           TGCC_USER_ID: userId,
           TGCC_SOCKET: join(socketDir, `${agentId}-${userId}.sock`),
+          ...(chatId != null ? { TGCC_CHAT_ID: String(chatId) } : {}),
           ...(capabilities.length > 0 ? { TGCC_CAPABILITIES: capabilities.join(',') } : {}),
         },
       },
@@ -106,7 +108,7 @@ export function generateMcpConfig(
   };
 
   if (!existsSync(mcpConfigDir)) mkdirSync(mcpConfigDir, { recursive: true });
-  const configPath = join(mcpConfigDir, `mcp-${agentId}-${userId}.json`);
+  const configPath = join(mcpConfigDir, `mcp-${agentId}-${userId}${chatId != null ? `-${chatId}` : ''}.json`);
   writeFileSync(configPath, JSON.stringify(config));
   return configPath;
 }

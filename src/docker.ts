@@ -277,6 +277,7 @@ export function generateContainerMcpConfig(
   userId: string,
   mcpConfigDir: string,
   additionalServers?: Record<string, { command: string; args: string[]; env?: Record<string, string> }>,
+  chatId?: number,
 ): string {
   const config: Record<string, unknown> = {
     mcpServers: {
@@ -288,6 +289,7 @@ export function generateContainerMcpConfig(
           TGCC_USER_ID: userId,
           // Socket path inside the container (mounted from host)
           TGCC_SOCKET: `/run/tgcc/${agentId}-${userId}.sock`,
+          ...(chatId != null ? { TGCC_CHAT_ID: String(chatId) } : {}),
         },
       },
       ...additionalServers,
@@ -295,7 +297,7 @@ export function generateContainerMcpConfig(
   };
 
   mkdirSync(mcpConfigDir, { recursive: true });
-  const configPath = join(mcpConfigDir, `mcp-${agentId}-${userId}.json`);
+  const configPath = join(mcpConfigDir, `mcp-${agentId}-${userId}${chatId != null ? `-${chatId}` : ''}.json`);
   writeFileSync(configPath, JSON.stringify(config));
   return configPath;
 }

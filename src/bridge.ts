@@ -1476,6 +1476,8 @@ ${hbContent}`;
         agentId,
         agentId,
         claudeConfigDir,
+        undefined,
+        chatId,
       );
 
       // Ensure the container is running (syncs auth, mounts repo + dist + sockets)
@@ -1516,6 +1518,7 @@ ${hbContent}`;
         mcpServerPath,
         this.getAgentCapabilities(agentId),
         this.config.global.mcpConfigDir,
+        chatId,
       );
 
       proc = new CCProcess({
@@ -4095,8 +4098,9 @@ ${hbContent}`;
         }
       }
 
-      // TG tools (need chatId and tgBot) — agent-level fallback to the primary chat.
-      const chatId = this.getAgentChatId(agent);
+      // TG tools (need chatId and tgBot) — route to the calling CC process's chat
+      // (TGCC_CHAT_ID), falling back to the primary chat for agent-level callers.
+      const chatId = request.chatId ?? this.getAgentChatId(agent);
       if (!chatId || !agent.tgBot) {
         return { id: request.id, success: false, error: `No chat ID for agent: ${request.agentId}` };
       }

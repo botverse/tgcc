@@ -9,12 +9,13 @@ import { McpBridgeClient, type McpToolRequest } from './mcp-bridge.js';
 
 const AGENT_ID = process.env.TGCC_AGENT_ID ?? 'unknown';
 const USER_ID = process.env.TGCC_USER_ID ?? 'unknown';
+const CHAT_ID = process.env.TGCC_CHAT_ID ? Number(process.env.TGCC_CHAT_ID) : undefined;
 const SOCKET_PATH = process.env.TGCC_SOCKET ?? '/tmp/tgcc/sockets/default.sock';
 const CAPABILITIES = new Set((process.env.TGCC_CAPABILITIES ?? '').split(',').filter(Boolean));
 const hasCap = (cap: string): boolean => CAPABILITIES.has('*') || CAPABILITIES.has(cap);
 
 async function main(): Promise<void> {
-  const client = new McpBridgeClient(SOCKET_PATH);
+  const client = new McpBridgeClient(SOCKET_PATH, CHAT_ID);
 
   try {
     await client.connect();

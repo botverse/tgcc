@@ -11,6 +11,8 @@ export interface McpToolRequest {
   tool: string;
   agentId: string;
   userId: string;
+  /** Originating Telegram chat — set so per-chat CC processes route tool output to the right chat. */
+  chatId?: number;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   params: Record<string, any>;
 }
@@ -124,13 +126,15 @@ export class McpBridgeServer extends EventEmitter {
 
 export class McpBridgeClient {
   private socketPath: string;
+  private chatId: number | undefined;
   private socket: Socket | null = null;
   private pendingRequests = new Map<string, { resolve: (r: McpToolResponse) => void; reject: (e: Error) => void }>();
   private buffer = '';
   private connected = false;
 
-  constructor(socketPath: string) {
+  constructor(socketPath: string, chatId?: number) {
     this.socketPath = socketPath;
+    this.chatId = chatId;
   }
 
   async connect(): Promise<void> {
@@ -208,6 +212,7 @@ export class McpBridgeClient {
         reject: (e) => { clearTimeout(timer); reject(e); },
       });
 
+      if (this.chatId != null && request.chatId == null) request.chatId = this.chatId;
       this.socket!.write(JSON.stringify(request) + '\n');
     });
   }
