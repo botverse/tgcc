@@ -205,6 +205,9 @@ export class TelegramBot {
       role: existing?.role,
       lastSeen: Date.now(),
     });
+    if (!existing) {
+      this.logger.info({ chatId, userId: from.id, firstName: from.first_name, lastName: from.last_name, username: from.username }, 'New group member seen');
+    }
   }
 
   /** Bootstrap group roster by fetching admins from the TG API. */

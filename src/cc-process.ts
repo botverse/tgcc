@@ -21,6 +21,7 @@ import {
   createInitializeRequest,
   createPermissionResponse,
 } from './cc-protocol.js';
+import { acquireSessionLock, releaseSessionLock } from './session-lock.js';
 
 // ── Inline config types (decoupled from ./config for library use) ──
 
@@ -343,6 +344,7 @@ export class CCProcess extends EventEmitter implements ICCProcess {
         if (event.subtype === 'init') {
           this._sessionId = event.session_id;
           this._state = 'active';
+          acquireSessionLock(event.session_id, this.agentId);
           this.emit('stateChange', 'active');
           this.emit('init', event);
           this.flushQueue();
@@ -717,6 +719,7 @@ export class CCProcess extends EventEmitter implements ICCProcess {
     this._stateBeforeExit = this._state;
     this._activityBeforeExit = this._ccActivity;
     this._killedBeforeExit = this._killedByUs;
+    if (this._sessionId) releaseSessionLock(this._sessionId);
     this._state = 'idle';
     this._ccActivity = 'idle';
     this._killedByUs = false;

@@ -300,6 +300,18 @@ function isSidechainSession(jsonlPath: string): boolean {
   }
 }
 
+/** Read just the session title (derived from first user message) without scanning for model. */
+export function readSessionTitle(jsonlPath: string): string | null {
+  if (!existsSync(jsonlPath)) return null;
+  try {
+    const st = statSync(jsonlPath);
+    const { title } = extractSessionMeta(jsonlPath, st.size);
+    return title && title !== 'untitled' ? title : null;
+  } catch {
+    return null;
+  }
+}
+
 function extractSessionMeta(jsonlPath: string, fileSize: number): { title: string; model: string | null } {
   let title = 'untitled';
   let model: string | null = null;

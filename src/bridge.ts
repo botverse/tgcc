@@ -39,7 +39,9 @@ import {
   hasIDEContent,
   computeProjectSlug,
   extractRecentConversation,
+  readSessionTitle,
 } from './session.js';
+import { isSessionExternallyActive } from './session-lock.js';
 import {
   CtlServer,
   type CtlHandler,
@@ -319,6 +321,8 @@ export class Bridge extends EventEmitter implements CtlHandler {
   private supervisorSubscriptions = new Set<string>(); // "agentId:sessionId" or "agentId:*"
   private suppressExitForProcess = new Set<string>(); // sessionIds where takeover suppresses exit event
   private supervisorPendingRequests = new Map<string, SupervisorPendingRequest>();
+  /** Cache of session-id → derived title (read from JSONL on first turn-complete per session). */
+  private sessionTitleCache = new Map<string, string | null>();
 
   constructor(config: TgccConfig, logger?: pino.Logger) {
     super();
@@ -451,6 +455,20 @@ export class Bridge extends EventEmitter implements CtlHandler {
   /** The effective repo path for session discovery (container agents use a different path). */
   private agentSessionRepo(agent: AgentInstance): string {
     return agent.claudeConfigDir ? '/home/project' : agent.repo;
+  }
+
+  /** Format ` · {sid8}` or ` · {sid8} "{title}"` for blockquote suffixes. Empty if no session. */
+  private formatSessionTag(agent: AgentInstance): string {
+    const sid = agent.ccProcess?.sessionId;
+    if (!sid) return '';
+    const short = sid.slice(0, 8);
+    let title = this.sessionTitleCache.get(sid);
+    if (title === undefined) {
+      const jsonlPath = getSessionJsonlPath(sid, this.agentSessionRepo(agent), agent.claudeConfigDir);
+      title = readSessionTitle(jsonlPath);
+      this.sessionTitleCache.set(sid, title);
+    }
+    return title ? ` · ${short} "${title}"` : ` · ${short}`;
   }
 
   /** Discover CC sessions for an agent, using the correct config dir and repo slug. */
@@ -1328,6 +1346,21 @@ ${hbContent}`;
     if (!sessionId && !forceNew && isRecent && agentState.lastSessionId) {
       sessionId = agentState.lastSessionId;
     }
+    // Lock check: if our chosen sessionId is being actively written by some other process
+    // (e.g. you started `claude` in a terminal on the same project), don't yank it —
+    // spawn a fresh session instead and notify the TG chat.
+    if (sessionId) {
+      const jsonlPath = getSessionJsonlPath(sessionId, this.agentSessionRepo(agent), agent.claudeConfigDir);
+      if (isSessionExternallyActive(sessionId, jsonlPath)) {
+        this.logger.info({ agentId, sessionId }, 'Session externally active — spawning fresh instead of resuming');
+        const chatId = this.getAgentChatId(agent);
+        if (chatId && agent.tgBot) {
+          agent.tgBot.sendText(chatId, '<blockquote>📎 Detected active <code>claude</code> on this project — starting fresh session for TG.</blockquote>', 'HTML', true)
+            .catch(err => this.logger.warn({ err }, 'Failed to send external-session notification'));
+        }
+        sessionId = undefined;
+      }
+    }
     const continueSession = !forceNew && !!sessionId;
 
     // Start MCP socket listener for this agent (bridge-side, receives tool calls from CC's MCP client)
@@ -2088,7 +2121,8 @@ ${hbContent}`;
 
     // Route turn-complete to native supervisor (routine — errors escalate via result error path)
     const cost = event.total_cost_usd ? ` · $${event.total_cost_usd.toFixed(4)}` : '';
-    this.pushSupervisorEvent(agentId, `${event.is_error ? '❌' : '✅'} Turn complete${cost}`, false, false, 'routine');
+    const sessionTag = this.formatSessionTag(agent);
+    this.pushSupervisorEvent(agentId, `${event.is_error ? '❌' : '✅'} Turn complete${cost}${sessionTag}`, false, false, 'routine');
 
     // Route to EventRouter → watchers (ralph) + future consumers
     this.eventRouter.routeLifecycle({
