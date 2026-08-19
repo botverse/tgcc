@@ -7,7 +7,7 @@ import { homedir } from 'node:os';
 import { execSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import type { CtlRequest, CtlResponse, CtlCliAttachedResponse, CtlCliInjectCommand, CtlCliKillCommand, CtlCliCancelCommand } from './ctl-server.js';
-import { loadConfig, agentForRepo, CONFIG_PATH, updateConfig, isValidRepoName, findRepoOwner, type TgccConfig } from './config.js';
+import { loadConfig, agentForRepo, CONFIG_PATH, updateConfig, isValidRepoName, findRepoOwner, expandPath, type TgccConfig } from './config.js';
 
 const CTL_DIR = '/tmp/tgcc/ctl';
 
@@ -472,12 +472,14 @@ function cmdRepoAdd(args: string[]): void {
 
   if (positional.length === 1) {
     // tgcc repo add <path-or-.> [--name=...]
-    repoPath = resolve(positional[0]);
+    repoPath = expandPath(positional[0]);
     name = flags.name || repoPath.split('/').pop() || 'default';
   } else if (positional.length >= 2) {
     // tgcc repo add <name> <path> (original syntax)
     name = positional[0];
-    repoPath = positional[1];
+    // Expand `~`/resolve to absolute — the filesystem never expands `~`, so a raw
+    // `~/foo` fails existsSync and would break the CC spawn cwd if stored.
+    repoPath = expandPath(positional[1]);
   } else {
     console.error('Usage: tgcc repo add <path> [--name=<name>]');
     console.error('       tgcc repo add <name> <path>');
@@ -1054,13 +1056,26 @@ function cmdLogs(): void {
 // ── Attach (interactive CLI session) ──
 
 async function cmdAttach(args: string[]): Promise<void> {
-  // All flags pass through to CC unchanged — TGCC must not shadow CC's native flags
-  // (--agent, --resume, --session, --dangerously-skip-permissions, etc).
-  // The TGCC agent is resolved from cwd via config; no --agent override.
-  const passthroughArgs = [...args];
+  // Extract `--agent <id>` for TGCC's own use; everything else is forwarded to CC.
+  // CC's native flags (--resume, --session, --dangerously-skip-permissions, etc.)
+  // still pass through unchanged.
+  let explicitAgent: string | undefined;
+  const passthroughArgs: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--agent' && i + 1 < args.length) {
+      explicitAgent = args[i + 1];
+      i++;
+      continue;
+    }
+    if (args[i].startsWith('--agent=')) {
+      explicitAgent = args[i].slice('--agent='.length);
+      continue;
+    }
+    passthroughArgs.push(args[i]);
+  }
 
   const config = loadConfigSafe();
-  const agentId = resolveAgent(undefined, config);
+  const agentId = resolveAgent(explicitAgent, config);
   const agentConfig = config.agents[agentId];
   const repo = agentConfig.defaults.repo ?? process.cwd();
   const ccBinaryPath = config.global.ccBinaryPath ?? 'claude';

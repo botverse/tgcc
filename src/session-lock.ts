@@ -44,33 +44,45 @@ export function releaseSessionLock(sessionId: string): void {
 }
 
 /**
- * Decide whether a session is being actively used by a process OTHER than this TGCC process.
+ * Decide whether a session is being actively used by a process OTHER than this TGCC agent.
  * Returns true if it looks like an interactive `claude` session is currently writing to the JSONL.
  *
  * Signal combo:
- *   - No lock from us with a live pid → we're not the owner
+ *   - No lock owned by this tgcc agent
  *   - AND JSONL was written within recentWindowMs → SOMEONE is actively writing
  *   → assume external owner (interactive claude in a terminal). Don't resume.
+ *
+ * A lock whose `agentId` matches ours always means the session is ours — either the
+ * current process or a previous instance from before a restart. Its pid may be dead
+ * (restart) but the recent JSONL writes were TGCC's own, not an external `claude`.
  */
 export function isSessionExternallyActive(
   sessionId: string,
   jsonlPath: string,
+  agentId: string,
   recentWindowMs = 60_000,
 ): boolean {
-  // Check if a lock from THIS tgcc process exists and is live
+  // Check the lock file for this session.
   try {
     const p = lockPath(sessionId);
     if (existsSync(p)) {
       const lock = JSON.parse(readFileSync(p, 'utf-8')) as SessionLock;
-      if (lock.pid === process.pid && pidAlive(lock.pid)) {
-        return false; // we own it, safe
+      // A lock owned by THIS tgcc agent means the session is ours — current process or
+      // a previous instance before a restart. Either way it's safe to resume; never
+      // treat our own session as externally owned (this is the post-restart case).
+      if (lock.agentId === agentId) {
+        return false;
       }
-      // Other-pid lock: if that pid is alive, treat as another tgcc instance? Unlikely with
-      // systemd-managed single instance. Fall through to mtime check.
+      // Lock owned by a different agent with a live pid → genuinely in use elsewhere.
+      if (pidAlive(lock.pid)) {
+        return true;
+      }
+      // Stale lock from another agent (dead pid) → fall through to the mtime check.
     }
   } catch { /* fall through */ }
 
-  // No live lock from us — check JSONL recency
+  // No lock we recognize — an interactive `claude` in a terminal leaves no lock file,
+  // so a recently-written JSONL means someone external is actively using it.
   try {
     if (!existsSync(jsonlPath)) return false;
     const st = statSync(jsonlPath);

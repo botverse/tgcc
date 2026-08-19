@@ -1,6 +1,6 @@
 import { spawn, execSync, type ChildProcess } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import { writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { writeFileSync, readFileSync, mkdirSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { EventEmitter } from 'node:events';
 import type pino from 'pino';
@@ -21,7 +21,7 @@ import {
   createInitializeRequest,
   createPermissionResponse,
 } from './cc-protocol.js';
-import { acquireSessionLock, releaseSessionLock } from './session-lock.js';
+import { acquireSessionLock } from './session-lock.js';
 
 // ── Inline config types (decoupled from ./config for library use) ──
 
@@ -88,24 +88,44 @@ export function generateMcpConfig(
   capabilities: string[] = [],
   mcpConfigDir = '/tmp/tgcc',
   chatId?: number,
+  repo?: string,
 ): string {
-  const config = {
-    mcpServers: {
-      tgcc: {
-        command: mcpServerPath.endsWith('.ts') ? 'tsx' : 'node',
-        args: mcpServerPath.endsWith('.ts')
-          ? ['--import', 'tsx/esm', mcpServerPath]
-          : [mcpServerPath],
-        env: {
-          TGCC_AGENT_ID: agentId,
-          TGCC_USER_ID: userId,
-          TGCC_SOCKET: join(socketDir, `${agentId}-${userId}.sock`),
-          ...(chatId != null ? { TGCC_CHAT_ID: String(chatId) } : {}),
-          ...(capabilities.length > 0 ? { TGCC_CAPABILITIES: capabilities.join(',') } : {}),
-        },
-      },
+  const tgccServer = {
+    command: mcpServerPath.endsWith('.ts') ? 'tsx' : 'node',
+    args: mcpServerPath.endsWith('.ts')
+      ? ['--import', 'tsx/esm', mcpServerPath]
+      : [mcpServerPath],
+    env: {
+      TGCC_AGENT_ID: agentId,
+      TGCC_USER_ID: userId,
+      TGCC_SOCKET: join(socketDir, `${agentId}-${userId}.sock`),
+      ...(chatId != null ? { TGCC_CHAT_ID: String(chatId) } : {}),
+      ...(capabilities.length > 0 ? { TGCC_CAPABILITIES: capabilities.join(',') } : {}),
     },
   };
+
+  const mcpServers: Record<string, unknown> = {};
+
+  // Fold the repo's own `.mcp.json` servers (e.g. a project-specific MCP server) into
+  // the config we pass via `--mcp-config`. `claude` does NOT reliably load a project
+  // `.mcp.json` in non-interactive `-p` mode — it needs prior approval, and that
+  // approval state lives in the volatile ~/.claude.json — whereas servers in an
+  // explicit `--mcp-config` file always load. This keeps project MCP servers available
+  // and survives ~/.claude.json being reset.
+  if (repo) {
+    try {
+      const repoMcpPath = join(repo, '.mcp.json');
+      if (existsSync(repoMcpPath)) {
+        const parsed = JSON.parse(readFileSync(repoMcpPath, 'utf-8')) as { mcpServers?: Record<string, unknown> };
+        if (parsed.mcpServers) Object.assign(mcpServers, parsed.mcpServers);
+      }
+    } catch { /* malformed .mcp.json — skip it, keep the tgcc server only */ }
+  }
+
+  // Added last so the tgcc server always wins over any repo server also named "tgcc".
+  mcpServers.tgcc = tgccServer;
+
+  const config = { mcpServers };
 
   if (!existsSync(mcpConfigDir)) mkdirSync(mcpConfigDir, { recursive: true });
   const configPath = join(mcpConfigDir, `mcp-${agentId}-${userId}${chatId != null ? `-${chatId}` : ''}.json`);
@@ -726,7 +746,12 @@ export class CCProcess extends EventEmitter implements ICCProcess {
     this._stateBeforeExit = this._state;
     this._activityBeforeExit = this._ccActivity;
     this._killedBeforeExit = this._killedByUs;
-    if (this._sessionId) releaseSessionLock(this._sessionId);
+    // Intentionally do NOT release the session lock here. The lock is a persistent
+    // ownership marker — it lets a future TGCC restart recognize the session as
+    // ours via `isSessionExternallyActive`'s agentId check. Without it, the mtime
+    // fallback false-positives on JSONL writes WE made before exiting and we
+    // spuriously "Detect active claude — starting fresh session" within 60s of any
+    // clean CC exit (e.g. /restart followed by a quick user message).
     this._state = 'idle';
     this._ccActivity = 'idle';
     this._killedByUs = false;

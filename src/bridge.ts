@@ -11,7 +11,7 @@ import type {
   CronJobConfig,
 } from './config.js';
 import type { ApiErrorEvent, PermissionRequest, ToolResultEvent, TaskStartedEvent, TaskProgressEvent, TaskCompletedEvent, CompactBoundaryEvent } from './cc-protocol.js';
-import { resolveUserConfig, resolveRepoPath, updateConfig, isValidRepoName, findRepoOwner } from './config.js';
+import { resolveUserConfig, resolveRepoPath, updateConfig, isValidRepoName, findRepoOwner, expandPath } from './config.js';
 import { CCProcess, generateMcpConfig, type ICCProcess } from './cc-process.js';
 import { ContainerCCProcess } from './container-process.js';
 import { ensureContainer, generateContainerClaudeMd, generateContainerMcpConfig } from './docker.js';
@@ -36,6 +36,7 @@ import {
   discoverCCSessions,
   DiscoveredSession,
   getSessionJsonlPath,
+  getSessionEndState,
   hasIDEContent,
   computeProjectSlug,
   extractRecentConversation,
@@ -561,7 +562,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
     }).catch(err => this.logger.error({ err, jobId: job.id }, 'Failed to spawn isolated cron agent'));
   }
 
-  // ── Whisper transcription ──
+  // Whisper transcription
 
   private async resolveWhisperBin(): Promise<string | null> {
     if (this.whisperBin !== undefined) return this.whisperBin;
@@ -681,6 +682,51 @@ export class Bridge extends EventEmitter implements CtlHandler {
       if (!agent.repo) continue;
 
       try {
+        // Prefer per-chat tracked sessions (state.json) over JSONL-mtime discovery.
+        // Picking by mtime is wrong here: other JSONLs in the same project dir
+        // (subagents, ralph, a CLI session, a forked session) routinely outrank the
+        // chat's actual session, and after one wrong pick `init` overwrites the
+        // chat's tracking in state.json — the original session is lost forever.
+        const agentState = this.sessionStore.getAgent(agentId);
+        const tracked = Object.entries(agentState.sessionsByChat ?? {});
+
+        let resumedAnyChat = false;
+        for (const [chatIdStr, sessionId] of tracked) {
+          const chatId = Number(chatIdStr);
+          const jsonlPath = getSessionJsonlPath(sessionId, this.agentSessionRepo(agent), agent.claudeConfigDir);
+          if (!existsSync(jsonlPath)) {
+            this.logger.info({ agentId, chatId, sessionId }, 'Auto-resume: tracked JSONL missing — clearing tracking');
+            this.sessionStore.clearSessionForChat(agentId, chatId);
+            continue;
+          }
+          const st = statSync(jsonlPath);
+          const ageMs = now - st.mtimeMs;
+          if (ageMs > STALE_MS) {
+            this.logger.info({ agentId, chatId, sessionId, ageMs }, 'Auto-resume: tracked session too old — skipping');
+            continue;
+          }
+          const endState = getSessionEndState(jsonlPath, st.size);
+
+          const cs = getOrCreateChatSession(agent, chatId);
+          cs.pendingSessionId = sessionId;
+          cs.forceNewSession = false;
+          resumedAnyChat = true;
+
+          this.logger.info({ agentId, chatId, sessionId, endState, ageMs }, 'Auto-resume: tracked session prepared');
+
+          if (endState === 'interrupted') {
+            this.logger.info({ agentId, chatId, sessionId }, 'Auto-resume: sending nudge for interrupted tracked session');
+            this.sendToCC(agentId, {
+              text: wrapSystemReminder('TGCC restarted while you were mid-turn. Your previous session has been resumed. Continue where you left off.'),
+            }, { chatId });
+          }
+        }
+
+        if (resumedAnyChat) continue;
+
+        // Fallback: no per-chat tracking yet (first run after upgrade, or chat
+        // never produced an `init` event). Discover the newest JSONL and pin it
+        // to the agent's primary chat — best-effort only.
         const sessions = this.discoverAgentSessions(agent, 1);
         if (sessions.length === 0) continue;
 
@@ -691,8 +737,6 @@ export class Bridge extends EventEmitter implements CtlHandler {
           continue;
         }
 
-        // Set up session resume for next interaction on the agent's primary chat.
-        // No originating chat at startup, so fall back to getAgentChatId.
         const resumeChatId = this.getAgentChatId(agent);
         if (resumeChatId == null) {
           this.logger.info({ agentId, sessionId: session.id }, 'Auto-resume: no chat to attach session — skipping');
@@ -702,13 +746,13 @@ export class Bridge extends EventEmitter implements CtlHandler {
         cs.pendingSessionId = session.id;
         cs.forceNewSession = false;
 
-        this.logger.info({ agentId, sessionId: session.id, endState: session.endState, ageMs }, 'Auto-resume: session prepared');
+        this.logger.info({ agentId, sessionId: session.id, endState: session.endState, ageMs }, 'Auto-resume: fallback session prepared (no per-chat tracking)');
 
         if (session.endState === 'interrupted') {
           this.logger.info({ agentId, sessionId: session.id }, 'Auto-resume: sending nudge for interrupted session');
           this.sendToCC(agentId, {
             text: wrapSystemReminder('TGCC restarted while you were mid-turn. Your previous session has been resumed. Continue where you left off.'),
-          });
+          }, { chatId: resumeChatId });
         }
       } catch (err) {
         this.logger.error({ err, agentId }, 'Auto-resume failed for agent');
@@ -993,7 +1037,7 @@ ${hbContent}`;
             const askProc = pending.questionChatId != null
               ? getChatSession(agent, pending.questionChatId)?.ccProcess
               : undefined;
-            if (askProc) submitAskAnswer(pending, askProc, questions, answers);
+            this.submitAskAnswer(agentId, pending, askProc ?? null, questions, answers);
             agent.pendingPermissions.delete(reqId);
             if (pending.questionMsgId && pending.questionChatId) {
               const summary = questions.map((q, i) => `<b>${escapeHtml(q.question)}</b>\n→ ${escapeHtml(answers[String(i)]?.[0] ?? '')}`).join('\n\n');
@@ -1021,9 +1065,10 @@ ${hbContent}`;
         agent.tgBot?.sendText(msg.chatId, '<blockquote>Invalid session name. Use alphanumeric characters only.</blockquote>', 'HTML').catch(() => {});
         return;
       }
-      const tgccBin = process.argv[1] ?? 'tgcc';
+      // Use the system-installed `tgcc` binary (in PATH) — NOT `process.argv[1]`,
+      // which is the relative non-executable `dist/cli.js` under systemd.
       try {
-        execSync(`tmux new-session -d -s ${JSON.stringify(tmuxName)} "${tgccBin} attach --agent ${targetAgent}"`, { stdio: 'ignore' });
+        execSync(`tmux new-session -d -s ${JSON.stringify(tmuxName)} "tgcc attach --agent ${targetAgent}"`, { stdio: 'ignore' });
         agent.tgBot?.sendText(
           msg.chatId,
           `<blockquote>CLI session created in new tmux session <code>${escapeHtml(tmuxName)}</code>.\nAttach: <code>tmux attach -t ${escapeHtml(tmuxName)}</code></blockquote>`,
@@ -1266,7 +1311,68 @@ ${hbContent}`;
       acc.reset();
     }
 
+    // User wrote again instead of clicking an AskUserQuestion keyboard — discard
+    // the pending question so CC unblocks and processes this new turn. Must go
+    // out BEFORE the new user message: deny is a control_response, the message
+    // is a user input — both hit stdin, order is preserved by the stream.
+    this.cancelPendingAskUserQuestions(agent, chatId, proc);
+
     proc.sendMessage(ccMsg);
+  }
+
+  /**
+   * Deliver AskUserQuestion answers back to the worker.
+   *
+   * Three paths:
+   *  - `can_use_tool` permission flow (no toolUseId): we must reply via the live
+   *    process's `control_response` channel — there's no fallback if the process
+   *    is gone, the request just expires.
+   *  - `requiresUserInteraction=true` tool-result flow (has toolUseId): CC rejected
+   *    the tool before we could respond, so the answer is delivered as a fresh user
+   *    turn. Use `sendToCC` so it spawns the worker if it had exited between the
+   *    question being posted and the user tapping the keyboard.
+   */
+  private submitAskAnswer(
+    agentId: string,
+    pending: PendingPermission,
+    proc: ICCProcess | null,
+    questions: AskQuestion[],
+    answers: Record<string, string[]>,
+  ): void {
+    if (!pending.toolUseId) {
+      if (proc) {
+        const builtAnswers = buildAskAnswers(questions, answers);
+        proc.respondToPermission(pending.requestId, true, { questions, answers: builtAnswers });
+      } else {
+        this.logger.warn({ agentId, reqId: pending.requestId }, 'AskUserQuestion permission expired — no live CC to respond to');
+      }
+      return;
+    }
+    const text = buildAskAnswerText(questions, answers);
+    const chatId = pending.questionChatId ?? this.getAgentChatId(this.agents.get(agentId)!);
+    if (chatId == null) {
+      this.logger.warn({ agentId, reqId: pending.requestId }, 'AskUserQuestion answer has no chat to route to — dropping');
+      return;
+    }
+    this.sendToCC(agentId, { text }, { chatId, spawnSource: 'telegram' });
+  }
+
+  /**
+   * Cancel any pending AskUserQuestion for this chat by denying the permission
+   * request and editing the keyboard message to show it was discarded.
+   */
+  private cancelPendingAskUserQuestions(agent: AgentInstance, chatId: number, proc: ICCProcess): void {
+    for (const [reqId, pending] of agent.pendingPermissions) {
+      if (pending.toolName !== 'AskUserQuestion') continue;
+      if (pending.questionChatId !== chatId) continue;
+      proc.respondToPermission(reqId, false);
+      agent.pendingPermissions.delete(reqId);
+      if (pending.questionMsgId && pending.questionChatId && agent.tgBot) {
+        agent.tgBot.editText(pending.questionChatId, pending.questionMsgId, '❌ Question discarded — you wrote again.', 'HTML')
+          .catch(err => this.logger.warn({ err, reqId }, 'Failed to mark discarded AskUserQuestion'));
+      }
+      this.logger.info({ agentId: agent.id, chatId, reqId }, 'Cancelled pending AskUserQuestion — user wrote again');
+    }
   }
 
   // ── Process cleanup helper ──
@@ -1428,14 +1534,21 @@ ${hbContent}`;
     }
     if (sessionId) {
       const jsonlPath = getSessionJsonlPath(sessionId, this.agentSessionRepo(agent), agent.claudeConfigDir);
+      // If state.json's sessionsByChat tracks this session for THIS agent/chat,
+      // it's ours — skip the externally-active check entirely. The lock-based
+      // check is a safety net for unknown sessions; for tracked ones it just
+      // false-positives whenever we lost the lock (clean exit before the lock
+      // was made persistent, etc.).
+      const tracked = this.sessionStore.getSessionForChat(agentId, chatId);
+      const knownOurs = tracked === sessionId;
       if (!existsSync(jsonlPath)) {
         // Tracked session's JSONL is gone (deleted, or never persisted) — start fresh.
         this.logger.info({ agentId, chatId, sessionId }, 'Tracked session JSONL missing — starting fresh');
         sessionId = undefined;
-      } else if (isSessionExternallyActive(sessionId, jsonlPath)) {
-        // Lock check: the session is being actively written by some other process
-        // (e.g. you started `claude` in a terminal on the same project) — don't yank it,
-        // spawn a fresh session instead and notify the TG chat.
+      } else if (!knownOurs && isSessionExternallyActive(sessionId, jsonlPath, agentId)) {
+        // Unknown sessionId (came from pendingSessionId, not from our state) and
+        // something else is actively writing the JSONL → assume an interactive
+        // `claude` in a terminal owns it and start fresh instead of yanking.
         this.logger.info({ agentId, sessionId }, 'Session externally active — spawning fresh instead of resuming');
         if (agent.tgBot) {
           agent.tgBot.sendText(chatId, '<blockquote>📎 Detected active <code>claude</code> on this project — starting fresh session for TG.</blockquote>', 'HTML', true)
@@ -1519,6 +1632,7 @@ ${hbContent}`;
         this.getAgentCapabilities(agentId),
         this.config.global.mcpConfigDir,
         chatId,
+        agent.repo,
       );
 
       proc = new CCProcess({
@@ -2554,11 +2668,14 @@ ${hbContent}`;
         if (repoSub === 'add') {
           // /repo add <name> <path>
           const repoName = repoArgs[1];
-          const repoAddPath = repoArgs[2];
-          if (!repoName || !repoAddPath) {
+          if (!repoName || !repoArgs[2]) {
             await agent.tgBot.sendText(cmd.chatId, '<blockquote>Usage: /repo add &lt;name&gt; &lt;path&gt;</blockquote>', 'HTML');
             break;
           }
+          // Expand `~` and resolve to absolute — the filesystem never expands `~`,
+          // so existsSync('~/foo') always fails and a raw `~` path stored in config
+          // would later break the CC spawn cwd.
+          const repoAddPath = expandPath(repoArgs[2]);
           if (!isValidRepoName(repoName)) {
             await agent.tgBot.sendText(cmd.chatId, '<blockquote>Invalid repo name. Use alphanumeric + hyphens only.</blockquote>', 'HTML');
             break;
@@ -3168,7 +3285,7 @@ ${hbContent}`;
         // Check if all questions are answered
         const allAnswered = questions.every((_, i) => answers[String(i)]?.length);
         if (allAnswered) {
-          if (cs.ccProcess) submitAskAnswer(pending, cs.ccProcess, questions, answers);
+          this.submitAskAnswer(agentId, pending, cs.ccProcess, questions, answers);
           agent.pendingPermissions.delete(askReqId);
           // Show confirmation on the message
           if (pending.questionMsgId && pending.questionChatId) {
@@ -3222,7 +3339,7 @@ ${hbContent}`;
         }
         const questions = (pending.input?.questions ?? []) as AskQuestion[];
         const answers = pending.questionAnswers ?? {};
-        if (cs.ccProcess) submitAskAnswer(pending, cs.ccProcess, questions, answers);
+        this.submitAskAnswer(agentId, pending, cs.ccProcess, questions, answers);
         agent.pendingPermissions.delete(askReqId);
         if (pending.questionMsgId && pending.questionChatId) {
           const summary = questions.map((q, i) => `<b>${escapeHtml(q.question)}</b>\n→ ${escapeHtml((answers[String(i)] ?? []).join(', ') || '(none)')}`).join('\n\n');
@@ -3316,9 +3433,10 @@ ${hbContent}`;
       case 'cli-tmux': {
         // User picked an existing tmux session — open a new window
         const [targetAgent, tmuxSession] = query.data.split(':', 2);
-        const tgccBin = process.argv[1] ?? 'tgcc';
+        // Use the system-installed `tgcc` binary (in PATH) — NOT `process.argv[1]`,
+        // which is the relative non-executable `dist/cli.js` under systemd.
         try {
-          execSync(`tmux new-window -t ${JSON.stringify(tmuxSession)} "${tgccBin} attach --agent ${targetAgent}"`, { stdio: 'ignore' });
+          execSync(`tmux new-window -t ${JSON.stringify(tmuxSession)} "tgcc attach --agent ${targetAgent}"`, { stdio: 'ignore' });
           await agent.tgBot.answerCallbackQuery(query.callbackQueryId, 'CLI window created');
           await agent.tgBot.sendText(
             query.chatId,
@@ -4231,6 +4349,8 @@ ${hbContent}`;
       mcpServerPath,
       [],
       this.config.global.mcpConfigDir,
+      undefined,
+      agent.repo,
     );
 
     this.logger.info({ agentId, mcpConfigPath }, 'CLI session attached');
@@ -5027,32 +5147,21 @@ function buildAskAnswers(
   return result;
 }
 
-/** Submit answers for AskUserQuestion via the correct mechanism. */
-function submitAskAnswer(
-  pending: PendingPermission,
-  proc: ICCProcess,
+/** Build the user-turn text that injects AskUserQuestion answers. */
+function buildAskAnswerText(
   questions: AskQuestion[],
   answers: Record<string, string[]>,
-): void {
+): string {
   const builtAnswers = buildAskAnswers(questions, answers);
-  if (pending.toolUseId) {
-    // CC immediately rejects AskUserQuestion in headless mode (requiresUserInteraction=true bypasses
-    // all permission modes and returns an error before the bridge can respond). sendToolResult would
-    // be ignored since CC is no longer waiting. Inject the answer as a new user message turn instead.
-    const answerParts = questions
-      .map((q, i) => {
-        const ans = builtAnswers[String(i)];
-        return ans ? `"${q.question}" → "${ans}"` : null;
-      })
-      .filter((p): p is string => p !== null);
-    const text = answerParts.length > 0
-      ? `User has answered your questions: ${answerParts.join(', ')}. You can now continue with the user's answers in mind.`
-      : 'User declined to answer.';
-    proc.sendMessage(createTextMessage(text));
-  } else {
-    // can_use_tool permission path — send control_response
-    proc.respondToPermission(pending.requestId, true, { questions, answers: builtAnswers });
-  }
+  const answerParts = questions
+    .map((q, i) => {
+      const ans = builtAnswers[String(i)];
+      return ans ? `"${q.question}" → "${ans}"` : null;
+    })
+    .filter((p): p is string => p !== null);
+  return answerParts.length > 0
+    ? `User has answered your questions: ${answerParts.join(', ')}. You can now continue with the user's answers in mind.`
+    : 'User declined to answer.';
 }
 
 // ── Helpers ──

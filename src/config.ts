@@ -1,6 +1,6 @@
 import { readFileSync, writeFileSync, watchFile, unwatchFile, existsSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, dirname } from 'node:path';
+import { join, dirname, resolve } from 'node:path';
 import { EventEmitter } from 'node:events';
 import pino from 'pino';
 
@@ -403,7 +403,9 @@ export function resolveUserConfig(agent: AgentConfig, userId: string): ResolvedU
 
 /** Resolve a repo name or path: if it matches a key in the repos map, return the path; otherwise return as-is. */
 export function resolveRepoPath(repos: Record<string, string>, nameOrPath: string): string {
-  return repos[nameOrPath] ?? nameOrPath;
+  // expandPath both rescues a legacy `~` path stored in config and expands a `~`
+  // the user typed directly (e.g. `/repo ~/foo`). Idempotent on absolute paths.
+  return expandPath(repos[nameOrPath] ?? nameOrPath);
 }
 
 /** Find which agent owns a given repo path (by matching defaults.repo). Returns agentId or null. */
@@ -427,6 +429,19 @@ const REPO_NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9-]*$/;
 
 export function isValidRepoName(name: string): boolean {
   return REPO_NAME_RE.test(name);
+}
+
+/**
+ * Expand a user-supplied path to an absolute one. `~` is a shell construct the
+ * filesystem never expands, so `existsSync('~/foo')` always fails and a raw `~`
+ * path stored in config later breaks spawn/cwd. Expand a leading `~` (bare or
+ * `~/…`) to the home directory, then resolve to absolute. Non-`~` paths are just
+ * resolved. `$HOME`-style env vars are intentionally NOT expanded — only `~`.
+ */
+export function expandPath(p: string): string {
+  if (p === '~') return homedir();
+  if (p.startsWith('~/')) return join(homedir(), p.slice(2));
+  return resolve(p);
 }
 
 /** Find which agent "owns" a repo key (has it as defaults.repo in the raw config). */
