@@ -5,3 +5,10 @@ dist/
 .local/
 /tmp/
 .playwright-mcp/
+
+# Personal WhatsApp voice-note audio used as a real-corpus test fixture for
+# Spanish transcription (see tests/fixtures/audio/README.md, which IS tracked).
+# The audio itself must never be committed — it's real household audio, not
+# synthetic — so ignore everything in the dir except the README.
+tests/fixtures/audio/*
+!tests/fixtures/audio/README.md

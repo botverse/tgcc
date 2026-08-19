@@ -7,7 +7,7 @@ import type { AgentConfig } from './config.js';
 // ── Types ──
 
 export interface TelegramMessage {
-  type: 'text' | 'photo' | 'document' | 'voice' | 'video';
+  type: 'text' | 'photo' | 'document' | 'voice' | 'video' | 'audio' | 'video_note';
   chatId: number;
   userId: string;
   userName?: string;
@@ -19,6 +19,12 @@ export interface TelegramMessage {
   fileName?: string;
   replyToText?: string;
   mediaGroupId?: string;
+  /** base64-encoded bytes — set on voice/audio/video_note for transcription. */
+  audioBase64?: string;
+  /** MIME type for transcription (e.g. "audio/ogg", "audio/mpeg", "video/mp4"). */
+  mimeType?: string;
+  /** Duration in seconds, as reported by Telegram — voice/audio/video_note only. */
+  durationSec?: number;
 }
 
 export interface SlashCommand {
@@ -293,6 +299,12 @@ export class TelegramBot {
 
     // ── Video ──
     this.bot.on('message:video', (ctx) => this.handleVideo(ctx));
+
+    // ── Audio (forwarded music/voice files, distinct from voice notes) ──
+    this.bot.on('message:audio', (ctx) => this.handleAudio(ctx));
+
+    // ── Video notes (round selfie videos) ──
+    this.bot.on('message:video_note', (ctx) => this.handleVideoNote(ctx));
   }
 
   private async handleCallbackQuery(ctx: Context): Promise<void> {
@@ -492,6 +504,11 @@ export class TelegramBot {
       if (!existsSync(this.mediaDir)) mkdirSync(this.mediaDir, { recursive: true });
       writeFileSync(savePath, buffer);
 
+      let replyToText: string | undefined;
+      if (ctx.message?.reply_to_message?.message_id) {
+        replyToText = this.getReplyMap(chatId).get(ctx.message.reply_to_message.message_id);
+      }
+
       this.onMessage({
         type: 'voice',
         chatId,
@@ -501,9 +518,105 @@ export class TelegramBot {
         text: ctx.message?.caption ?? '',
         filePath: savePath,
         fileName,
+        audioBase64: buffer.toString('base64'),
+        mimeType: voice.mime_type,
+        durationSec: voice.duration,
+        replyToText,
       });
     } catch (err) {
       this.logger.error({ err }, 'Failed to handle voice');
+    }
+  }
+
+  private async handleAudio(ctx: Context): Promise<void> {
+    const userId = ctx.from?.id;
+    const chatId = ctx.chat?.id;
+    if (!userId || !chatId) return;
+    if (!this.isAllowed(userId, chatId)) { await this.rejectUnauthorized(ctx, userId, chatId); return; }
+
+    try {
+      const audio = ctx.message?.audio;
+      if (!audio) return;
+
+      const file = await ctx.api.getFile(audio.file_id);
+      const fileUrl = `https://api.telegram.org/file/bot${this.config.botToken}/${file.file_path}`;
+
+      const response = await fetch(fileUrl);
+      const buffer = Buffer.from(await response.arrayBuffer());
+      const ext = extname(audio.file_name ?? file.file_path ?? '') || '.mp3';
+      const fileName = audio.file_name ?? `audio_${Date.now()}${ext}`;
+      const savePath = join(this.mediaDir, fileName);
+
+      if (!existsSync(this.mediaDir)) mkdirSync(this.mediaDir, { recursive: true });
+      writeFileSync(savePath, buffer);
+
+      let replyToText: string | undefined;
+      if (ctx.message?.reply_to_message?.message_id) {
+        replyToText = this.getReplyMap(chatId).get(ctx.message.reply_to_message.message_id);
+      }
+
+      this.onMessage({
+        type: 'audio',
+        chatId,
+        userId: String(userId),
+        userName: TelegramBot.getUserName(ctx),
+        userHandle: ctx.from?.username,
+        text: ctx.message?.caption ?? '',
+        filePath: savePath,
+        fileName,
+        audioBase64: buffer.toString('base64'),
+        mimeType: audio.mime_type,
+        durationSec: audio.duration,
+        replyToText,
+      });
+    } catch (err) {
+      this.logger.error({ err }, 'Failed to handle audio');
+    }
+  }
+
+  private async handleVideoNote(ctx: Context): Promise<void> {
+    const userId = ctx.from?.id;
+    const chatId = ctx.chat?.id;
+    if (!userId || !chatId) return;
+    if (!this.isAllowed(userId, chatId)) { await this.rejectUnauthorized(ctx, userId, chatId); return; }
+
+    try {
+      const videoNote = ctx.message?.video_note;
+      if (!videoNote) return;
+
+      const file = await ctx.api.getFile(videoNote.file_id);
+      const fileUrl = `https://api.telegram.org/file/bot${this.config.botToken}/${file.file_path}`;
+
+      const response = await fetch(fileUrl);
+      const buffer = Buffer.from(await response.arrayBuffer());
+      const fileName = `video_note_${Date.now()}.mp4`;
+      const savePath = join(this.mediaDir, fileName);
+
+      if (!existsSync(this.mediaDir)) mkdirSync(this.mediaDir, { recursive: true });
+      writeFileSync(savePath, buffer);
+
+      let replyToText: string | undefined;
+      if (ctx.message?.reply_to_message?.message_id) {
+        replyToText = this.getReplyMap(chatId).get(ctx.message.reply_to_message.message_id);
+      }
+
+      // video_note carries no mime_type from Telegram — it's always mp4.
+      this.onMessage({
+        type: 'video_note',
+        chatId,
+        userId: String(userId),
+        userName: TelegramBot.getUserName(ctx),
+        userHandle: ctx.from?.username,
+        text: '',
+        filePath: savePath,
+        fileName,
+        audioBase64: buffer.toString('base64'),
+        mimeType: 'video/mp4',
+        durationSec: videoNote.duration,
+        replyToText,
+      });
+    } catch (err) {
+      this.logger.error({ err }, 'Failed to handle video note');
     }
   }
 

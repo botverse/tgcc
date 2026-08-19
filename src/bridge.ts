@@ -63,6 +63,7 @@ import { wrapTeammateMessage, wrapSystemReminder } from './cc-tags.js';
 import { Scheduler, computeOneShotSchedule, parseEveryToCron } from './scheduler.js';
 import { randomUUID } from 'node:crypto';
 import { exec as nodeExec, execSync } from 'node:child_process';
+import { transcribeAudioGemini, buildTranscriptionTurn, type TranscribeResult } from './transcribe.js';
 
 // ── Types ──
 
@@ -170,6 +171,39 @@ function getOrCreateChatSession(agent: AgentInstance, chatId: number): ChatSessi
   return cs;
 }
 
+export interface InboundTextInput {
+  text: string;
+  replyToText?: string;
+  chatId: number;
+  userName?: string;
+  userHandle?: string;
+}
+
+/**
+ * Prepend reply context and, for group chats, sender attribution + roster/groupContext as a
+ * system-reminder. Pure and Bridge-independent (no `agent`/`ChatSession` access) so the
+ * routing behaviour item 4 depends on — voice/audio/video_note transcripts now getting the
+ * same reply-context and group attribution as text — is unit-testable without constructing a
+ * full Bridge instance.
+ */
+export function buildInboundText(input: InboundTextInput, roster: string | null, groupContext: string | undefined): string {
+  let text = input.text;
+  if (input.replyToText) {
+    text = `[Replying to: '${input.replyToText}']\n\n${text}`;
+  }
+  // In group chats (negative chatId), prepend sender identity so CC knows who's talking
+  if (input.chatId < 0 && input.userName) {
+    const tag = input.userHandle ? `${input.userName} (@${input.userHandle})` : input.userName;
+    text = `[${tag}]: ${text}`;
+    // Inject group roster + optional groupContext as system-reminder
+    const contextParts = [roster, groupContext].filter(Boolean);
+    if (contextParts.length > 0) {
+      text = `${wrapSystemReminder(contextParts.join('\n\n'))}\n${text}`;
+    }
+  }
+  return text;
+}
+
 interface SupervisorPendingRequest {
   resolve: (result: unknown) => void;
   reject: (err: Error) => void;
@@ -177,8 +211,14 @@ interface SupervisorPendingRequest {
 }
 
 // ── Message Batcher ──
+//
+// Exported (with a pure constructor: injected windowMs + flush callback, no Bridge/Agent
+// dependency) so it's unit-testable in isolation — in particular the immediate-flush-on-
+// attachment vs 2s-text-window distinction that item 4's routing fix depends on (transcribed
+// voice/audio/video_note deliberately omit filePath/fileName so they use the text window and
+// can coalesce with a fast follow-up message).
 
-interface BatcherMessage {
+export interface BatcherMessage {
   text: string;
   imageBase64?: string;
   imageMediaType?: string;
@@ -187,7 +227,7 @@ interface BatcherMessage {
   mediaGroupId?: string;
 }
 
-interface BatcherOutput {
+export interface BatcherOutput {
   text: string;
   imageBase64?: string;
   imageMediaType?: string;
@@ -196,7 +236,7 @@ interface BatcherOutput {
   fileName?: string;
 }
 
-class MessageBatcher {
+export class MessageBatcher {
   private pending: BatcherMessage[] = [];
   private timer: ReturnType<typeof setTimeout> | null = null;
   private mediaGroupTimer: ReturnType<typeof setTimeout> | null = null;
@@ -606,7 +646,13 @@ export class Bridge extends EventEmitter implements CtlHandler {
     }).catch(err => this.logger.error({ err, jobId: job.id }, 'Failed to spawn isolated cron agent'));
   }
 
-  // Whisper transcription
+  // ── Audio / video transcription ──
+  //
+  // Gemini is the default and only transcription path (no ffmpeg dependency — it takes
+  // audio/video inline; never forces a language, so it works for an EN/ES household).
+  // Whisper is kept as an opt-in fallback only (TGCC_WHISPER_FALLBACK=true), tried only when
+  // Gemini genuinely failed (not when it succeeded with an empty/no-speech transcript), and
+  // never for video_note. See linds.ai-chat/_specs/BACKLOG.md §4.
 
   private async resolveWhisperBin(): Promise<string | null> {
     if (this.whisperBin !== undefined) return this.whisperBin;
@@ -624,34 +670,94 @@ export class Bridge extends EventEmitter implements CtlHandler {
     return null;
   }
 
-  private async transcribeVoice(agentId: string, msg: TelegramMessage): Promise<void> {
-    const agent = this.agents.get(agentId);
-    if (!agent || !msg.filePath || !msg.fileName) return;
+  /** Opt-in Whisper fallback. Returns null if Whisper isn't available or fallback isn't enabled
+   *  (caller keeps the original Gemini failure in that case). Never forces a language — the
+   *  hardcoded `--language en` was the reason this was unfit for an EN/ES household even when
+   *  the binary worked. */
+  private async tryWhisperFallback(filePath: string, fileName: string): Promise<TranscribeResult | null> {
+    if (process.env.TGCC_WHISPER_FALLBACK !== 'true') return null;
 
     const whisper = await this.resolveWhisperBin();
     if (!whisper) {
-      this.logger.warn({ agentId }, 'Whisper not found — forwarding voice file path to CC');
-      this.sendToCC(agentId, { text: msg.text || '', filePath: msg.filePath, fileName: msg.fileName }, { chatId: msg.chatId, spawnSource: 'telegram' });
-      return;
+      this.logger.warn({ filePath }, 'Whisper fallback enabled but binary not found');
+      return null;
     }
 
     const outDir = '/tmp/tgcc/whisper';
-    mkdirSync(outDir, { recursive: true });
+    const model = 'whisper-small';
+    try {
+      mkdirSync(outDir, { recursive: true });
+      const execAsync = promisify(nodeExec);
+      this.logger.info({ filePath }, 'Whisper fallback: transcribing');
+      // 30s cap — matches the Gemini timeout. There was no timeout on this call before, which
+      // could hang a turn indefinitely on a long note.
+      await execAsync(`"${whisper}" "${filePath}" --model small --output_format txt --output_dir "${outDir}"`, { timeout: 30_000 });
 
-    const execAsync = promisify(nodeExec);
-    this.logger.info({ agentId, filePath: msg.filePath }, 'Transcribing voice message');
-    await execAsync(`"${whisper}" "${msg.filePath}" --language en --model small --output_format txt --output_dir "${outDir}"`);
+      const baseName = fileName.replace(/\.[^.]+$/, '');
+      const txtPath = join(outDir, `${baseName}.txt`);
+      if (!existsSync(txtPath)) {
+        return { ok: false, text: null, truncated: false, model, provider: 'whisper', error: 'Whisper output file not found' };
+      }
+      const transcript = readFileSync(txtPath, 'utf-8').trim();
+      return { ok: true, text: transcript || null, truncated: false, model, provider: 'whisper' };
+    } catch (err) {
+      const e = err as Error;
+      this.logger.error({ err: e, filePath }, 'Whisper fallback failed');
+      return { ok: false, text: null, truncated: false, model, provider: 'whisper', error: e.message };
+    }
+  }
 
-    const baseName = msg.fileName.replace(/\.[^.]+$/, '');
-    const txtPath = join(outDir, `${baseName}.txt`);
-    if (!existsSync(txtPath)) throw new Error(`Whisper output not found: ${txtPath}`);
+  /** Kind label for the injected turn, matching BACKLOG.md §4c/4d examples. */
+  private static transcribableKind(type: TelegramMessage['type']): string {
+    if (type === 'voice') return 'Voice note';
+    if (type === 'video_note') return 'Video note';
+    return 'Audio';
+  }
 
-    const transcript = readFileSync(txtPath, 'utf-8').trim();
-    const text = msg.text
-      ? `${msg.text}\n\n[Voice message transcription]\n${transcript}`
-      : `[Voice message transcription]\n${transcript}`;
+  /**
+   * Transcribe a voice note, forwarded audio file, or video note, then route the result through
+   * the normal message path (reply context, group attribution/roster, MessageBatcher) exactly
+   * like a text message — this was the routing bug: voice used to call sendToCC directly,
+   * skipping all of that. The file path stays embedded in the injected text (not on
+   * BatcherMessage.filePath/fileName) so the transcript is treated as plain text for batching
+   * purposes and doesn't trigger the immediate-flush-on-attachment branch, letting it coalesce
+   * with a fast follow-up text message.
+   */
+  private async transcribeMedia(agentId: string, msg: TelegramMessage): Promise<void> {
+    if (!msg.filePath || !msg.fileName) return;
+    const kind = Bridge.transcribableKind(msg.type);
 
-    this.sendToCC(agentId, { text }, { chatId: msg.chatId, spawnSource: 'telegram' });
+    let result: TranscribeResult;
+    if (msg.audioBase64) {
+      result = await transcribeAudioGemini(msg.audioBase64, msg.mimeType ?? 'audio/ogg', this.logger);
+    } else {
+      result = {
+        ok: false,
+        text: null,
+        truncated: false,
+        model: process.env.TRANSCRIBE_MODEL || 'gemini-2.5-flash',
+        provider: 'gemini',
+        error: 'No audio data captured from Telegram',
+      };
+    }
+
+    // Only fall back to Whisper on a genuine failure — never for a legitimate empty transcript,
+    // and never for video (Whisper doesn't decode video containers here).
+    if (!result.ok && msg.type !== 'video_note') {
+      const fallback = await this.tryWhisperFallback(msg.filePath, msg.fileName);
+      if (fallback) result = fallback;
+    }
+
+    const text = buildTranscriptionTurn({
+      senderName: msg.userName,
+      durationSec: msg.durationSec,
+      filePath: msg.filePath,
+      kind,
+      result,
+    });
+
+    this.logger.info({ agentId, kind, ok: result.ok, provider: result.provider, truncated: result.truncated }, 'Transcription complete');
+    this.queueForChat(agentId, { ...msg, text });
   }
 
   // ── Startup ──
@@ -1124,14 +1230,34 @@ ${hbContent}`;
       return;
     }
 
-    // Voice messages: transcribe with whisper before forwarding
-    if (msg.type === 'voice') {
-      this.transcribeVoice(agentId, msg).catch(err => {
-        this.logger.error({ err, agentId }, 'Voice transcription failed — falling back to file path');
-        this.sendToCC(agentId, { text: msg.text || '', filePath: msg.filePath, fileName: msg.fileName }, { chatId: msg.chatId, spawnSource: 'telegram' });
+    // Voice notes, forwarded audio files, and video notes: transcribe (Gemini, with an opt-in
+    // Whisper fallback) before forwarding. Routed through queueForChat like any other message —
+    // this used to call sendToCC directly, skipping reply-context, group attribution/roster,
+    // and the MessageBatcher entirely.
+    if (msg.type === 'voice' || msg.type === 'audio' || msg.type === 'video_note') {
+      this.transcribeMedia(agentId, msg).catch(err => {
+        // Last-resort net: transcribeMedia/transcribeAudioGemini should never throw (every
+        // failure mode is captured in TranscribeResult), but if something truly unexpected
+        // happens, still fail loudly rather than silently dropping the note.
+        this.logger.error({ err, agentId }, 'Transcription pipeline threw unexpectedly');
+        const kind = Bridge.transcribableKind(msg.type);
+        const text = `[${kind} — transcription FAILED: ${(err as Error)?.message ?? String(err)}. Audio at ${msg.filePath}; you may transcribe it yourself.]`;
+        this.queueForChat(agentId, { ...msg, text });
       });
       return;
     }
+
+    this.queueForChat(agentId, msg);
+  }
+
+  /**
+   * Shared routing tail for every inbound Telegram message: per-chat batcher, reply context,
+   * and group attribution + roster injection. `msg.text` is used verbatim — callers (including
+   * transcribeMedia) are responsible for having already built the final text.
+   */
+  private queueForChat(agentId: string, msg: TelegramMessage): void {
+    const agent = this.agents.get(agentId);
+    if (!agent) return;
 
     // Ensure a per-chat batcher exists — each chat batches independently.
     agent.lastTgChatId = msg.chatId;
@@ -1144,29 +1270,26 @@ ${hbContent}`;
     }
 
     // Prepare text with reply context and group attribution
-    let text = msg.text;
-    if (msg.replyToText) {
-      text = `[Replying to: '${msg.replyToText}']\n\n${text}`;
-    }
-    // In group chats (negative chatId), prepend sender identity so CC knows who's talking
-    if (msg.chatId < 0 && msg.userName) {
-      const tag = msg.userHandle ? `${msg.userName} (@${msg.userHandle})` : msg.userName;
-      text = `[${tag}]: ${text}`;
-      // Inject group roster + optional groupContext as system-reminder
-      const roster = agent.tgBot?.getGroupRoster(msg.chatId);
-      const groupCtx = agent.config.groupContext;
-      const contextParts = [roster, groupCtx].filter(Boolean);
-      if (contextParts.length > 0) {
-        text = `${wrapSystemReminder(contextParts.join('\n\n'))}\n${text}`;
-      }
-    }
+    const roster = agent.tgBot?.getGroupRoster(msg.chatId) ?? null;
+    const text = buildInboundText(
+      { text: msg.text, replyToText: msg.replyToText, chatId: msg.chatId, userName: msg.userName, userHandle: msg.userHandle },
+      roster,
+      agent.config.groupContext,
+    );
+
+    // Transcribed media already has its audio path embedded in the text (see
+    // buildTranscriptionTurn) — don't also pass filePath/fileName through, or sendToCC's
+    // createDocumentMessage branch would append a second, redundant "[Attached file: ...]" line
+    // and (more importantly) the MessageBatcher would flush it immediately instead of using the
+    // normal 2s window, so it could never coalesce with a fast follow-up text message.
+    const isTranscribedMedia = msg.type === 'voice' || msg.type === 'audio' || msg.type === 'video_note';
 
     cs.batcher.add({
       text,
       imageBase64: msg.imageBase64,
       imageMediaType: msg.imageMediaType,
-      filePath: msg.filePath,
-      fileName: msg.fileName,
+      filePath: isTranscribedMedia ? undefined : msg.filePath,
+      fileName: isTranscribedMedia ? undefined : msg.fileName,
       mediaGroupId: msg.mediaGroupId,
     });
   }
