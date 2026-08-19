@@ -282,6 +282,11 @@ export function discoverCCSessions(repo: string, limit = 10, configDir?: string)
       // Skip sidechain sessions (sub-agent transcript forks)
       if (isSidechainSession(fullPath)) continue;
 
+      // Skip sessions ever bridged via `claude remote-control` — interactive terminal
+      // sessions and `/newcc` external CC sessions, never TGCC's own. Excluded from
+      // discovery entirely so they can't be auto-resumed or manually picked from /sessions.
+      if (isRemoteControlSession(fullPath, st.size)) continue;
+
       const { title, model } = extractSessionMeta(fullPath, st.size);
 
       // Skip sessions with no real user messages
@@ -324,6 +329,34 @@ function isSidechainSession(jsonlPath: string): boolean {
     if (bytesRead === 0) return false;
     const firstLine = buf.subarray(0, bytesRead).toString('utf-8').split('\n')[0];
     return firstLine.includes('"isSidechain":true') || firstLine.includes('"isSidechain": true');
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * True if the JSONL shows this session was ever bridged via `claude remote-control`
+ * (either launched with `--remote-control`, or the `/remote-control` slash command was
+ * run inside it — both write a `"type":"bridge-session"` line and a `bridge_status`
+ * system message near the top of the transcript).
+ *
+ * TGCC NEVER uses `--remote-control` — cc-process.ts always drives sessions via
+ * `--input-format stream-json --output-format stream-json`. So any session carrying this
+ * marker is either a human's interactive terminal session or a `/newcc`-spawned external
+ * CC session, both of which share TGCC agents' project directories on disk but must never
+ * be treated as TGCC's own — discovering or auto-resuming one silently hijacks someone
+ * else's conversation (see: color agent adopting an unrelated interactive session).
+ */
+export function isRemoteControlSession(jsonlPath: string, fileSize?: number): boolean {
+  try {
+    const size = fileSize ?? statSync(jsonlPath).size;
+    const readSize = Math.min(8192, size);
+    const fd = openSync(jsonlPath, 'r');
+    const buf = Buffer.alloc(readSize);
+    readSync(fd, buf, 0, readSize, 0);
+    closeSync(fd);
+    const text = buf.toString('utf-8');
+    return text.includes('"type":"bridge-session"') || text.includes('"subtype":"bridge_status"');
   } catch {
     return false;
   }

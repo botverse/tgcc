@@ -41,6 +41,7 @@ import {
   computeProjectSlug,
   extractRecentConversation,
   readSessionTitle,
+  isRemoteControlSession,
 } from './session.js';
 import { isSessionExternallyActive } from './session-lock.js';
 import {
@@ -874,32 +875,48 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
         if (resumedAnyChat) continue;
 
-        // Fallback: no per-chat tracking yet (first run after upgrade, or chat
-        // never produced an `init` event). Discover the newest JSONL and pin it
-        // to the agent's primary chat — best-effort only.
-        const sessions = this.discoverAgentSessions(agent, 1);
-        if (sessions.length === 0) continue;
+        // Fallback: no per-chat tracking yet. This is legitimate ONLY for an agent that
+        // predates the per-chat refactor and still carries a `lastSessionId` from the old
+        // single-session-per-agent model — resume exactly that recorded session, nothing
+        // else. Do NOT discover-by-mtime here: the project directory is shared with
+        // interactive `claude` sessions, `/newcc` external CC sessions, and other TGCC
+        // agents pointed at the same repo. Picking "the newest JSONL" would silently and
+        // permanently adopt whichever one of those happens to sort first — the moment
+        // `init` fires, it gets written into sessionsByChat forever (this is exactly how
+        // the color agent ended up hijacking an unrelated interactive session).
+        const legacySessionId = agentState.lastSessionId;
+        if (!legacySessionId) continue;
 
-        const session = sessions[0];
-        const ageMs = now - session.mtime.getTime();
+        const jsonlPath = getSessionJsonlPath(legacySessionId, this.agentSessionRepo(agent), agent.claudeConfigDir);
+        if (!existsSync(jsonlPath)) {
+          this.logger.info({ agentId, sessionId: legacySessionId }, 'Auto-resume: legacy lastSessionId JSONL missing — skipping');
+          continue;
+        }
+        if (isRemoteControlSession(jsonlPath)) {
+          this.logger.warn({ agentId, sessionId: legacySessionId }, 'Auto-resume: legacy lastSessionId is a foreign remote-control session — skipping');
+          continue;
+        }
+        const st = statSync(jsonlPath);
+        const ageMs = now - st.mtimeMs;
         if (ageMs > STALE_MS) {
-          this.logger.info({ agentId, sessionId: session.id, ageMs }, 'Skipping auto-resume — session too old');
+          this.logger.info({ agentId, sessionId: legacySessionId, ageMs }, 'Auto-resume: legacy lastSessionId too old — skipping');
           continue;
         }
 
         const resumeChatId = this.getAgentChatId(agent);
         if (resumeChatId == null) {
-          this.logger.info({ agentId, sessionId: session.id }, 'Auto-resume: no chat to attach session — skipping');
+          this.logger.info({ agentId, sessionId: legacySessionId }, 'Auto-resume: no chat to attach legacy session — skipping');
           continue;
         }
+        const endState = getSessionEndState(jsonlPath, st.size);
         const cs = getOrCreateChatSession(agent, resumeChatId);
-        cs.pendingSessionId = session.id;
+        cs.pendingSessionId = legacySessionId;
         cs.forceNewSession = false;
 
-        this.logger.info({ agentId, sessionId: session.id, endState: session.endState, ageMs }, 'Auto-resume: fallback session prepared (no per-chat tracking)');
+        this.logger.info({ agentId, sessionId: legacySessionId, endState, ageMs }, 'Auto-resume: legacy lastSessionId prepared (pre-per-chat migration)');
 
-        if (session.endState === 'interrupted') {
-          this.logger.info({ agentId, sessionId: session.id }, 'Auto-resume: sending nudge for interrupted session');
+        if (endState === 'interrupted') {
+          this.logger.info({ agentId, sessionId: legacySessionId }, 'Auto-resume: sending nudge for interrupted legacy session');
           this.sendToCC(agentId, {
             text: wrapSystemReminder('TGCC restarted while you were mid-turn. Your previous session has been resumed. Continue where you left off.'),
           }, { chatId: resumeChatId });
