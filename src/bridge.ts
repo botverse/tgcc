@@ -851,6 +851,17 @@ export class Bridge extends EventEmitter implements CtlHandler {
             continue;
           }
           const st = statSync(jsonlPath);
+          if (isRemoteControlSession(jsonlPath, st.size)) {
+            // A tracked entry can be poisoned the same way legacy lastSessionId was: a
+            // human's interactive `claude`/`--remote-control` session (or a `/newcc`
+            // external session) sharing this agent's project dir got written into
+            // sessionsByChat. Discovery-side filtering (discoverCCSessions) never runs
+            // for tracked ids, so without this check a poisoned entry gets silently
+            // re-resumed — and re-nudged — on every restart forever.
+            this.logger.warn({ agentId, chatId, sessionId }, 'Auto-resume: tracked session is a foreign remote-control session — clearing tracking');
+            this.sessionStore.clearSessionForChat(agentId, chatId);
+            continue;
+          }
           const ageMs = now - st.mtimeMs;
           if (ageMs > STALE_MS) {
             this.logger.info({ agentId, chatId, sessionId, ageMs }, 'Auto-resume: tracked session too old — skipping');
