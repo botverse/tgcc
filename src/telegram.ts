@@ -61,6 +61,9 @@ export const COMMANDS = [
   { command: 'cron', description: 'Manage scheduled cron jobs' },
   { command: 'ralph', description: 'Spawn shepherd to ensure task completion' },
   { command: 'new_cli', description: 'Open interactive CLI session via tmux' },
+  { command: 'newcc', description: 'New external CC session (tmux + Claude app)' },
+  { command: 'listcc', description: 'List external CC sessions' },
+  { command: 'killcc', description: 'Kill an external CC session' },
   { command: 'ping', description: 'Quick liveness check' },
   { command: 'help', description: 'List all commands' },
 ];

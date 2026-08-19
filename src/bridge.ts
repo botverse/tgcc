@@ -58,6 +58,7 @@ import { EventRouter, type RoutableEvent } from './event-router.js';
 import { SupervisorManager, formatElapsed } from './supervisor.js';
 import { WatcherManager } from './watcher.js';
 import { RalphManager, buildRalphPrompt } from './ralph.js';
+import { ExternalCcManager, sanitizeSessionName, formatAgo } from './external-cc.js';
 import { wrapTeammateMessage, wrapSystemReminder } from './cc-tags.js';
 import { Scheduler, computeOneShotSchedule, parseEveryToCron } from './scheduler.js';
 import { randomUUID } from 'node:crypto';
@@ -340,6 +341,9 @@ export class Bridge extends EventEmitter implements CtlHandler {
   private supervisorManager: SupervisorManager | null = null;
   private watcherManager: WatcherManager;
   private ralphManager: RalphManager;
+  private externalCc: ExternalCcManager;
+  // `${agentId}:${chatId}` → /newcc flow state (name from the command; worktree/repo from keyboard prompts)
+  private pendingExtCcNew = new Map<string, { name: string; worktree?: boolean }>();
 
   // Heartbeat & cron scheduling
   private scheduler: Scheduler;
@@ -474,6 +478,9 @@ export class Bridge extends EventEmitter implements CtlHandler {
         await a.tgBot.sendText(chatId, text, parseMode as 'HTML');
       },
     }, this.logger, join(homedir(), '.tgcc', 'ralphs.json'));
+
+    // External CC sessions (tmux windows running `claude --remote-control`)
+    this.externalCc = new ExternalCcManager(join(homedir(), '.tgcc', 'external-cc.json'), this.logger);
   }
 
   /** Start or restart the supervisor heartbeat timer. Delegates to SupervisorManager. */
@@ -495,6 +502,43 @@ export class Bridge extends EventEmitter implements CtlHandler {
   /** The effective repo path for session discovery (container agents use a different path). */
   private agentSessionRepo(agent: AgentInstance): string {
     return agent.claudeConfigDir ? '/home/project' : agent.repo;
+  }
+
+  /** Repo picker keyboard — final step of the /newcc flow. */
+  private async sendExtCcRepoKeyboard(agent: AgentInstance, chatId: number, name: string, worktree: boolean): Promise<void> {
+    const kb = new InlineKeyboard();
+    Object.keys(this.config.repos).forEach((rn, i) => {
+      kb.text(rn, `extcc-repo:${rn}`);
+      if (i % 2 === 1) kb.row();
+    });
+    await agent.tgBot?.sendTextWithKeyboard(
+      chatId,
+      `<b>${escapeHtml(name)}</b>${worktree ? ' 🌿' : ''} — pick a repo:`,
+      kb,
+      'HTML',
+    );
+  }
+
+  /** Create an external CC session (tmux window running `claude --remote-control`) and confirm on TG. */
+  private async createExternalCcSession(
+    agent: AgentInstance,
+    chatId: number,
+    name: string,
+    opts: { worktree: boolean; repoName: string; repoPath: string },
+  ): Promise<void> {
+    try {
+      const session = this.externalCc.create({ name, repoName: opts.repoName, repoPath: opts.repoPath, worktree: opts.worktree });
+      const lines = [
+        `🖥 External CC session <b>${escapeHtml(name)}</b> created${opts.worktree ? ' 🌿 (worktree)' : ''}.`,
+        `📂 <code>${escapeHtml(opts.repoName)}</code> · tmux <code>${escapeHtml(session.tmuxSession)}</code>`,
+        `It will appear in your Claude apps shortly.`,
+        `Attach: <code>tmux attach -t ${escapeHtml(session.tmuxSession)}</code>`,
+      ];
+      await agent.tgBot?.sendText(chatId, `<blockquote>${lines.join('\n')}</blockquote>`, 'HTML');
+    } catch (err) {
+      this.logger.error({ err, name, ...opts }, 'ExternalCc: create failed');
+      await agent.tgBot?.sendText(chatId, `<blockquote>Failed to create external CC session: ${escapeHtml(String(err))}</blockquote>`, 'HTML');
+    }
   }
 
   /** Format ` · {sid8}` or ` · {sid8} "{title}"` for blockquote suffixes. Empty if no session. */
@@ -2495,6 +2539,65 @@ ${hbContent}`;
         break;
       }
 
+      case 'newcc': {
+        // /newcc [-w] <name> — then prompts: worktree yes/no (skipped when -w), repo.
+        const extTokens = (cmd.args ?? '').trim().split(/\s+/).filter(Boolean);
+        const extWorktreeFlag = extTokens.includes('-w');
+        const extName = sanitizeSessionName(extTokens.filter((t) => t !== '-w').join(' '));
+        if (!extName) {
+          await agent.tgBot.sendText(cmd.chatId, '<blockquote>Usage: /newcc &lt;name&gt;\nThen pick worktree yes/no and a repo.</blockquote>', 'HTML');
+          break;
+        }
+        if (Object.keys(this.config.repos).length === 0) {
+          await agent.tgBot.sendText(cmd.chatId, '<blockquote>No repos configured. Use /repo add &lt;name&gt; &lt;path&gt; first.</blockquote>', 'HTML');
+          break;
+        }
+        this.pendingExtCcNew.set(`${agentId}:${cmd.chatId}`, { name: extName, ...(extWorktreeFlag ? { worktree: true } : {}) });
+        if (extWorktreeFlag) {
+          await this.sendExtCcRepoKeyboard(agent, cmd.chatId, extName, true);
+        } else {
+          const extKb = new InlineKeyboard()
+            .text('🌿 Yes — worktree', 'extcc-w:y')
+            .text('No — repo checkout', 'extcc-w:n');
+          await agent.tgBot.sendTextWithKeyboard(cmd.chatId, `<b>${escapeHtml(extName)}</b> — create in a git worktree?`, extKb, 'HTML');
+        }
+        break;
+      }
+
+      case 'listcc': {
+        const extRemoved = this.externalCc.cleanup();
+        const extSessions = this.externalCc.list();
+        const extLines: string[] = [];
+        if (extSessions.length === 0) {
+          extLines.push('No external CC sessions. Use /newcc to create one.');
+        } else {
+          extLines.push(`<b>External CC sessions (${extSessions.length})</b>`);
+          for (const s of extSessions) {
+            extLines.push(`• <b>${escapeHtml(s.name)}</b>${s.worktree ? ' 🌿' : ''} — <code>${escapeHtml(s.repoName)}</code> · tmux <code>${escapeHtml(s.tmuxSession)}</code> · ${formatAgo(s.createdAt)}`);
+          }
+        }
+        if (extRemoved.length > 0) {
+          extLines.push(`🧹 Cleaned ${extRemoved.length} dead: ${extRemoved.map((s) => escapeHtml(s.name)).join(', ')}`);
+        }
+        await agent.tgBot.sendText(cmd.chatId, `<blockquote>${extLines.join('\n')}</blockquote>`, 'HTML');
+        break;
+      }
+
+      case 'killcc': {
+        this.externalCc.cleanup();
+        const extKillable = this.externalCc.list();
+        if (extKillable.length === 0) {
+          await agent.tgBot.sendText(cmd.chatId, '<blockquote>No external CC sessions to kill.</blockquote>', 'HTML');
+          break;
+        }
+        const extKillKb = new InlineKeyboard();
+        for (const s of extKillable) {
+          extKillKb.text(`${s.name} (${s.repoName})${s.worktree ? ' 🌿' : ''}`, `extcc-kill:${s.windowId}`).row();
+        }
+        await agent.tgBot.sendTextWithKeyboard(cmd.chatId, '<b>Kill external CC session:</b>', extKillKb, 'HTML');
+        break;
+      }
+
       case 'restart': {
         // Restart the TGCC systemd service — this process will die and come back
         // Only notify supervisor chat — workers don't need the restart message
@@ -3461,6 +3564,58 @@ ${hbContent}`;
         );
         // Store pending state to catch the next text message as the session name
         agent.pendingCliTmuxAgent = targetAgent2;
+        break;
+      }
+
+      case 'extcc-w': {
+        // Worktree yes/no answered for pending /newcc — next: repo keyboard
+        const extPend = this.pendingExtCcNew.get(`${agentId}:${query.chatId}`);
+        if (!extPend) {
+          await agent.tgBot.answerCallbackQuery(query.callbackQueryId, 'Expired — run /newcc again');
+          break;
+        }
+        extPend.worktree = query.data === 'y';
+        await agent.tgBot.answerCallbackQuery(query.callbackQueryId, extPend.worktree ? 'Worktree' : 'Repo checkout');
+        await this.sendExtCcRepoKeyboard(agent, query.chatId, extPend.name, extPend.worktree);
+        break;
+      }
+
+      case 'extcc-repo': {
+        // Repo picked for pending /newcc — final step, create the session
+        const extPendKey = `${agentId}:${query.chatId}`;
+        const extPend = this.pendingExtCcNew.get(extPendKey);
+        if (!extPend) {
+          await agent.tgBot.answerCallbackQuery(query.callbackQueryId, 'Expired — run /newcc again');
+          break;
+        }
+        const extRepoPath = this.config.repos[query.data];
+        if (!extRepoPath) {
+          await agent.tgBot.answerCallbackQuery(query.callbackQueryId, 'Unknown repo');
+          break;
+        }
+        this.pendingExtCcNew.delete(extPendKey);
+        await agent.tgBot.answerCallbackQuery(query.callbackQueryId, 'Creating…');
+        await this.createExternalCcSession(agent, query.chatId, extPend.name, {
+          worktree: extPend.worktree ?? false,
+          repoName: query.data,
+          repoPath: extRepoPath,
+        });
+        break;
+      }
+
+      case 'extcc-kill': {
+        const extVictim = this.externalCc.kill(query.data);
+        if (extVictim) {
+          await agent.tgBot.answerCallbackQuery(query.callbackQueryId, 'Killed');
+          await agent.tgBot.sendText(
+            query.chatId,
+            `<blockquote>🗡 Killed external CC session <b>${escapeHtml(extVictim.name)}</b> (tmux <code>${escapeHtml(extVictim.tmuxSession)}</code>).</blockquote>`,
+            'HTML',
+          );
+        } else {
+          await agent.tgBot.answerCallbackQuery(query.callbackQueryId, 'Already gone');
+          await agent.tgBot.sendText(query.chatId, '<blockquote>Session was no longer tracked — nothing to kill.</blockquote>', 'HTML');
+        }
         break;
       }
 
