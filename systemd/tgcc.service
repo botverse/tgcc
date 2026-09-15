@@ -1,0 +1,16 @@
+[Unit]
+Description=TGCC - Telegram Claude Code Bridge
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/fonz/Botverse/tgcc
+ExecStart=/home/linuxbrew/.linuxbrew/bin/node dist/cli.js run
+Restart=on-failure
+RestartSec=5
+Environment=NODE_ENV=production
+Environment=HOME=/home/fonz
+Environment=PATH=/home/linuxbrew/.linuxbrew/bin:/home/fonz/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target
