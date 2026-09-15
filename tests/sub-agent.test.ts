@@ -24,17 +24,24 @@ function createMockSubAgentSender() {
 
 describe('isSubAgentTool', () => {
   it('detects agent-related tools', () => {
-    expect(isSubAgentTool('dispatch_agent')).toBe(true);
+    // 1d6e47c narrowed detection from fuzzy name matching to an exact allowlist
+    // (Agent, Task, SendMessage, TeamCreate) driven by the CC protocol instead of
+    // regex heuristics over arbitrary tool names.
+    expect(isSubAgentTool('Agent')).toBe(true);
     expect(isSubAgentTool('Task')).toBe(true);
-    expect(isSubAgentTool('create_agent')).toBe(true);
-    expect(isSubAgentTool('AgentRunner')).toBe(true);
+    expect(isSubAgentTool('SendMessage')).toBe(true);
+    expect(isSubAgentTool('TeamCreate')).toBe(true);
   });
 
-  it('ignores normal tools', () => {
+  it('ignores tools outside the exact allowlist, including old fuzzy-matched names', () => {
     expect(isSubAgentTool('Bash')).toBe(false);
     expect(isSubAgentTool('Read')).toBe(false);
     expect(isSubAgentTool('Write')).toBe(false);
     expect(isSubAgentTool('Edit')).toBe(false);
+    // Previously matched by fuzzy /agent/i-style patterns; no longer recognized.
+    expect(isSubAgentTool('dispatch_agent')).toBe(false);
+    expect(isSubAgentTool('create_agent')).toBe(false);
+    expect(isSubAgentTool('AgentRunner')).toBe(false);
   });
 });
 
@@ -111,7 +118,7 @@ describe('SubAgentTracker', () => {
     await tracker.handleEvent({
       type: 'content_block_start',
       index: 0,
-      content_block: { type: 'tool_use', id: 'toolu_1', name: 'dispatch_agent', input: {} },
+      content_block: { type: 'tool_use', id: 'toolu_1', name: 'Task', input: {} },
     } as StreamInnerEvent);
 
     // No TG messages sent during turn — tracker just registers the agent
@@ -135,7 +142,7 @@ describe('SubAgentTracker', () => {
     await tracker.handleEvent({
       type: 'content_block_start',
       index: 0,
-      content_block: { type: 'tool_use', id: 'toolu_1', name: 'dispatch_agent', input: {} },
+      content_block: { type: 'tool_use', id: 'toolu_1', name: 'Task', input: {} },
     } as StreamInnerEvent);
 
     await tracker.handleEvent({
@@ -156,7 +163,7 @@ describe('SubAgentTracker', () => {
     await tracker.handleEvent({
       type: 'content_block_start',
       index: 0,
-      content_block: { type: 'tool_use', id: 'toolu_1', name: 'dispatch_agent', input: {} },
+      content_block: { type: 'tool_use', id: 'toolu_1', name: 'Task', input: {} },
     } as StreamInnerEvent);
 
     await tracker.handleEvent({
@@ -204,7 +211,7 @@ describe('SubAgentTracker', () => {
     await tracker.handleEvent({
       type: 'content_block_start',
       index: 0,
-      content_block: { type: 'tool_use', id: 'toolu_1', name: 'dispatch_agent', input: {} },
+      content_block: { type: 'tool_use', id: 'toolu_1', name: 'Task', input: {} },
     } as StreamInnerEvent);
 
     await tracker.handleEvent({
@@ -226,7 +233,7 @@ describe('SubAgentTracker', () => {
     await tracker.handleEvent({
       type: 'content_block_start',
       index: 0,
-      content_block: { type: 'tool_use', id: 'toolu_1', name: 'dispatch_agent', input: {} },
+      content_block: { type: 'tool_use', id: 'toolu_1', name: 'Task', input: {} },
     } as StreamInnerEvent);
 
     expect(tracker.hadSubAgents).toBe(true);
@@ -240,7 +247,7 @@ describe('SubAgentTracker', () => {
     await tracker.handleEvent({
       type: 'content_block_start',
       index: 0,
-      content_block: { type: 'tool_use', id: 'toolu_1', name: 'dispatch_agent', input: {} },
+      content_block: { type: 'tool_use', id: 'toolu_1', name: 'Task', input: {} },
     } as StreamInnerEvent);
 
     expect(tracker.activeAgents).toHaveLength(1);
@@ -271,7 +278,7 @@ describe('SubAgentTracker', () => {
     await tracker.handleEvent({
       type: 'content_block_start',
       index: 0,
-      content_block: { type: 'tool_use', id: 'toolu_1', name: 'dispatch_agent', input: {} },
+      content_block: { type: 'tool_use', id: 'toolu_1', name: 'Task', input: {} },
     } as StreamInnerEvent);
 
     const longResult = 'A'.repeat(4000);
@@ -379,7 +386,7 @@ describe('SubAgentTracker — mailbox watching', () => {
     await tracker.handleEvent({
       type: 'content_block_start',
       index: 0,
-      content_block: { type: 'tool_use', id: 'toolu_1', name: 'dispatch_agent', input: {} },
+      content_block: { type: 'tool_use', id: 'toolu_1', name: 'Task', input: {} },
     } as StreamInnerEvent);
 
     await tracker.handleEvent({
@@ -404,7 +411,7 @@ describe('SubAgentTracker — mailbox watching', () => {
     await tracker.handleEvent({
       type: 'content_block_start',
       index: 0,
-      content_block: { type: 'tool_use', id: 'toolu_1', name: 'dispatch_agent', input: {} },
+      content_block: { type: 'tool_use', id: 'toolu_1', name: 'Task', input: {} },
     } as StreamInnerEvent);
 
     await tracker.handleEvent({
@@ -458,7 +465,7 @@ describe('SubAgentTracker — mailbox watching', () => {
     await tracker.handleEvent({
       type: 'content_block_start',
       index: 0,
-      content_block: { type: 'tool_use', id: 'toolu_1', name: 'dispatch_agent', input: {} },
+      content_block: { type: 'tool_use', id: 'toolu_1', name: 'Task', input: {} },
     } as StreamInnerEvent);
 
     await tracker.handleEvent({
@@ -498,7 +505,7 @@ describe('SubAgentTracker — mailbox watching', () => {
     await tracker.handleEvent({
       type: 'content_block_start',
       index: 0,
-      content_block: { type: 'tool_use', id: 'toolu_1', name: 'dispatch_agent', input: {} },
+      content_block: { type: 'tool_use', id: 'toolu_1', name: 'Task', input: {} },
     } as StreamInnerEvent);
     await tracker.handleEvent({
       type: 'content_block_delta',
@@ -541,7 +548,7 @@ describe('SubAgentTracker — mailbox watching', () => {
     await tracker.handleEvent({
       type: 'content_block_start',
       index: 0,
-      content_block: { type: 'tool_use', id: 'toolu_1', name: 'dispatch_agent', input: {} },
+      content_block: { type: 'tool_use', id: 'toolu_1', name: 'Task', input: {} },
     } as StreamInnerEvent);
     await tracker.handleEvent({
       type: 'content_block_delta',
@@ -568,7 +575,7 @@ describe('SubAgentTracker — mailbox watching', () => {
     await tracker.handleEvent({
       type: 'content_block_start',
       index: 0,
-      content_block: { type: 'tool_use', id: 'toolu_1', name: 'dispatch_agent', input: {} },
+      content_block: { type: 'tool_use', id: 'toolu_1', name: 'Task', input: {} },
     } as StreamInnerEvent);
     await tracker.handleEvent({
       type: 'content_block_delta',
@@ -595,16 +602,16 @@ describe('SubAgentTracker — mailbox watching', () => {
 
     // Agent is completed
     expect(tracker.activeAgents[0].status).toBe('completed');
-    // Standalone bubble edited with "✅ Done"
+    // Standalone bubble edited with "✔ Done" (f3c5a2b swapped ✅ for ✔)
     const lastEdit = sender.edits[sender.edits.length - 1];
-    expect(lastEdit.text).toContain('✅ Done');
+    expect(lastEdit.text).toContain('✔ Done');
   });
 
   it('uses color emoji from mailbox message on standalone bubble', async () => {
     await tracker.handleEvent({
       type: 'content_block_start',
       index: 0,
-      content_block: { type: 'tool_use', id: 'toolu_1', name: 'dispatch_agent', input: {} },
+      content_block: { type: 'tool_use', id: 'toolu_1', name: 'Task', input: {} },
     } as StreamInnerEvent);
     await tracker.handleEvent({
       type: 'content_block_delta',
