@@ -121,11 +121,16 @@ describe('StreamAccumulator', () => {
       content_block: { type: 'thinking', thinking: '' },
     } as StreamInnerEvent);
 
-    await acc.flush();
+    // The placeholder ships eagerly (queued on sendQueue, not the throttled flush
+    // path) so flushIfDirty() would be a no-op here (dirty is already false) and
+    // would additionally force-finalize the still-open thinking block as "empty" —
+    // wait on the same queue the eager send used instead (679862b: bare 💭
+    // placeholder, no blockquote — it promotes to a blockquote once duration/content
+    // is known).
+    await (acc as any).sendQueue;
 
     expect(sender.sentMessages).toHaveLength(1);
-    expect(sender.sentMessages[0].text).toContain('💭 Processing…');
-    expect(sender.sentMessages[0].text).toContain('blockquote');
+    expect(sender.sentMessages[0].text).toBe('💭');
   });
 
   it('accumulates text deltas and sends first message', async () => {
@@ -143,7 +148,7 @@ describe('StreamAccumulator', () => {
       delta: { type: 'text_delta', text: 'Hello world' },
     } as StreamInnerEvent);
 
-    await acc.flush();
+    await acc.flushIfDirty();
 
     // First text should trigger sendMessage
     expect(sender.sentMessages.length).toBeGreaterThanOrEqual(1);
@@ -162,7 +167,7 @@ describe('StreamAccumulator', () => {
       delta: { type: 'text_delta', text: 'Hello' },
     } as StreamInnerEvent);
 
-    await acc.flush();
+    await acc.flushIfDirty();
 
     await acc.handleEvent({
       type: 'content_block_delta',
@@ -170,7 +175,7 @@ describe('StreamAccumulator', () => {
       delta: { type: 'text_delta', text: ' world' },
     } as StreamInnerEvent);
 
-    await acc.flush();
+    await acc.flushIfDirty();
 
     // Should have sent once and edited at least once
     expect(sender.sentMessages.length).toBeGreaterThanOrEqual(1);
@@ -205,26 +210,32 @@ describe('StreamAccumulator', () => {
   });
 
   it('shows tool use indicator', async () => {
-    vi.useFakeTimers();
-    try {
-      await acc.handleEvent({
-        type: 'content_block_start',
-        index: 0,
-        content_block: { type: 'tool_use', id: 'toolu_1', name: 'Bash', input: {} },
-      } as StreamInnerEvent);
+    // Pending tool cards are gated event-driven, not by a timer (6171e13): a
+    // bare content_block_start with no extracted input renders as nothing at
+    // all, so the tool name only appears once input_json_delta has produced
+    // an inputPreview (or the call resolves).
+    await acc.handleEvent({
+      type: 'content_block_start',
+      index: 0,
+      content_block: { type: 'tool_use', id: 'toolu_1', name: 'Bash', input: {} },
+    } as StreamInnerEvent);
 
-      // Advance past the 500ms tool hide debounce so the indicator becomes visible
-      await vi.runAllTimersAsync();
-      await acc.flush();
+    await acc.handleEvent({
+      type: 'content_block_delta',
+      index: 0,
+      delta: { type: 'input_json_delta', partial_json: '{"command":"ls -la"}' },
+    } as any);
 
-      const allTexts = [
-        ...sender.sentMessages.map(m => m.text),
-        ...sender.editedMessages.map(m => m.text),
-      ];
-      expect(allTexts.some(t => t.includes('Bash'))).toBe(true);
-    } finally {
-      vi.useRealTimers();
-    }
+    // Not flushIfDirty(): it deliberately drops still-pending tool segments so an
+    // interrupted turn doesn't leave a frozen "⚡ ..." card, which would filter this
+    // one out before it ever rendered. finalize() (the real turn-end path) doesn't.
+    await acc.finalize();
+
+    const allTexts = [
+      ...sender.sentMessages.map(m => m.text),
+      ...sender.editedMessages.map(m => m.text),
+    ];
+    expect(allTexts.some(t => t.includes('Bash'))).toBe(true);
   });
 
   it('accumulates thinking content for expandable blockquote', async () => {
@@ -234,7 +245,9 @@ describe('StreamAccumulator', () => {
       content_block: { type: 'thinking', thinking: '' },
     } as StreamInnerEvent);
 
-    await acc.flush();
+    // Wait for the eager placeholder send (queued on sendQueue, not the throttled
+    // flush path — see 'sends thinking indicator on thinking block start' above).
+    await (acc as any).sendQueue;
 
     await acc.handleEvent({
       type: 'content_block_delta',
@@ -244,7 +257,7 @@ describe('StreamAccumulator', () => {
 
     // Thinking indicator should show but not the thinking content yet (no text block yet)
     expect(sender.sentMessages).toHaveLength(1);
-    expect(sender.sentMessages[0].text).toContain('💭 Processing…');
+    expect(sender.sentMessages[0].text).toBe('💭');
 
     // End thinking block, start text block
     await acc.handleEvent({ type: 'content_block_stop', index: 0 } as StreamInnerEvent);
@@ -292,7 +305,7 @@ describe('StreamAccumulator', () => {
       delta: { type: 'text_delta', text: 'Hi' },
     } as StreamInnerEvent);
 
-    await acc.flush();
+    await acc.flushIfDirty();
 
     expect(acc.allMessageIds.length).toBeGreaterThanOrEqual(1);
   });
@@ -340,7 +353,7 @@ describe('StreamAccumulator', () => {
     } as StreamInnerEvent);
 
     // Flush: both deltas are batched into a single send
-    await slowAcc.flush();
+    await slowAcc.flushIfDirty();
 
     // With the batched pipeline, only ONE sendMessage call should have been made
     expect(sendCount).toBe(1);
@@ -378,7 +391,7 @@ describe('StreamAccumulator', () => {
       delta: { type: 'text_delta', text: 'Turn 2' },
     } as StreamInnerEvent);
 
-    await acc.flush();
+    await acc.flushIfDirty();
 
     // Full reset clears tgMessageId → new message on second API call
     expect(sender.sentMessages).toHaveLength(2);
@@ -399,7 +412,7 @@ describe('StreamAccumulator', () => {
       delta: { type: 'text_delta', text: 'First' },
     } as StreamInnerEvent);
 
-    await acc.flush();
+    await acc.flushIfDirty();
     expect(sender.sentMessages).toHaveLength(1);
 
     // Full reset (simulates process exit)
@@ -418,7 +431,7 @@ describe('StreamAccumulator', () => {
       delta: { type: 'text_delta', text: 'Second' },
     } as StreamInnerEvent);
 
-    await acc.flush();
+    await acc.flushIfDirty();
 
     expect(sender.sentMessages).toHaveLength(2);
   });
