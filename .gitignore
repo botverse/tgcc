@@ -12,3 +12,10 @@ dist/
 # synthetic — so ignore everything in the dir except the README.
 tests/fixtures/audio/*
 !tests/fixtures/audio/README.md
+
+# Claude Code local settings and other agents' nested git worktrees live here
+# (e.g. .claude/worktrees/<agent-id>/, itself a separate .git checkout).
+# Nothing under .claude/ is currently tracked in this repo; ignore it so it's
+# never accidentally staged — that would commit a nested worktree, not just
+# local config.
+.claude/
