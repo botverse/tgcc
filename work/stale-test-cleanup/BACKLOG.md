@@ -11,7 +11,7 @@
 - [x] sub-agent.test.ts (15 failures) — fixed: fuzzy tool names replaced with exact allowlist, plus 1 independently-found stale-UI-text issue
 - [x] Full suite green (verified clean: `rm -rf dist && npm run build && npx vitest run` → 259 passed / 1 skipped / 0 failed, re-verified after rebasing onto origin/main)
 - [x] Rebase onto origin/main (picked up root BACKLOG.md/PROJECT_LOG.md/CLAUDE.md bootstrap + .gitignore `.claude/` entry from the parallel systemd-unit-tracking PRs — clean, no conflicts)
-- [ ] Push branch, open PR against main, propose root BACKLOG.md/PROJECT_LOG.md edits (root records now exist — bootstrapped by another agent — so this proposes edits to them rather than creating competing files, per the lead's instruction)
+- [x] Push branch, open PR against main (https://github.com/botverse/tgcc/pull/4, not merged), propose root BACKLOG.md/PROJECT_LOG.md edits (root records now exist — bootstrapped by another agent — proposed edits to them rather than creating competing files)
 
 ## Notes for PR
 
