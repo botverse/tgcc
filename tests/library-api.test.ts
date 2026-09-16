@@ -185,6 +185,10 @@ describe('Library API - StreamAccumulator with custom callbacks', () => {
     await acc.handleEvent({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'world!' } } as any);
     await acc.handleEvent({ type: 'content_block_stop', index: 0 });
     await acc.handleEvent({ type: 'message_stop' });
+    // Renders are throttled via requestRender()'s timer even with editIntervalMs: 0 —
+    // finalize() is what the real turn-end path (bridge.ts) calls to drain the queue
+    // and force the final render through.
+    await acc.finalize();
 
     // Should have sent or edited messages
     expect(sent.length).toBeGreaterThan(0);
@@ -217,16 +221,30 @@ describe('Library API - SubAgentTracker with custom callbacks', () => {
 
     const tracker = new SubAgentTracker(options);
 
-    // Simulate a sub-agent tool_use block
+    // Simulate a sub-agent tool_use block. 'Task' is one of the exact-match tool
+    // names isSubAgentTool() recognizes (Agent, Task, SendMessage, TeamCreate).
     await tracker.handleEvent({
       type: 'content_block_start',
       index: 0,
-      content_block: { type: 'tool_use', id: 'tu_1', name: 'dispatch_agent', input: {} },
+      content_block: { type: 'tool_use', id: 'tu_1', name: 'Task', input: {} },
+    } as any);
+    await tracker.handleEvent({
+      type: 'content_block_delta',
+      index: 0,
+      delta: { type: 'input_json_delta', partial_json: '{}' },
+    } as any);
+    await tracker.handleEvent({
+      type: 'content_block_stop',
+      index: 0,
     } as any);
 
-    // Should have sent a standalone message (no reply_to)
+    // No TG messages happen during the turn (StreamAccumulator renders in-turn).
+    expect(sends.length).toBe(0);
+
+    // The standalone status bubble is only created once post-turn tracking starts.
+    await tracker.startPostTurnTracking();
     expect(sends.length).toBe(1);
-    expect(sends[0].text).toContain('Starting sub-agent');
+    expect(sends[0].text).toContain('Working');
   });
 });
 

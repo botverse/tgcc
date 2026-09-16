@@ -156,13 +156,13 @@ describe('SessionStore permissionMode', () => {
   });
 
   it('sets and reads permissionMode', () => {
-    store.setPermissionMode('agent1', 'user1', 'plan');
+    store.setPermissionMode('agent1', 'plan');
     const user = store.getUser('agent1', 'user1');
     expect(user.permissionMode).toBe('plan');
   });
 
   it('persists permissionMode to disk', () => {
-    store.setPermissionMode('agent1', 'user1', 'acceptEdits');
+    store.setPermissionMode('agent1', 'acceptEdits');
     // Re-read from disk
     const store2 = new SessionStore(statePath, logger);
     const user = store2.getUser('agent1', 'user1');
@@ -170,8 +170,8 @@ describe('SessionStore permissionMode', () => {
   });
 
   it('can clear permissionMode by setting empty string', () => {
-    store.setPermissionMode('agent1', 'user1', 'plan');
-    store.setPermissionMode('agent1', 'user1', '');
+    store.setPermissionMode('agent1', 'plan');
+    store.setPermissionMode('agent1', '');
     const user = store.getUser('agent1', 'user1');
     expect(user.permissionMode).toBe('');
   });

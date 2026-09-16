@@ -51,7 +51,7 @@
     "build": "tsc",
     "dev": "tsx src/service.ts",
     "start": "node dist/service.js",
-    "test": "vitest run",
+    "test": "npm run build && vitest run",
     "test:watch": "vitest"
   },
   "pnpm": {

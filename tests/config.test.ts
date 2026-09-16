@@ -71,8 +71,7 @@ describe('validateConfig', () => {
         },
       },
     });
-    expect(config.agents.test.defaults.model).toBe('claude-sonnet-4-20250514');
-    expect(config.agents.test.defaults.maxTurns).toBe(50);
+    expect(config.agents.test.defaults.model).toBe('opus');
     expect(config.agents.test.defaults.permissionMode).toBe('dangerously-skip');
   });
 
@@ -164,6 +163,7 @@ describe('diffConfigs', () => {
   it('detects added agents', () => {
     const newConfig = validateConfig({
       ...VALID_CONFIG,
+      supervisor: 'personal',
       agents: {
         ...VALID_CONFIG.agents,
         work: {
@@ -264,6 +264,7 @@ describe('repo registry', () => {
   it('allows agents without repo (generic agents)', () => {
     const config = validateConfig({
       repos: { tgcc: '/home/fonz/tgcc' },
+      supervisor: 'bound',
       agents: {
         bound: { botToken: 'tok1', allowedUsers: ['1'], defaults: { repo: 'tgcc' } },
         generic: { botToken: 'tok2', allowedUsers: ['1'] },

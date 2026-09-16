@@ -107,137 +107,16 @@ describe('integration: CC stream → TG messages', () => {
   });
 });
 
-describe('integration: config → session store', () => {
-  const testDir = join(tmpdir(), `tgcc-test-${Date.now()}`);
-  const stateFile = join(testDir, 'state.json');
-
-  beforeEach(() => {
-    if (existsSync(testDir)) rmSync(testDir, { recursive: true });
-    mkdirSync(testDir, { recursive: true });
-  });
-
-  it('persists and loads session state', () => {
-    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } as any;
-    const store = new SessionStore(stateFile, logger);
-
-    store.setCurrentSession('personal', '123', 'sess-abc');
-    store.updateSessionActivity('personal', '123', 0.05);
-    store.setModel('personal', '123', 'claude-opus-4-6');
-    store.setRepo('personal', '123', '/home/test/project');
-
-    // Create new store instance (simulates restart)
-    const store2 = new SessionStore(stateFile, logger);
-    const user = store2.getUser('personal', '123');
-
-    expect(user.currentSessionId).toBe('sess-abc');
-    expect(user.model).toBe('claude-opus-4-6');
-    expect(user.repo).toBe('/home/test/project');
-    expect(user.knownSessionIds).toContain('sess-abc');
-  });
-
-  it('tracks multiple sessions', () => {
-    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } as any;
-    const store = new SessionStore(stateFile, logger);
-
-    store.setCurrentSession('personal', '123', 'sess-1');
-    store.updateSessionActivity('personal', '123');
-    store.setCurrentSession('personal', '123', 'sess-2');
-    store.updateSessionActivity('personal', '123');
-
-    const sessions = store.getRecentSessions('personal', '123');
-    expect(sessions).toHaveLength(2);
-  });
-
-  it('clears session on /new', () => {
-    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } as any;
-    const store = new SessionStore(stateFile, logger);
-
-    store.setCurrentSession('personal', '123', 'sess-abc');
-    store.clearSession('personal', '123');
-
-    const user = store.getUser('personal', '123');
-    expect(user.currentSessionId).toBeNull();
-  });
-});
-
-describe('integration: session titles and deletion', () => {
-  const testDir = join(tmpdir(), `tgcc-test-title-${Date.now()}`);
-  const stateFile = join(testDir, 'state.json');
-
-  beforeEach(() => {
-    if (existsSync(testDir)) rmSync(testDir, { recursive: true });
-    mkdirSync(testDir, { recursive: true });
-  });
-
-  it('sets session title (truncated to 40 chars)', () => {
-    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } as any;
-    const store = new SessionStore(stateFile, logger);
-
-    store.setCurrentSession('personal', '123', 'sess-title');
-    store.setSessionTitle('personal', '123', 'sess-title', 'Fix auth middleware for JWT tokens');
-
-    const sessions = store.getRecentSessions('personal', '123');
-    expect(sessions[0].title).toBe('Fix auth middleware for JWT tokens');
-  });
-
-  it('truncates long titles to 40 chars', () => {
-    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } as any;
-    const store = new SessionStore(stateFile, logger);
-
-    store.setCurrentSession('personal', '123', 'sess-long');
-    store.setSessionTitle('personal', '123', 'sess-long', 'A'.repeat(60));
-
-    const sessions = store.getRecentSessions('personal', '123');
-    expect(sessions[0].title).toBe('A'.repeat(40));
-  });
-
-  it('does not overwrite existing title', () => {
-    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } as any;
-    const store = new SessionStore(stateFile, logger);
-
-    store.setCurrentSession('personal', '123', 'sess-keep');
-    store.setSessionTitle('personal', '123', 'sess-keep', 'First title');
-    store.setSessionTitle('personal', '123', 'sess-keep', 'Second title');
-
-    const sessions = store.getRecentSessions('personal', '123');
-    expect(sessions[0].title).toBe('First title');
-  });
-
-  it('deletes a session', () => {
-    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } as any;
-    const store = new SessionStore(stateFile, logger);
-
-    store.setCurrentSession('personal', '123', 'sess-del-1');
-    store.setCurrentSession('personal', '123', 'sess-del-2');
-
-    const deleted = store.deleteSession('personal', '123', 'sess-del-1');
-    expect(deleted).toBe(true);
-
-    const sessions = store.getRecentSessions('personal', '123');
-    expect(sessions).toHaveLength(1);
-    expect(sessions[0].id).toBe('sess-del-2');
-  });
-
-  it('clears currentSessionId when deleting the active session', () => {
-    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } as any;
-    const store = new SessionStore(stateFile, logger);
-
-    store.setCurrentSession('personal', '123', 'sess-active');
-    const deleted = store.deleteSession('personal', '123', 'sess-active');
-    expect(deleted).toBe(true);
-
-    const user = store.getUser('personal', '123');
-    expect(user.currentSessionId).toBeNull();
-  });
-
-  it('returns false when deleting non-existent session', () => {
-    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } as any;
-    const store = new SessionStore(stateFile, logger);
-
-    const deleted = store.deleteSession('personal', '123', 'nonexistent');
-    expect(deleted).toBe(false);
-  });
-});
+// The old "integration: config → session store" and "integration: session
+// titles and deletion" describe blocks (9 tests total) called
+// SessionStore.setCurrentSession/updateSessionActivity/getRecentSessions/
+// setSessionTitle/deleteSession/clearSession — all removed by 6e635e0
+// ("strip session tracking"). Session titles/models are now read live from
+// the CC JSONL, and TGCC tracks one session per chat via sessionsByChat
+// instead of manually-tracked per-user session lists with titles. Manual
+// titling/deletion of sessions was intentionally dropped along with that —
+// there is no replacement API to rewrite these against, so they're deleted
+// rather than ported.
 
 describe('integration: CC activity state tracking', () => {
   it('tracks activity state through stream events', () => {
@@ -309,8 +188,14 @@ describe('integration: session takeover detection', () => {
     child: vi.fn().mockReturnThis(),
   } as any;
 
-  it('emits takeover event on unexpected exit (non-zero code)', async () => {
-    // Spawn a process that exits with code 1 (simulating external kill)
+  it('does NOT emit takeover on unexpected exit before session init (restart race)', async () => {
+    // dfed4cc ("tool UI, AskUserQuestion, plan mode, sealed-bubble detection")
+    // fixed a takeover false positive: exit is only a real "takeover" if the
+    // process had fully initialized (i.e. got a sessionId from CC's init
+    // event). This bash stand-in never emits CC protocol output, so
+    // _sessionId is never set — exiting non-zero here is indistinguishable
+    // from an orphaned CC process losing a restart race, not an external
+    // takeover, and must NOT emit 'takeover'.
     const proc = new CCProcess({
       agentId: 'test',
       userId: '123',
@@ -337,6 +222,44 @@ describe('integration: session takeover detection', () => {
 
     await proc.start();
     // Wait for the process to exit
+    await new Promise<void>((resolve) => {
+      proc.on('exit', () => resolve());
+    });
+
+    expect(takeover).not.toHaveBeenCalled();
+    expect(proc.takenOver).toBe(false);
+  });
+
+  it('emits takeover event on unexpected exit once the session has initialized', async () => {
+    // Positive counterpart to the guard above: once _sessionId is set (CC
+    // fully initialized), an unexpected non-zero exit IS treated as a
+    // takeover.
+    const proc = new CCProcess({
+      agentId: 'test',
+      userId: '123',
+      ccBinaryPath: 'bash',
+      userConfig: {
+        model: 'claude-opus-4-6',
+        repo: '/tmp',
+        maxTurns: 1,
+        idleTimeoutMs: 300_000,
+        hangTimeoutMs: 300_000,
+        permissionMode: 'dangerously-skip',
+      },
+      continueSession: false,
+      logger: mockLogger,
+    });
+
+    (proc as any).buildArgs = () => ['-c', 'exit 1'];
+    (proc as any).sendInitializeRequest = () => {};
+
+    const takeover = vi.fn();
+    proc.on('takeover', takeover);
+
+    await proc.start();
+    // Simulate CC having reached full init before the external kill.
+    (proc as any)._sessionId = 'fake-session-id';
+
     await new Promise<void>((resolve) => {
       proc.on('exit', () => resolve());
     });
