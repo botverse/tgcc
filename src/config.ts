@@ -101,12 +101,29 @@ export interface AgentConfig {
   groupContext?: string;
 }
 
+/**
+ * Conversation monitor: mirrors every mirrored agent's traffic (minus owner-originated turns)
+ * into a Telegram destination, posted by the native supervisor's bot. Absent = feature off,
+ * behaviour byte-for-byte unchanged. See work/agent-conversation-monitor/PLAN.md.
+ */
+export interface MonitorConfig {
+  /** Destination chat id — a private supergroup (with Topics) or a DM. Set by /monitor_here or by hand. */
+  chatId: number;
+  /** Agent IDs to mirror. Agents not listed here are never mirrored. */
+  agents: string[];
+  /** Telegram user IDs whose turns are never mirrored, on any agent (as strings, matching allowedUsers). */
+  excludeUsers: string[];
+  /** One forum topic per agent (created on first use, id persisted). Default: true. */
+  topicPerAgent: boolean;
+}
+
 export interface TgccConfig {
   global: GlobalConfig;
   repos: Record<string, string>;       // name → absolute path
   agents: Record<string, AgentConfig>;
   supervisor: string | null;           // agentId of native supervisor (null = disabled)
   cron?: { jobs: CronJobConfig[] };
+  monitor?: MonitorConfig;
 }
 
 // ── Defaults ──
@@ -373,7 +390,31 @@ export function validateConfig(raw: unknown): TgccConfig {
     cron = { jobs };
   }
 
-  return { global, repos, agents, supervisor, ...(cron ? { cron } : {}) };
+  // Monitor (optional, top-level). Absent = feature off, behaviour unchanged.
+  let monitor: TgccConfig['monitor'];
+  const monitorRaw = obj.monitor as Record<string, unknown> | undefined;
+  if (monitorRaw && typeof monitorRaw === 'object') {
+    if (typeof monitorRaw.chatId !== 'number') {
+      throw new Error('"monitor.chatId" must be a number (Telegram chat id) — run /monitor_here in the destination chat, or set it by hand');
+    }
+    const monitorAgents = Array.isArray(monitorRaw.agents)
+      ? monitorRaw.agents.filter((a: unknown): a is string => typeof a === 'string')
+      : [];
+    for (const aid of monitorAgents) {
+      if (!agents[aid]) throw new Error(`"monitor.agents" references unknown agent "${aid}"`);
+    }
+    const excludeUsers = Array.isArray(monitorRaw.excludeUsers)
+      ? monitorRaw.excludeUsers.map(String)
+      : [];
+    monitor = {
+      chatId: monitorRaw.chatId,
+      agents: monitorAgents,
+      excludeUsers,
+      topicPerAgent: monitorRaw.topicPerAgent !== false,
+    };
+  }
+
+  return { global, repos, agents, supervisor, ...(cron ? { cron } : {}), ...(monitor ? { monitor } : {}) };
 }
 
 // ── Resolved per-user config ──
@@ -573,9 +614,10 @@ export class ConfigWatcher extends EventEmitter {
       const diff = diffConfigs(this.currentConfig, newConfig);
       const reposChanged = JSON.stringify(this.currentConfig.repos) !== JSON.stringify(newConfig.repos);
       const globalChanged = JSON.stringify(this.currentConfig.global) !== JSON.stringify(newConfig.global);
+      const monitorChanged = JSON.stringify(this.currentConfig.monitor) !== JSON.stringify(newConfig.monitor);
 
-      if (diff.added.length || diff.removed.length || diff.changed.length || reposChanged || globalChanged) {
-        this.logger.info({ diff, reposChanged, globalChanged }, 'Config changed');
+      if (diff.added.length || diff.removed.length || diff.changed.length || reposChanged || globalChanged || monitorChanged) {
+        this.logger.info({ diff, reposChanged, globalChanged, monitorChanged }, 'Config changed');
         this.currentConfig = newConfig;
         this.emit('change', newConfig, diff);
       }
