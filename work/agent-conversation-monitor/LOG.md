@@ -41,6 +41,54 @@
 - `/monitor_here` was read-through only, never invoked against a real bot/config (would have required touching the real `~/.tgcc/config.json`, which is off-limits per operational constraints).
 - Ordering/interleaving across *concurrent* chats of the same agent (two different chatIds active at once) — the design keys everything by `${agentId}:${chatId}` so it should be independent per chat, but I didn't write a specific concurrent-chat fixture.
 
-### Status
+### Status (superseded — see next section)
 
 Implementation complete and self-verified against all 11 acceptance criteria to the extent achievable without a real Telegram destination. Handed back to the lead for a tester to write the regression suite in `tests/`.
+
+## 2026-09-17 (later) — lead review: 3 fixes before a tester gets involved
+
+The lead reviewed independently (confirmed my `npm install` never touched the primary checkout's `node_modules`/`dist`) and found three problems worth fixing before bringing in a tester. Housekeeping first: deleted the stray `package-lock.json` (never committed) and switched to `pnpm` (this repo's actual package manager — `pnpm-lock.yaml` was already present; I'd been using `npm` out of habit). `rm -rf node_modules dist && pnpm install` reused the existing lockfile cleanly; `pnpm run build` and `pnpm test` both green afterward (259 passed / 1 skipped / 17 files, matching the npm-run baseline exactly).
+
+### Fix 1 — throughput: the coalescing granularity doesn't hold up (lead's plan flaw, not an implementation miss)
+
+My criterion-10 self-test result (100 tool calls → 102 messages) technically satisfied "bounded" but missed why it mattered: Telegram throttles a bot to ~20 messages/minute *per chat*, forum topics share that limit, and delivery was chained *per agent* — so a busy turn built a multi-minute backlog, a queued ⚠️ could arrive minutes late, and multiple busy agents fighting over one shared per-chat limit multiplied 429s instead of sharing capacity. Nothing bounded backlog growth either.
+
+Redesigned `src/monitor.ts`'s outbound delivery (see `PLAN.md` §Delivery for the full "as built" description — the plan text itself was wrong here, now corrected):
+- Turn-boundary buffering (assistant `message_stop` / tool result / turn end → `pendingLines`) is unchanged — that part of the design was right.
+- New: a per-agent **outbound backlog** (`backlogs`) that a single **pump loop** drains, serialized per *destination chat* rather than per agent. A send's completion (not a timer) is what triggers picking the next thing to send — still purely event-driven.
+- Each pick **packs** one agent's backlog into as few ≤3500-char messages as fit, so message count follows the rate limit and how much fits per send, not the raw event count.
+- Blocks are `critical` (destructive ⚠️, inbound human messages, `tgcc_send` origins, final replies — "who asked for what") or `routine` (thinking, non-destructive tool calls, tool results, non-final narration). Critical blocks pack first on every send and are never collapsed — a ⚠️ escapes the very next time its agent is chosen, never stuck behind routine backlog.
+- Routine backlog capped at 50 blocks/agent; past the cap, the *oldest* routine blocks collapse into one summary line grouped by tool/kind (`… N routine events omitted: Read ×20, ...`) — bounds memory, never touches critical content.
+- Forum topic ids now persisted keyed by **destination chat id + agent id** (`${chatId}:${agentId}`), not just agent id — a destination change can no longer reuse a stale thread id from the old chat.
+- Topic-creation failure now warns **once** per destination (`topicsUnavailableWarned` flag) instead of on every message, and falls back to posting without a thread.
+- `registerHere` now also notifies the *previous* destination (if different) that it no longer receives mirrors — a destination change is never silent — without naming the new chat id to a chat that may not be trusted with it.
+
+Decision: kept the 429-retry-with-`sleep` idiom exactly as before (still data-driven by Telegram's own `retry_after`, not a batching heuristic) rather than adding proactive rate-limiting — the lead's own instruction was explicit that this should stay event-driven with no new timers, and packing + reactive 429 backoff together are sufficient to make message count track the rate limit.
+
+Self-verified with a rewritten scratch harness (never committed): a 201-event burst with realistic interleaved yields packed down to well under 40 sends (22 in one run); a destructive call pushed behind 30 pending routine blocks in the same synchronous tick still escaped within the first 3 messages sent; a 400-event burst with zero yields triggered cap-collapse and stayed under 30 messages, with a visible `... N routine events omitted` summary grouped correctly by tool name; cross-agent sends to the same destination never overlapped (measured max concurrency = 1, confirming per-agent chains are gone); a destination change correctly created a *fresh* topic in the new chat rather than reusing the old thread id; the topics-unavailable fallback warned exactly once across 5 messages, not 5 times.
+
+### Fix 2 — `/monitor_here` had no real authorization check
+
+Originally gated only by whichever bot's generic `allowedUsers` happened to apply — reachable on every agent's bot, including `sentinella`'s, whose `allowedUsers` includes the colleagues (Max, Clara) the monitor exists to watch. Either could have moved the destination themselves.
+
+Added `monitor.ownerUserId` (required once a `monitor` block exists — config validation now rejects a block without it) and two defense layers: `TelegramBot` gets an `isSupervisorBot` flag (set from `agentId === this.nativeSupervisorId` at construction) that gates whether `/monitor_here` is even registered as a live command (`bot.command(...)`) or listed in the BotFather menu (`setMyCommands`) — every other bot doesn't parse it as a command at all, it just falls through as ordinary text. The shared `handleSlashCommand` handler *also* independently re-checks via a new pure function `checkMonitorHereAuth(agentId, nativeSupervisorId, callerUserId, ownerUserId)`, exported from `bridge.ts` alongside the existing `buildInboundText`/`MessageBatcher` pattern (pure logic pulled out of the handler specifically so it's unit-testable without constructing a full `Bridge`) — this never trusts routing alone. Explicitly did NOT infer the owner from `excludeUsers`, per the lead's instruction: that list can contain other ids too, and inferring identity from it would be guesswork, not an explicit check.
+
+Self-verified with the scratch harness calling `checkMonitorHereAuth` directly for every branch, including the exact attack the lead described (a colleague's user id reaching `sentinella`'s bot, rejected as `not-supervisor-bot` even when that id happens to equal the configured owner) and a non-owner reaching the supervisor bot itself (rejected as `not-owner`). The full routing-level guarantee (that `sentinella`'s actual `TelegramBot` instance really doesn't wire up the command) is architectural — `isSupervisorBot` is only ever `true` for the one agent matching `config.supervisor` — but wasn't exercised via a live grammy bot instance in my harness; that's a natural fit for the tester's `tests/` suite, which can construct a `TelegramBot` directly.
+
+### Fix 3 — the monitor destination chat itself was never excluded
+
+The owner has to be an allowed user of whichever bot posts into the destination chat (to run `/monitor_here`), and that bot has to be a group admin to manage topics — so it receives every message sent there. With no exclusion, anything the owner typed in the destination chat (a note, a reply to a mirrored message) was treated as an ordinary prompt and spawned a CC turn inside the mirror feed itself.
+
+Added `Bridge.isMonitorDestinationChat(chatId)` (`this.config.monitor?.chatId === chatId`), checked in both message paths: `handleTelegramMessage` now returns immediately for any inbound message from that chat (before touching AskUserQuestion/CLI-tmux/voice-transcription handling — none of those should run there either); `handleSlashCommand` now ignores every command except `monitor_here` and `status` when run in that chat, so `/new`, `/repo`, `/model`, etc. typed there don't silently act on whichever bot happens to be posting into the feed. Slash commands were never at risk from the `handleTelegramMessage` guard specifically — grammy routes `/command` messages to `onCommand` before `handleText`/`onMessage` ever sees them — but needed their own guard in `handleSlashCommand` for the same reason.
+
+### Commit structure
+
+Split into 3 logical commits per the lead's request, matching the 3 problems: `src/monitor.ts` (throughput) committed whole; then `src/config.ts` + `src/telegram.ts` + the authorization-only parts of `src/bridge.ts` (authorization); then the `isMonitorDestinationChat` guard additions to `src/bridge.ts` (monitor-chat exclusion) as their own commit. The latter two both touch `src/bridge.ts`, so I temporarily reverted the exclusion-guard hunks via `Edit` before the authorization commit, verified the build stayed clean without them, committed, then re-added them and committed again — rather than fighting interactive `git add -p` (no interactive stdin in this environment) or hand-writing patch files.
+
+### Re-verification after all 3 fixes
+
+`pnpm run build` clean; `pnpm test` — 259 passed / 1 skipped / 0 failed, all 17 files — on the final committed state (all 3 fix commits applied). Plan and this log updated to match what was actually built; acceptance criterion 10 revised, criteria 12 and 13 added for fixes 2 and 3.
+
+### Status
+
+All 3 fixes implemented, self-verified, and pushed. Ready for the lead to bring in a tester.
