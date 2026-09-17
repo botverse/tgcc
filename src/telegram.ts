@@ -12,6 +12,8 @@ export interface TelegramMessage {
   userId: string;
   userName?: string;
   userHandle?: string; // Telegram @username (without @)
+  /** Group/supergroup title — undefined for DMs (chatId > 0). Used by the conversation monitor to tag inbound group traffic. */
+  chatTitle?: string;
   text: string;
   imageBase64?: string;
   imageMediaType?: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp';
@@ -71,6 +73,7 @@ export const COMMANDS = [
   { command: 'listcc', description: 'List external CC sessions' },
   { command: 'killcc', description: 'Kill an external CC session' },
   { command: 'ping', description: 'Quick liveness check' },
+  { command: 'monitor_here', description: 'Register this chat as the conversation monitor destination' },
   { command: 'help', description: 'List all commands' },
 ];
 
@@ -270,6 +273,12 @@ export class TelegramBot {
     return from.last_name ? `${from.first_name} ${from.last_name}` : from.first_name;
   }
 
+  /** Group/supergroup title, if this chat has one (undefined for DMs). */
+  private static getChatTitle(ctx: Context): string | undefined {
+    const chat = ctx.chat;
+    return chat && 'title' in chat ? chat.title : undefined;
+  }
+
   private setupHandlers(): void {
     // ── Group member tracking (runs before all handlers) ──
     this.bot.use((ctx, next) => {
@@ -415,6 +424,7 @@ export class TelegramBot {
         userId: String(userId),
         userName: TelegramBot.getUserName(ctx),
         userHandle: ctx.from?.username,
+        chatTitle: TelegramBot.getChatTitle(ctx),
         text: caption,
         imageBase64: base64,
         imageMediaType: mediaType,
@@ -450,6 +460,7 @@ export class TelegramBot {
       const caption = ctx.message?.caption ?? '';
       const userName = TelegramBot.getUserName(ctx);
       const userHandle = ctx.from?.username;
+      const chatTitle = TelegramBot.getChatTitle(ctx);
 
       // Check if it's an image — send as image content block
       if (doc.mime_type?.startsWith('image/')) {
@@ -461,6 +472,7 @@ export class TelegramBot {
           userId: String(userId),
           userName,
           userHandle,
+          chatTitle,
           text: caption,
           imageBase64: base64,
           imageMediaType: mediaType,
@@ -474,6 +486,7 @@ export class TelegramBot {
         userId: String(userId),
         userName,
         userHandle,
+        chatTitle,
         text: caption,
         filePath: savePath,
         fileName,
@@ -515,6 +528,7 @@ export class TelegramBot {
         userId: String(userId),
         userName: TelegramBot.getUserName(ctx),
         userHandle: ctx.from?.username,
+        chatTitle: TelegramBot.getChatTitle(ctx),
         text: ctx.message?.caption ?? '',
         filePath: savePath,
         fileName,
@@ -561,6 +575,7 @@ export class TelegramBot {
         userId: String(userId),
         userName: TelegramBot.getUserName(ctx),
         userHandle: ctx.from?.username,
+        chatTitle: TelegramBot.getChatTitle(ctx),
         text: ctx.message?.caption ?? '',
         filePath: savePath,
         fileName,
@@ -607,6 +622,7 @@ export class TelegramBot {
         userId: String(userId),
         userName: TelegramBot.getUserName(ctx),
         userHandle: ctx.from?.username,
+        chatTitle: TelegramBot.getChatTitle(ctx),
         text: '',
         filePath: savePath,
         fileName,
@@ -647,6 +663,7 @@ export class TelegramBot {
         userId: String(userId),
         userName: TelegramBot.getUserName(ctx),
         userHandle: ctx.from?.username,
+        chatTitle: TelegramBot.getChatTitle(ctx),
         text: ctx.message?.caption ?? '',
         filePath: savePath,
         fileName,
@@ -722,11 +739,12 @@ export class TelegramBot {
     return Number(chatId) === 0;
   }
 
-  async sendText(chatId: number | string, text: string, parseMode?: string, silent = false): Promise<number> {
+  async sendText(chatId: number | string, text: string, parseMode?: string, silent = false, threadId?: number): Promise<number> {
     if (this.isSyntheticChat(chatId)) return 0;
     const msg = await this.bot.api.sendMessage(Number(chatId), text, {
       parse_mode: parseMode as 'Markdown' | 'MarkdownV2' | 'HTML' | undefined,
       disable_notification: silent || undefined,
+      message_thread_id: threadId,
     });
     this.trackBotMessage(Number(chatId), msg.message_id, text);
     return msg.message_id;
@@ -804,6 +822,13 @@ export class TelegramBot {
     await this.bot.api.sendVoice(Number(chatId), new InputFile(filePath), {
       caption,
     });
+  }
+
+  /** Create a Topics-enabled forum topic in a supergroup. Returns the message_thread_id.
+   *  Requires the bot to be an admin with "Manage Topics" in that supergroup. */
+  async createForumTopic(chatId: number | string, name: string): Promise<number> {
+    const topic = await this.bot.api.createForumTopic(Number(chatId), name.slice(0, 128));
+    return topic.message_thread_id;
   }
 
   async replyToMessage(chatId: number | string, text: string, replyToMessageId: number, parseMode?: string): Promise<number> {
