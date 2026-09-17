@@ -1,16 +1,18 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
-import { tmpdir } from 'node:os';
+import { dirname } from 'node:path';
 import { updateConfig, isValidRepoName, findRepoOwner, CONFIG_PATH } from '../src/config.js';
 
-// Use a temp config for tests
-const TEST_DIR = join(tmpdir(), 'tgcc-test-' + process.pid);
-const TEST_CONFIG = join(TEST_DIR, 'config.json');
-
-// We need to override CONFIG_PATH for updateConfig.
-// Since CONFIG_PATH is a const export, we'll test updateConfig indirectly
-// by providing a minimal test that exercises the logic.
+// `CONFIG_PATH` is a module-level constant (`join(homedir(), '.tgcc', 'config.json')`) with no
+// override parameter, so the only way to redirect `updateConfig()` — the function under test
+// below — is to control what `homedir()` itself resolves to. vitest.config.ts's own `test.env`
+// does exactly that for the whole suite (a fresh, disposable HOME per run, set before any test
+// module is imported) — see its comment for the real-config-corruption incident that made that
+// necessary. This file used to read/write CONFIG_PATH directly with NO redirection at all
+// (silently relying on whatever `~/.tgcc/config.json` happened to exist on the machine running
+// the tests, backing it up and restoring it around each test) — that's exactly what caused it.
+// It's fixed here to seed a known-good, throwaway config into the (now-sandboxed) CONFIG_PATH
+// itself before every test, rather than depending on — or risking — a real one.
 
 describe('isValidRepoName', () => {
   it('accepts alphanumeric names', () => {
@@ -64,21 +66,26 @@ describe('findRepoOwner', () => {
 });
 
 describe('updateConfig', () => {
+  // Resolves into vitest.config.ts's sandboxed HOME — never the real ~/.tgcc/config.json. Seeded
+  // fresh before every test (not just once) so tests never depend on execution order or leftover
+  // state from a previous test/run, and always includes one agent so "assigns a repo to an
+  // agent" / "clears an agent repo assignment" below exercise their real logic rather than
+  // silently skipping when no agents happen to be configured.
   const origConfigPath = CONFIG_PATH;
-  let backupContent: string | null = null;
+  const seedConfig = {
+    repos: {},
+    agents: {
+      seedagent: { botToken: 'seed-token', allowedUsers: ['1'], defaults: { model: 'test' } },
+    },
+  };
 
   beforeEach(() => {
-    // Backup existing config
-    if (existsSync(origConfigPath)) {
-      backupContent = readFileSync(origConfigPath, 'utf-8');
-    }
+    mkdirSync(dirname(origConfigPath), { recursive: true });
+    writeFileSync(origConfigPath, JSON.stringify(seedConfig, null, 2));
   });
 
   afterEach(() => {
-    // Restore
-    if (backupContent !== null) {
-      writeFileSync(origConfigPath, backupContent);
-    }
+    if (existsSync(origConfigPath)) rmSync(origConfigPath, { force: true });
   });
 
   it('adds a repo to config', () => {
