@@ -4,7 +4,7 @@ Bootstrapped 2026-09-15 alongside the first PR to use `~/.claude/WORKFLOW.md` in
 
 ## Open
 
-_(none)_
+- **agent-conversation-monitor** — mirrors monitored-agent Telegram conversations (minus owner-originated turns) into a private Telegram destination for oversight, with destructive-action flagging and secret redaction. Implementation complete and self-verified (build clean, full existing `npm test` suite still green with no `monitor` config block, plus an unshipped scratch harness against all 11 acceptance criteria — see `work/agent-conversation-monitor/LOG.md`). **Not yet reviewed, not yet tested by a dedicated regression suite (tests/ not written), and not yet deployed** — a tester still needs to write `tests/` coverage against the 11 criteria in `work/agent-conversation-monitor/PLAN.md` before this is ready to merge; deployment (creating the destination supergroup, restarting `tgcc`, running `/monitor_here`) is a separate authorized step after merge. Plan/backlog/log: `work/agent-conversation-monitor/`. Branch: `feat/agent-conversation-monitor`.
 
 ## Recently completed
 
