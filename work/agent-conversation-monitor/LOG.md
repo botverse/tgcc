@@ -89,6 +89,36 @@ Split into 3 logical commits per the lead's request, matching the 3 problems: `s
 
 `pnpm run build` clean; `pnpm test` — 259 passed / 1 skipped / 0 failed, all 17 files — on the final committed state (all 3 fix commits applied). Plan and this log updated to match what was actually built; acceptance criterion 10 revised, criteria 12 and 13 added for fixes 2 and 3.
 
-### Status
+### Status (superseded — see next section)
 
 All 3 fixes implemented, self-verified, and pushed. Ready for the lead to bring in a tester.
+
+## 2026-09-17 (round 3) — lead review: DM-lockout bug + cross-agent ⚠️ priority verification
+
+A tester (`monitor-tests`) started in parallel in its own worktree, pushing to this same remote branch and owning `tests/`. Coordination going forward: `git fetch` + rebase onto `origin/feat/agent-conversation-monitor` before every push (no push races observed this round — checked via `git fetch` before starting and again before each push; `origin` matched local HEAD both times).
+
+### Bug: fix 3 (monitor-chat exclusion) could lock the owner out of every agent
+
+`isMonitorDestinationChat` matched on `chatId === monitor.chatId` alone, shared by `handleTelegramMessage`/`handleSlashCommand` across every agent's bot. Telegram private-chat ids equal the user's id, and that id is **identical across every bot** the user talks to — so a DM destination (explicitly endorsed by the plan: "the destination is just a chat id in config, so a DM destination remains possible without code changes") set to the owner's own DM would make the owner's private-chat id collide with `monitor.chatId` on *every* agent's bot, silently dropping everything the owner sent to every agent. A real, embarrassing bug — my own earlier scratch harness never exercised a DM destination, only group ones, so I never noticed it.
+
+Fixed: `isMonitorDestinationChat(agentId, chatId)` now returns `false` outright for `chatId >= 0` (any private chat) — group/supergroup ids are Telegram-wide unique and never collide with a user id, so this alone makes the exclusion safe for the DM case. Added `agentId === this.nativeSupervisorId` as defence in depth (the exclusion should only ever apply to the one bot actually sitting in the monitor group, even in the unlikely case another agent's bot is also a member of that same group for an unrelated reason). Confirmed the existing "topics unavailable → warn once, fall back to no thread" handling already covers a DM destination for free, since Telegram's `createForumTopic` rejects private chats — no separate code path needed there.
+
+Self-verified with a scratch harness (never committed): the exact lockout scenario (destination == owner's DM id) confirmed non-excluded for `sentinella`, `kyobot`, and the supervisor bot itself; a group destination confirmed still correctly excluded on the supervisor's bot and *not* excluded for a different agent's bot even sharing the same chat id; a simulated DM destination with `createForumTopic` always rejecting (real Telegram behaviour outside supergroups) still delivered every message, with no `threadId`, warning exactly once across 4 messages.
+
+### Cross-agent ⚠️ priority: verified already correct, no code change needed
+
+The lead asked me to check whether `selectNextToSend()` was critical-aware *across* agents (not just within one agent's own backlog) — my round-2 report had said a ⚠️ "escapes on the next send for its agent," which the lead correctly flagged as ambiguous/possibly wrong given the pump rotates through agents. Re-read `selectNextToSend()` closely: `candidates = withCritical.length > 0 ? withCritical : withAny` — `withCritical` is computed by scanning **every** agent's backlog (`for (const [agentId, blocks] of this.backlogs)`), not scoped to whichever agent was picked last. So whenever *any* agent has a pending critical block, `candidates` is restricted to *only* agents with critical content, globally — an agent with routine-only content is never selected while any other agent has critical content waiting. This was already correct in the round-1 design; my round-1 test (`testDestructiveJumpsQueue`) just never isolated the cross-agent case (it only ever used one agent), which is exactly why the lead's "consistent with rotation" concern was reasonable to raise.
+
+Wrote a dedicated cross-agent scratch test to confirm empirically rather than rely on code reading alone: gave `kyo_team` and `sentinella_team` large routine-only backlogs (20 tool calls each) with the pump *already mid-flight* delivering one of them (artificial send delay to force real interleaving), then pushed a `sentinella` destructive call while both other agents still had substantial undelivered routine backlog (confirmed: at least 40 pending routine sends' worth still queued at the moment the ⚠️ arrived). Result: at most the *one* send already physically in flight at arrival time (which can't be preempted — there is no way to cancel an in-progress Telegram API call) happened before the ⚠️ went out; zero *additional* routine sends from either other agent snuck in ahead of it. No code change made — this was a verification task, and the design held up. Tightened acceptance criterion 10's wording in PLAN.md to state the cross-agent requirement explicitly (destination-chat-wide, not per-agent) so it's unambiguous for the tester.
+
+### Plan/log updated
+
+`PLAN.md`: §Configuration's monitor-chat-exclusion note gets a "shipped with a lockout bug, now fixed" addendum explaining the DM-id-collision mechanism; criterion 10 reworded to state the ⚠️ priority requirement is destination-chat-wide; new criterion 14 added for the DM-non-suppression guarantee.
+
+### Re-verification
+
+`pnpm run build` clean; `pnpm test` — 259 passed / 1 skipped / 0 failed, all 17 files — on the final committed state. `git fetch` confirmed no divergence from `origin/feat/agent-conversation-monitor` before pushing.
+
+### Status
+
+Both follow-ups addressed (one real bug fixed, one verified already-correct with new test coverage), committed, and pushed. Ready for the lead / tester.

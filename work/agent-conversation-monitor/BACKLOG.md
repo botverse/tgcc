@@ -2,7 +2,9 @@
 
 Work ID: `agent-conversation-monitor` · Branch: `feat/agent-conversation-monitor` · Owner: implementing agent (worktree `agent-a255419cfffec4ced`)
 
-See `PLAN.md` in this directory for the full spec (problem, decisions, design, 13 acceptance criteria as of the 2026-09-17 revision).
+See `PLAN.md` in this directory for the full spec (problem, decisions, design, 14 acceptance criteria as of the 2026-09-17 revisions).
+
+`monitor-tests` (tester, own worktree, owns `tests/`) is now working in parallel against this same remote branch. Coordination: fetch + rebase onto `origin/feat/agent-conversation-monitor` before every push; if a tester-reported failure is a genuine `src/` defect, fix it here and tell them once pushed.
 
 ## Done (implementation complete, self-verified — see LOG.md)
 
@@ -13,6 +15,8 @@ See `PLAN.md` in this directory for the full spec (problem, decisions, design, 1
 - [x] `src/config.ts`: `monitor` config block (including required `ownerUserId`) + validation + hot-reload diff detection.
 - [x] `src/bridge.ts` wiring: `queueForChat` (Telegram inbound), `sendToCC` (generic non-Telegram capture), `sendSupervisorMessage` (tgcc_send + tgcc_spawn initial message, with traced origin human), new `sendCronMessage` helper (all 8 cron-firing call sites), `proc.on('assistant'|'tool_result'|'result')` in `spawnCCProcess` (covers host + container agents identically — same `ICCProcess` event shapes), `/monitor_here` command with `checkMonitorHereAuth` (pure, exported) authorization, `isMonitorDestinationChat` guard in both `handleTelegramMessage` and `handleSlashCommand`.
 - [x] Switched worktree tooling from `npm` to `pnpm` (this repo's actual package manager) per the lead's instruction; deleted the stray untracked `package-lock.json`.
+- [x] Fixed a real bug: `isMonitorDestinationChat` could lock the owner out of every agent when the destination was set to the owner's own DM (Telegram private-chat ids are identical across every bot). Now scoped to `chatId < 0` (group/supergroup only) and `agentId === nativeSupervisorId`.
+- [x] Verified (no code change needed) that `⚠️` priority in the pump's `selectNextToSend()` is already critical-aware across ALL agents sharing the destination chat, not just within one agent's own backlog — see LOG.md's round-3 entry for the dedicated cross-agent test.
 
 ## Open (deferred, not required by the acceptance criteria)
 
