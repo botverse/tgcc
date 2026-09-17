@@ -115,6 +115,14 @@ export interface MonitorConfig {
   excludeUsers: string[];
   /** One forum topic per agent (created on first use, id persisted). Default: true. */
   topicPerAgent: boolean;
+  /**
+   * The owner's Telegram user id, explicit and required — NOT inferred from excludeUsers (that
+   * list can contain other ids too, and inferring "the owner" from it would be guesswork).
+   * Only this user, acting through the native supervisor's bot, may run /monitor_here. Anyone
+   * else who can reach that command — including colleagues the monitor exists to watch, via a
+   * different agent's bot — must not be able to move or disable the monitor destination.
+   */
+  ownerUserId: string;
 }
 
 export interface TgccConfig {
@@ -397,6 +405,12 @@ export function validateConfig(raw: unknown): TgccConfig {
     if (typeof monitorRaw.chatId !== 'number') {
       throw new Error('"monitor.chatId" must be a number (Telegram chat id) — run /monitor_here in the destination chat, or set it by hand');
     }
+    // Required and explicit — deliberately NOT inferred from excludeUsers. /monitor_here is
+    // gated on this id exactly, so a config that enables the monitor without saying who its
+    // owner is would leave that authorization check with nothing to check against.
+    if (typeof monitorRaw.ownerUserId !== 'string' || !monitorRaw.ownerUserId) {
+      throw new Error('"monitor.ownerUserId" must be a string (the owner\'s Telegram user id) — required so /monitor_here can be restricted to the owner');
+    }
     const monitorAgents = Array.isArray(monitorRaw.agents)
       ? monitorRaw.agents.filter((a: unknown): a is string => typeof a === 'string')
       : [];
@@ -411,6 +425,7 @@ export function validateConfig(raw: unknown): TgccConfig {
       agents: monitorAgents,
       excludeUsers,
       topicPerAgent: monitorRaw.topicPerAgent !== false,
+      ownerUserId: monitorRaw.ownerUserId,
     };
   }
 

@@ -206,6 +206,30 @@ export function buildInboundText(input: InboundTextInput, roster: string | null,
   return text;
 }
 
+// ── /monitor_here authorization ──
+//
+// Pulled out as a pure function (same pattern as buildInboundText / MessageBatcher above) so
+// the authorization decision is unit-testable without constructing a full Bridge instance —
+// this is the check that stops the people the monitor exists to watch (e.g. colleagues in
+// sentinella's allowedUsers, who can reach sentinella's bot but not the supervisor's) from
+// moving or disabling the monitor destination themselves.
+
+export type MonitorHereAuthResult =
+  | { ok: true }
+  | { ok: false; reason: 'not-supervisor-bot' | 'owner-not-configured' | 'not-owner' };
+
+export function checkMonitorHereAuth(
+  agentId: string,
+  nativeSupervisorId: string | null,
+  callerUserId: string,
+  ownerUserId: string | undefined,
+): MonitorHereAuthResult {
+  if (agentId !== nativeSupervisorId) return { ok: false, reason: 'not-supervisor-bot' };
+  if (!ownerUserId) return { ok: false, reason: 'owner-not-configured' };
+  if (callerUserId !== ownerUserId) return { ok: false, reason: 'not-owner' };
+  return { ok: true };
+}
+
 interface SupervisorPendingRequest {
   resolve: (result: unknown) => void;
   reject: (err: Error) => void;
@@ -991,6 +1015,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
       (cmd) => this.handleSlashCommand(agentId, cmd),
       this.logger,
       (query) => this.handleCallbackQuery(agentId, query),
+      agentId === this.nativeSupervisorId,
     );
 
     // Resolve initial repo and model from config + persisted state
@@ -2664,10 +2689,7 @@ ${hbContent}`;
         lines.push('', 'Send a message to start, or use /help for commands.');
         await agent.tgBot.sendText(cmd.chatId, lines.join('\n'), 'HTML');
         // Re-register commands with BotFather to ensure menu is up to date
-        try {
-          const { COMMANDS } = await import('./telegram.js');
-          await agent.tgBot.bot.api.setMyCommands(COMMANDS);
-        } catch {}
+        await agent.tgBot.refreshCommands().catch(() => {});
         break;
       }
 
@@ -2682,10 +2704,37 @@ ${hbContent}`;
       }
 
       case 'monitor_here': {
+        // Defense in depth: TelegramBot only wires this command up on the supervisor's bot at
+        // all (isSupervisorBot), but this handler is shared code reached from every bot, so it
+        // re-checks independently via a pure, unit-testable function rather than trusting that
+        // routing alone. The people this feature exists to watch (e.g. colleagues in
+        // sentinella's allowedUsers) must never be able to move or disable the monitor
+        // destination via some other agent's bot.
+        const auth = checkMonitorHereAuth(agentId, this.nativeSupervisorId, cmd.userId, this.config.monitor?.ownerUserId);
+        if (!auth.ok) {
+          if (auth.reason === 'not-supervisor-bot') {
+            this.logger.warn({ agentId, userId: cmd.userId }, '/monitor_here rejected — not the supervisor bot');
+            break;
+          }
+          if (auth.reason === 'owner-not-configured') {
+            await agent.tgBot.sendText(
+              cmd.chatId,
+              '<blockquote>⚠️ "monitor.ownerUserId" is not set in ~/.tgcc/config.json. Add a <code>monitor</code> block with at least <code>ownerUserId</code> (your Telegram user id) before /monitor_here can be used.</blockquote>',
+              'HTML',
+            );
+            break;
+          }
+          // not-owner
+          this.logger.warn({ agentId, userId: cmd.userId, ownerUserId: this.config.monitor?.ownerUserId }, '/monitor_here rejected — caller is not the configured owner');
+          await agent.tgBot.sendText(cmd.chatId, "<blockquote>You're not authorized to change the conversation monitor destination.</blockquote>", 'HTML');
+          break;
+        }
+
         // Run inside the intended monitor destination chat (typically a private supergroup with
-        // Topics enabled, with this agent's bot added as admin) — records its chat id into
-        // ~/.tgcc/config.json so the owner never has to look up a chat id by hand.
-        this.monitor.registerHere(cmd.chatId);
+        // Topics enabled, with this bot added as admin) — records its chat id into
+        // ~/.tgcc/config.json so the owner never has to look up a chat id by hand. Notifies the
+        // previous destination (if any) so a destination change is never silent.
+        this.monitor.registerHere(cmd.chatId, cmd.userId);
         await agent.tgBot.sendText(
           cmd.chatId,
           `<blockquote>✅ This chat (<code>${escapeHtml(String(cmd.chatId))}</code>) is now the conversation monitor destination.\nSet <code>monitor.agents</code> in ~/.tgcc/config.json to the agent IDs you want mirrored (or add them now if this is the first time).</blockquote>`,

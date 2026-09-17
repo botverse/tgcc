@@ -73,9 +73,13 @@ export const COMMANDS = [
   { command: 'listcc', description: 'List external CC sessions' },
   { command: 'killcc', description: 'Kill an external CC session' },
   { command: 'ping', description: 'Quick liveness check' },
-  { command: 'monitor_here', description: 'Register this chat as the conversation monitor destination' },
   { command: 'help', description: 'List all commands' },
 ];
+
+/** Only registered/visible on the supervisor's bot — see TelegramBot's isSupervisorBot flag.
+ *  Changing the conversation-monitor destination is owner-only and must not be reachable
+ *  (even cosmetically, via the command menu) from bots the people being monitored talk to. */
+export const MONITOR_HERE_COMMAND = { command: 'monitor_here', description: 'Register this chat as the conversation monitor destination (owner only)' };
 
 // ── Media type detection ──
 
@@ -137,6 +141,11 @@ export class TelegramBot {
   /** Per-chat group member roster: chatId → userId → GroupMember */
   private groupMembers = new Map<number, Map<number, GroupMember>>();
 
+  /** True only for the native supervisor's bot — gates whether /monitor_here is even wired up
+   *  (see setupHandlers/start). The bridge-level handler double-checks agentId + owner user id
+   *  regardless; this is defense in depth, not the only guard. */
+  readonly isSupervisorBot: boolean;
+
   constructor(
     agentId: string,
     config: AgentConfig,
@@ -145,6 +154,7 @@ export class TelegramBot {
     onCommand: CommandHandler,
     logger: pino.Logger,
     onCallback?: CallbackHandler,
+    isSupervisorBot = false,
   ) {
     this.agentId = agentId;
     this.config = config;
@@ -153,6 +163,7 @@ export class TelegramBot {
     this.onMessage = onMessage;
     this.onCommand = onCommand;
     this.onCallback = onCallback ?? null;
+    this.isSupervisorBot = isSupervisorBot;
 
     this.bot = new Bot(config.botToken);
     this.setupHandlers();
@@ -289,6 +300,11 @@ export class TelegramBot {
     // ── Slash commands ──
     for (const { command } of COMMANDS) {
       this.bot.command(command, (ctx) => this.handleCommand(ctx, command));
+    }
+    // monitor_here is wired up ONLY on the supervisor's bot — other bots don't even parse it
+    // as a command (it falls through to handleText as ordinary text there).
+    if (this.isSupervisorBot) {
+      this.bot.command(MONITOR_HERE_COMMAND.command, (ctx) => this.handleCommand(ctx, MONITOR_HERE_COMMAND.command));
     }
 
     // ── Callback queries (inline button presses) ──
@@ -675,10 +691,23 @@ export class TelegramBot {
 
   // ── Bot lifecycle ──
 
+  /** Commands to register/show in the BotFather menu for this bot — includes monitor_here
+   *  only on the supervisor's bot (see isSupervisorBot). */
+  private registeredCommands(): typeof COMMANDS {
+    return this.isSupervisorBot ? [...COMMANDS, MONITOR_HERE_COMMAND] : COMMANDS;
+  }
+
+  /** Re-register this bot's command menu with BotFather (e.g. after /start). Public so callers
+   *  never need to reach for the raw COMMANDS constant directly and risk registering
+   *  monitor_here on a non-supervisor bot. */
+  async refreshCommands(): Promise<void> {
+    await this.bot.api.setMyCommands(this.registeredCommands());
+  }
+
   async start(): Promise<void> {
     // Register commands with BotFather
     try {
-      await this.bot.api.setMyCommands(COMMANDS);
+      await this.bot.api.setMyCommands(this.registeredCommands());
       this.logger.info('Registered slash commands with BotFather');
     } catch (err) {
       this.logger.warn({ err }, 'Failed to register commands');
