@@ -62,6 +62,7 @@ import { RalphManager, buildRalphPrompt } from './ralph.js';
 import { ExternalCcManager, sanitizeSessionName, formatAgo } from './external-cc.js';
 import { wrapTeammateMessage, wrapSystemReminder } from './cc-tags.js';
 import { Scheduler, computeOneShotSchedule, parseEveryToCron } from './scheduler.js';
+import { ConversationMonitor, type TurnOrigin } from './monitor.js';
 import { randomUUID } from 'node:crypto';
 import { exec as nodeExec, execSync } from 'node:child_process';
 import { transcribeAudioGemini, buildTranscriptionTurn, type TranscribeResult } from './transcribe.js';
@@ -152,7 +153,7 @@ interface AgentInstance {
   awaitingAskCleanup: boolean;            // true when AskUserQuestion was detected this turn → delete fallback bubble on result
   muteOutput: boolean; // suppress TG rendering for wake-triggered supervisor turns
   authFlowInProgress: boolean; // prevents re-entrant auth fallback
-  lastSendData: { text: string; source?: { chatId?: number; spawnSource?: 'telegram' | 'supervisor' | 'cli' } } | null; // for retry after auth
+  lastSendData: { text: string; source?: { chatId?: number; spawnSource?: 'telegram' | 'supervisor' | 'cli'; alreadyMirrored?: boolean } } | null; // for retry after auth
   claudeConfigDir: string | undefined; // isolated CLAUDE_CONFIG_DIR for docker agents
   pendingCliTmuxAgent: string | null; // waiting for tmux session name reply from /new-cli
 }
@@ -409,6 +410,10 @@ export class Bridge extends EventEmitter implements CtlHandler {
   /** Cache of session-id → derived title (read from JSONL on first turn-complete per session). */
   private sessionTitleCache = new Map<string, string | null>();
 
+  // Conversation monitor: mirrors monitored-agent traffic into a Telegram destination
+  // (see work/agent-conversation-monitor/PLAN.md). Off when config.monitor is absent.
+  private monitor: ConversationMonitor;
+
   constructor(config: TgccConfig, logger?: pino.Logger) {
     super();
     this.config = config;
@@ -522,6 +527,17 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
     // External CC sessions (tmux windows running `claude --remote-control`)
     this.externalCc = new ExternalCcManager(join(homedir(), '.tgcc', 'external-cc.json'), this.logger);
+
+    // Conversation monitor — reads this.config fresh on every send, so hot-reloading the
+    // top-level "monitor" block (including turning it on/off) takes effect immediately.
+    this.monitor = new ConversationMonitor({
+      getConfig: () => this.config.monitor,
+      getSenderBot: () => {
+        if (!this.nativeSupervisorId) return null;
+        return this.agents.get(this.nativeSupervisorId)?.tgBot ?? null;
+      },
+      logger: this.logger,
+    });
   }
 
   /** Start or restart the supervisor heartbeat timer. Delegates to SupervisorManager. */
@@ -601,13 +617,27 @@ export class Bridge extends EventEmitter implements CtlHandler {
     return discoverCCSessions(this.agentSessionRepo(agent), limit, agent.claudeConfigDir);
   }
 
-  /** Send a supervisor message to an agent and register a wake-on-complete ping. */
+  /** Send a supervisor message to an agent and register a wake-on-complete ping. Covers both
+   *  tgcc_send and an initial tgcc_spawn message — both are one agent directing another. */
   private sendSupervisorMessage(agentId: string, text: string, fromAgentId: string): void {
     const agent = this.agents.get(agentId);
     if (!agent) return;
     const summary = text.length > 60 ? text.slice(0, 60) + '…' : text;
     const taggedText = wrapTeammateMessage(fromAgentId, text, summary);
-    this.sendToCC(agentId, { text: taggedText }, { spawnSource: 'supervisor' });
+
+    // Conversation monitor: tag with the source agent and its traced originating human (or
+    // "unknown"), BEFORE sendToCC so alreadyMirrored suppresses the generic capture there.
+    const sendChatId = this.getAgentChatId(agent);
+    if (sendChatId != null) {
+      this.monitor.recordInboundSystem(
+        agentId,
+        sendChatId,
+        { kind: 'tgcc_send', fromAgentId, originHuman: this.monitor.resolveOriginHuman(fromAgentId) },
+        text,
+      );
+    }
+
+    this.sendToCC(agentId, { text: taggedText }, { spawnSource: 'supervisor', alreadyMirrored: true });
     if (agent.tgBot) {
       const chatId = this.getAgentChatId(agent);
       if (chatId) {
@@ -616,6 +646,18 @@ export class Bridge extends EventEmitter implements CtlHandler {
           .catch(err => this.logger.warn({ err }, 'Failed to notify TG on supervisor send'));
       }
     }
+  }
+
+  /** Deliver a fired cron job's message to its target agent, tagging it for the conversation
+   *  monitor as ⏰ cron (rather than falling into sendToCC's generic 🧭 supervisor bucket) before
+   *  the shared static/dynamic cron callback hands off to sendToCC. */
+  private sendCronMessage(agentId: string, text: string): void {
+    const agent = this.agents.get(agentId);
+    const chatId = agent ? this.getAgentChatId(agent) : null;
+    if (chatId != null) {
+      this.monitor.recordInboundSystem(agentId, chatId, { kind: 'cron' }, text);
+    }
+    this.sendToCC(agentId, { text }, { spawnSource: 'supervisor', alreadyMirrored: true });
   }
 
   // ── Cron isolated spawn ──
@@ -785,7 +827,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
     if (this.config.cron?.jobs.length) {
       this.scheduler.startAllCronJobs(
         this.config.cron.jobs,
-        (agentId, text) => this.sendToCC(agentId, { text }),
+        (agentId, text) => this.sendCronMessage(agentId, text),
         (job) => this.spawnCronIsolated(job),
       );
     }
@@ -793,7 +835,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
     // Load persisted dynamic cron jobs
     const validAgentIds = new Set(Object.keys(this.config.agents));
     this.scheduler.loadDynamicJobs(
-      (agentId, text) => this.sendToCC(agentId, { text }),
+      (agentId, text) => this.sendCronMessage(agentId, text),
       (job) => this.spawnCronIsolated(job),
       validAgentIds,
     );
@@ -1096,14 +1138,14 @@ ${hbContent}`;
     if (newConfig.cron?.jobs.length) {
       this.scheduler.startAllCronJobs(
         newConfig.cron.jobs,
-        (agentId, text) => this.sendToCC(agentId, { text }),
+        (agentId, text) => this.sendCronMessage(agentId, text),
         (job) => this.spawnCronIsolated(job),
       );
     }
     // Re-load dynamic cron jobs (they survive config reload)
     const reloadValidAgentIds = new Set(Object.keys(newConfig.agents));
     this.scheduler.loadDynamicJobs(
-      (agentId, text) => this.sendToCC(agentId, { text }),
+      (agentId, text) => this.sendCronMessage(agentId, text),
       (job) => this.spawnCronIsolated(job),
       reloadValidAgentIds,
     );
@@ -1287,6 +1329,22 @@ ${hbContent}`;
     const agent = this.agents.get(agentId);
     if (!agent) return;
 
+    // Conversation monitor: capture the raw inbound message (full sender identity, pre-batching,
+    // pre-roster-injection) — the single point where both are available together. A no-op when
+    // the monitor is off or this agent isn't in monitor.agents.
+    this.monitor.recordInboundTelegram(
+      agentId,
+      {
+        userId: msg.userId,
+        userName: msg.userName,
+        userHandle: msg.userHandle,
+        chatId: msg.chatId,
+        isGroup: msg.chatId < 0,
+        chatTitle: msg.chatTitle,
+      },
+      { kind: msg.type, text: msg.text, fileName: msg.fileName },
+    );
+
     // Ensure a per-chat batcher exists — each chat batches independently.
     agent.lastTgChatId = msg.chatId;
     agent.lastTgUserId = msg.userId ? Number(msg.userId) : null;
@@ -1325,7 +1383,7 @@ ${hbContent}`;
   private async sendToCC(
     agentId: string,
     data: { text: string; imageBase64?: string; imageMediaType?: string; images?: Array<{ base64: string; mediaType: string }>; filePath?: string; fileName?: string },
-    source?: { chatId?: number; spawnSource?: 'telegram' | 'supervisor' | 'cli' }
+    source?: { chatId?: number; spawnSource?: 'telegram' | 'supervisor' | 'cli'; alreadyMirrored?: boolean }
   ): Promise<void> {
     const agent = this.agents.get(agentId);
     if (!agent) return;
@@ -1337,6 +1395,16 @@ ${hbContent}`;
       return;
     }
     const cs = getOrCreateChatSession(agent, chatId);
+
+    // Conversation monitor: capture every non-Telegram-originated turn (Telegram-originated ones
+    // are already captured earlier in queueForChat, with richer sender identity than survives
+    // batching). Callers that already mirrored this turn themselves with a more specific tag
+    // (tgcc_send, cron, ralph — see sendSupervisorMessage / sendCronMessage / the ralph prompt
+    // send) set alreadyMirrored so it isn't double-recorded under a generic label here.
+    if (source?.spawnSource !== 'telegram' && !source?.alreadyMirrored) {
+      const origin: TurnOrigin = source?.spawnSource === 'cli' ? { kind: 'cli' } : { kind: 'supervisor' };
+      this.monitor.recordInboundSystem(agentId, chatId, origin, data.text);
+    }
 
     // If a CLI session is attached, yank it: TG always wins. Pass the CLI's sessionId
     // through pendingSessionId so the new stdin CC resumes the same conversation.
@@ -1881,6 +1949,10 @@ ${hbContent}`;
     });
 
     proc.on('tool_result', (event: ToolResultEvent) => {
+      // Conversation monitor: mirror the tool result (redacted, truncated). Buffered until the
+      // next assistant flush or turn end — see monitor.ts recordToolResult.
+      this.monitor.recordToolResult(agentId, chatId, event);
+
       // Log to event buffer
       const toolName = event.tool_use_result?.name ?? 'unknown';
       const isToolErr = event.is_error === true;
@@ -2000,6 +2072,11 @@ ${hbContent}`;
     });
 
     proc.on('assistant', (event: AssistantMessage) => {
+      // Conversation monitor: mirror thinking/text/tool_use blocks from this complete assistant
+      // message (one flush per message_stop — see monitor.ts recordAssistant for why this also
+      // satisfies "destructive tool calls flush immediately").
+      this.monitor.recordAssistant(agentId, chatId, event);
+
       // Log text and thinking blocks to event buffer
       if (event.message?.content) {
         for (const block of event.message.content) {
@@ -2020,6 +2097,10 @@ ${hbContent}`;
     });
 
     proc.on('result', (event: ResultEvent) => {
+      // Conversation monitor: flush any remaining buffered lines (e.g. a trailing tool_result
+      // with no following assistant text) and tag the turn's end.
+      this.monitor.recordTurnEnd(agentId, chatId, event);
+
       this.stopTypingIndicator(agent, chatId);
       this.highSignalDetector.handleTurnEnd(agentId);
       // Track cumulative session cost and check budget thresholds
@@ -2597,6 +2678,19 @@ ${hbContent}`;
       case 'ping': {
         const state = cs.ccProcess?.state ?? 'idle';
         await agent.tgBot.sendText(cmd.chatId, `pong — process: <b>${state.toUpperCase()}</b>`, 'HTML');
+        break;
+      }
+
+      case 'monitor_here': {
+        // Run inside the intended monitor destination chat (typically a private supergroup with
+        // Topics enabled, with this agent's bot added as admin) — records its chat id into
+        // ~/.tgcc/config.json so the owner never has to look up a chat id by hand.
+        this.monitor.registerHere(cmd.chatId);
+        await agent.tgBot.sendText(
+          cmd.chatId,
+          `<blockquote>✅ This chat (<code>${escapeHtml(String(cmd.chatId))}</code>) is now the conversation monitor destination.\nSet <code>monitor.agents</code> in ~/.tgcc/config.json to the agent IDs you want mirrored (or add them now if this is the first time).</blockquote>`,
+          'HTML',
+        );
         break;
       }
 
@@ -3210,7 +3304,7 @@ ${hbContent}`;
 
         this.scheduler.addDynamicJob(
           result.job,
-          (aid, text) => this.sendToCC(aid, { text }),
+          (aid, text) => this.sendCronMessage(aid, text),
           (job) => this.spawnCronIsolated(job),
         );
 
@@ -3233,7 +3327,7 @@ ${hbContent}`;
         }
         const triggered = this.scheduler.triggerJob(
           jobId,
-          (aid, text) => this.sendToCC(aid, { text }),
+          (aid, text) => this.sendCronMessage(aid, text),
           (job) => this.spawnCronIsolated(job),
         );
         if (triggered) {
@@ -4482,7 +4576,7 @@ ${hbContent}`;
 
                 this.scheduler.addDynamicJob(
                   job,
-                  (aid, text) => this.sendToCC(aid, { text }),
+                  (aid, text) => this.sendCronMessage(aid, text),
                   (j) => this.spawnCronIsolated(j),
                 );
 
@@ -4506,7 +4600,7 @@ ${hbContent}`;
                 if (!jobId) return { id: request.id, success: false, error: 'jobId is required for trigger' };
                 const triggered = this.scheduler.triggerJob(
                   jobId,
-                  (aid, text) => this.sendToCC(aid, { text }),
+                  (aid, text) => this.sendCronMessage(aid, text),
                   (j) => this.spawnCronIsolated(j),
                 );
                 if (!triggered) return { id: request.id, success: false, error: `Job "${jobId}" not found` };
