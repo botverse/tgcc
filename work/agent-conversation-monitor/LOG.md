@@ -119,6 +119,24 @@ Wrote a dedicated cross-agent scratch test to confirm empirically rather than re
 
 `pnpm run build` clean; `pnpm test` — 259 passed / 1 skipped / 0 failed, all 17 files — on the final committed state. `git fetch` confirmed no divergence from `origin/feat/agent-conversation-monitor` before pushing.
 
-### Status
+### Status (superseded — see next section)
 
 Both follow-ups addressed (one real bug fixed, one verified already-correct with new test coverage), committed, and pushed. Ready for the lead / tester.
+
+## 2026-09-17 (round 4) — tester finding: generic redaction misses JSON/dict-quoted keys
+
+`monitor-tests` reported (via cross-session message, not blocking — filed as `it.todo` in `tests/monitor-redact.test.ts` so the suite stayed green while I decided) that `redactSecrets('{"apiKey": "FakeJsonSecretValue000"}')` returned the input **unchanged** — the secret value survived. Root cause: the generic `*_KEY=`/`*_SECRET=`/`*TOKEN=`/`*PASSWORD=` catch-all regex required `\s*[:=]\s*` immediately after the (unquoted) key name; in JSON/dict-style text the key itself is quoted (`"apiKey": "value"`), so the closing quote sitting between the key name and the colon broke the match. Confirmed both spaced and unspaced JSON (`"apiKey": "..."` / `"apiKey":"..."`) and Python-dict-style (`'api_key': '...'`) all failed to redact; unquoted-key forms (`api_key: ...`, `api_key=...`) already worked.
+
+Tester correctly scoped the impact: every specifically-shaped secret (AWS AKIA/ASIA, `sk-`, `ghp_`/`github_pat_`, `xox[bap]-`, JWT, PEM block) is unaffected and still redacted inside JSON regardless of quoting, since those rules match on the secret's own value shape, not the field name — this gap only affects a shapeless/generic secret whose only signal is a KEY/SECRET/TOKEN/PASSWORD-named field, embedded in JSON or Python-dict-style text.
+
+Decided this **is** in scope for criterion 6 despite PLAN.md's literal "assignments" wording, since it's a real gap in a security-sensitive redaction path and a JSON/dict shape is plausible for `tool_result` content (e.g. a `Read` of a config file, an API response echoed into `Bash` output). Fixed with a small, targeted regex change: added an optional `['"]?` right after the key-name group in `generic-secret-assignment`'s pattern, so a closing quote between the key and the colon/equals no longer breaks the match. Updated PLAN.md §Secret redaction to state the JSON/dict-style form explicitly rather than leaving it implicit in "assignments".
+
+Self-verified: the tester's exact repro (`{"apiKey": "FakeJsonSecretValue000"}`) now redacts the value; also confirmed the no-space JSON variant and Python-dict single-quoted variant; re-ran every round-1 redaction regression fixture (all 11 named categories) to confirm the fix didn't break the already-working unquoted/assignment forms — all still pass. `pnpm run build` clean, `pnpm test` still 259 passed / 1 skipped / 0 failed (tester's `tests/monitor-redact.test.ts` isn't in my worktree yet — separate worktree, not pushed as of this fix).
+
+Not fixed, and not asked to: the tester also flagged (FYI, no security impact, not filed as a defect) that the module comment "more specific patterns run first so their tag is preserved" doesn't hold when a secret is immediately preceded by a label whose own word ends in KEY/SECRET/TOKEN/PASSWORD (e.g. the AWS-secret-key rule's own `aws_secret_access_key=[REDACTED:aws-secret-key]` output gets re-matched and overwritten by the generic catch-all's plain `[REDACTED]`). The raw secret is fully gone either way — this is a cosmetic tag-precedence quirk, not a leak — leaving as-is per the tester's own recommendation.
+
+Notified `monitor-tests` (SendMessage, `from=monitor-tests`) that the fix is pushed so they can flip their `it.todo`/gap-demonstration pair to real assertions.
+
+### Status
+
+Redaction gap fixed, self-verified, committed, and pushed. Ready for the lead / tester.

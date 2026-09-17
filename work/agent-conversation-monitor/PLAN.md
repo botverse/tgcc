@@ -81,7 +81,7 @@ The monitor must never affect the monitored conversation. Mirror sends are async
 
 ### Secret redaction
 
-Mirrored content goes into a Telegram cloud chat, which is not end-to-end encrypted, and the monitored agents handle real credentials (`sentinella_team` mounts `~/.aws`; `kyo_team` has Supabase keys in its environment). Redact key-shaped strings before sending: AWS access keys (`AKIA…`, `ASIA…`) and secret-key assignments, `sk-…`, `ghp_…` / `github_pat_…`, `xox[bap]-…`, JWTs, `-----BEGIN … PRIVATE KEY-----` blocks, and values of `*_KEY=` / `*_SECRET=` / `*TOKEN=` / `*PASSWORD=` assignments. Redaction is a mitigation, not a guarantee; the monitor group must stay private to the owner.
+Mirrored content goes into a Telegram cloud chat, which is not end-to-end encrypted, and the monitored agents handle real credentials (`sentinella_team` mounts `~/.aws`; `kyo_team` has Supabase keys in its environment). Redact key-shaped strings before sending: AWS access keys (`AKIA…`, `ASIA…`) and secret-key assignments, `sk-…`, `ghp_…` / `github_pat_…`, `xox[bap]-…`, JWTs, `-----BEGIN … PRIVATE KEY-----` blocks, and values of `*_KEY=` / `*_SECRET=` / `*TOKEN=` / `*PASSWORD=` assignments — including the equivalent JSON/dict-style form (`"apiKey": "…"`, `'api_key': '…'`), which is a plausible shape for `tool_result` content (a `Read` of a JSON config file, an API response echoed into `Bash` output) and doesn't obviously read as an "assignment" but must redact the same way. Redaction is a mitigation, not a guarantee; the monitor group must stay private to the owner.
 
 ### Destructive-action flagging
 

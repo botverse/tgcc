@@ -66,8 +66,13 @@ const REDACTION_RULES: RedactionRule[] = [
   {
     name: 'generic-secret-assignment',
     // Prefix allows underscores too (DB_PASSWORD, API_TOKEN, AWS_SECRET_ACCESS_KEY, ...) —
-    // the suffix itself no longer needs its own leading underscore.
-    pattern: /\b([A-Za-z0-9_]*(?:KEY|SECRET|TOKEN|PASSWORD))\s*[:=]\s*['"]?([^\s'",]{4,})['"]?/gi,
+    // the suffix itself no longer needs its own leading underscore. The optional `['"]?` right
+    // after the key name handles JSON/dict-style quoted keys ("apiKey": "...", 'api_key': '...')
+    // — without it, the closing quote sitting between the key and the colon breaks the match
+    // and a shapeless secret embedded in JSON tool output survives unredacted. Found by
+    // monitor-tests (tests/monitor-redact.test.ts) — repro was redactSecrets('{"apiKey":
+    // "..."}') leaving the value untouched.
+    pattern: /\b([A-Za-z0-9_]*(?:KEY|SECRET|TOKEN|PASSWORD))['"]?\s*[:=]\s*['"]?([^\s'",]{4,})['"]?/gi,
     replace: ((_m: string, key: string) => `${key}=[REDACTED]`) as Replacer,
   },
 ];
