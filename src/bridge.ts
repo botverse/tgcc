@@ -1268,6 +1268,15 @@ ${hbContent}`;
     const agent = this.agents.get(agentId);
     if (!agent) return;
 
+    // The conversation-monitor destination chat is a one-way mirror feed, not a conversation.
+    // The owner has to be an allowed user for whichever bot posts there (to run /monitor_here),
+    // and that bot has to be a group admin to manage topics, so it receives every message in
+    // that chat — without this guard, anything typed there (a note, a reply to a mirrored
+    // message) would be treated as a prompt and spawn a CC turn inside the feed itself. Slash
+    // commands are unaffected (routed separately via onCommand/handleSlashCommand, which applies
+    // its own allowlist for this chat).
+    if (this.isMonitorDestinationChat(msg.chatId)) return;
+
     this.logger.debug({ agentId, userId: msg.userId, type: msg.type }, 'TG message received');
 
     // Check if this text is an "Other" answer for a pending AskUserQuestion
@@ -2667,10 +2676,24 @@ ${hbContent}`;
 
   // ── Slash commands ──
 
+  /** True if chatId is the conversation monitor's destination chat (see handleTelegramMessage
+   *  for why that chat must never be treated as a conversation). */
+  private isMonitorDestinationChat(chatId: number): boolean {
+    return this.config.monitor?.chatId === chatId;
+  }
+
   private async handleSlashCommand(agentId: string, cmd: SlashCommand): Promise<void> {
     const agent = this.agents.get(agentId);
     if (!agent) return;
     if (!agent.tgBot) return; // ephemeral agents don't have TG bots
+
+    // Same one-way-feed rule as handleTelegramMessage, applied to commands: only monitor_here
+    // (to move the destination) and a read-only status peek make sense inside the monitor
+    // destination chat — everything else (/new, /repo, /model, ...) would act on whichever
+    // agent's bot happens to be posting there, which is never what's intended.
+    if (this.isMonitorDestinationChat(cmd.chatId) && cmd.command !== 'monitor_here' && cmd.command !== 'status') {
+      return;
+    }
 
     this.logger.debug({ agentId, command: cmd.command, args: cmd.args }, 'Slash command');
 
