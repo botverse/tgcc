@@ -1274,8 +1274,12 @@ ${hbContent}`;
     // that chat — without this guard, anything typed there (a note, a reply to a mirrored
     // message) would be treated as a prompt and spawn a CC turn inside the feed itself. Slash
     // commands are unaffected (routed separately via onCommand/handleSlashCommand, which applies
-    // its own allowlist for this chat).
-    if (this.isMonitorDestinationChat(msg.chatId)) return;
+    // its own allowlist for this chat). Only applies to a GROUP destination on the supervisor's
+    // bot specifically — see isMonitorDestinationChat for why a private-chat destination must
+    // never trigger this (Telegram private chat ids are the user's id, identical across every
+    // bot, so this would otherwise lock the owner out of every agent whenever the destination is
+    // a DM).
+    if (this.isMonitorDestinationChat(agentId, msg.chatId)) return;
 
     this.logger.debug({ agentId, userId: msg.userId, type: msg.type }, 'TG message received');
 
@@ -2676,9 +2680,23 @@ ${hbContent}`;
 
   // ── Slash commands ──
 
-  /** True if chatId is the conversation monitor's destination chat (see handleTelegramMessage
-   *  for why that chat must never be treated as a conversation). */
-  private isMonitorDestinationChat(chatId: number): boolean {
+  /**
+   * True only for a GROUP/supergroup monitor destination, and only on the supervisor's own bot.
+   *
+   * Telegram private-chat ids equal the user's id and are IDENTICAL across every bot — so if
+   * the destination were ever a DM (e.g. the owner's own, `7016073156`) and this matched on
+   * chatId alone, EVERY agent's bot would see the owner's private chatId collide with
+   * monitor.chatId and silently drop every message/command the owner sends to every agent. A
+   * private-chat destination must instead work with no exclusion at all: mirrored messages land
+   * in that DM alongside the owner's normal conversation with whichever bot posts there, and the
+   * owner's conversations with every other agent continue unaffected. Group/supergroup chat ids
+   * are Telegram-wide unique (never collide with a user id or another chat), so restricting to
+   * chatId < 0 is sufficient by itself; the agentId check is defence in depth in case some other
+   * agent's bot is also ever a member of that same group for an unrelated reason.
+   */
+  private isMonitorDestinationChat(agentId: string, chatId: number): boolean {
+    if (chatId >= 0) return false; // never a private chat — see above
+    if (agentId !== this.nativeSupervisorId) return false; // only the bot actually sitting in the monitor group
     return this.config.monitor?.chatId === chatId;
   }
 
@@ -2691,7 +2709,7 @@ ${hbContent}`;
     // (to move the destination) and a read-only status peek make sense inside the monitor
     // destination chat — everything else (/new, /repo, /model, ...) would act on whichever
     // agent's bot happens to be posting there, which is never what's intended.
-    if (this.isMonitorDestinationChat(cmd.chatId) && cmd.command !== 'monitor_here' && cmd.command !== 'status') {
+    if (this.isMonitorDestinationChat(agentId, cmd.chatId) && cmd.command !== 'monitor_here' && cmd.command !== 'status') {
       return;
     }
 
