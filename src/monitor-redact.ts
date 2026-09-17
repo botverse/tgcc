@@ -62,6 +62,26 @@ const REDACTION_RULES: RedactionRule[] = [
     pattern: /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g,
     replace: '[REDACTED:private-key-block]',
   },
+  // Connection-string embedded passwords: scheme://user:password@host (DATABASE_URL, mysql://,
+  // postgres://, redis://, mongodb(+srv)://, ...). The password here is positional, not
+  // field-name-based, so the generic *_KEY=/... rule below can't catch it — this is the
+  // kyo_team/Supabase DATABASE_URL shape named in the plan's own motivation. Redacts only the
+  // password; scheme/user/host/port/db stay visible so the mirror is still useful for oversight.
+  // Found by monitor-tests.
+  {
+    name: 'connection-string-password',
+    pattern: /([\w.+-]+:\/\/)([^:/\s@]*):([^@\s]+)@/g,
+    replace: ((_m: string, scheme: string, user: string) => `${scheme}${user}:[REDACTED]@`) as Replacer,
+  },
+  // Opaque (non-JWT) Bearer tokens — e.g. an agent building `curl -H "Authorization: Bearer
+  // <token>"` as a tool call input, not just appearing in a result. A non-JWT bearer token has
+  // no distinctive value shape of its own (unlike sk-/ghp_/xox.../eyJ...), so this is keyed on
+  // the "Bearer " prefix itself rather than the token's contents. Found by monitor-tests.
+  {
+    name: 'bearer-token',
+    pattern: /\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi,
+    replace: 'Bearer [REDACTED]',
+  },
   // Generic *_KEY= / *_SECRET= / *TOKEN= / *PASSWORD= assignments (catch-all, runs last)
   {
     name: 'generic-secret-assignment',

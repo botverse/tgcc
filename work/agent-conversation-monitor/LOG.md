@@ -137,6 +137,27 @@ Not fixed, and not asked to: the tester also flagged (FYI, no security impact, n
 
 Notified `monitor-tests` (SendMessage, `from=monitor-tests`) that the fix is pushed so they can flip their `it.todo`/gap-demonstration pair to real assertions.
 
-### Status
+### Status (superseded — see next section)
 
 Redaction gap fixed, self-verified, committed, and pushed. Ready for the lead / tester.
+
+## 2026-09-17 (round 5) — tester exhaustiveness pass: connection-string passwords + opaque Bearer tokens
+
+Per the lead's request, `monitor-tests` added realistic-format fixtures to `tests/monitor-redact.test.ts` (`~/.aws/credentials` INI, YAML, shell exports, camelCase/snake_case JSON, connection strings, curl `Authorization: Bearer` headers) and reported two genuine gaps kept as real failing assertions (not `it.todo`) — both explicitly named by the lead as things to check after the JSON-key fix:
+
+1. **Connection-string embedded passwords** — nothing touched a `scheme://user:password@host` shape at all; the password is *positional*, so the field-name-based generic rule can't see it. Repro named `DATABASE_URL=postgresql://postgres:EXAMPLEPASS@db.example.supabase.co:5432/postgres` specifically — this is the exact `kyo_team`/Supabase shape the plan's own problem statement names, so a real, on-the-nose gap. Also repro'd `mysql://`, `redis://` (no username — password directly after `://:`), and `mongodb+srv://` (compound scheme with a `+`).
+2. **Opaque (non-JWT) Bearer tokens** — an agent building a `curl -H "Authorization: Bearer <token>"` tool call (input, not result) with a token that isn't JWT-shaped has nothing else catching it; the `jwt` rule only matches the `eyJ...` 3-segment shape.
+
+Fixed both with two new targeted rules in `src/monitor-redact.ts`, placed before the generic catch-all (same "specific before generic" convention as the rest of the file):
+- `connection-string-password`: `/([\w.+-]+:\/\/)([^:/\s@]*):([^@\s]+)@/g` → `$1$2:[REDACTED]@`. The `[\w.+-]+` scheme group (not just `\w+`) correctly captures compound schemes like `mongodb+srv`; empty-username forms (`redis://:pass@host`) work because the username group allows zero-width. Redacts only the password — scheme, username, host, port, and database name all stay visible, so a mirrored line like "connected to `db.example.supabase.co:5432/postgres`" is still legible for oversight, matching the plan's "notify, don't obscure everything" spirit.
+- `bearer-token`: `/\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi` → `Bearer [REDACTED]`. Deliberately keyed on the prefix, not the token's own shape (there isn't one for an opaque token) — and deliberately has no trailing `\b`, since a base64-ish token can end in `=`/`+`/`-` (non-word chars), and `\b` between two non-word characters (the token's last char and a following space) would never match, silently truncating or failing the redaction.
+
+One fixture-quality note from the tester, not a defect: the lead's own suggested AWS INI example (`AKIAEXAMPLE0000000000`) was 21 chars total (17 after `AKIA`) — AWS access key ids are a fixed 20 chars (`AKIA` + exactly 16), so that particular value would have silently missed the `aws-access-key-id` rule's `{16}` on length alone. The tester substituted a length-correct fake and confirmed the full INI block (access key id + secret key + session token) redacts cleanly.
+
+Self-verified with a scratch harness (never committed): all 4 named connection-string repros (postgres, mysql, redis, mongodb+srv) redact the password while host/port/db/username stay visible, explicitly asserted per field for the postgres/Supabase case; the exact Bearer repro redacts while the `Bearer ` prefix and the trailing URL stay legible; two benign `https://` URLs with no embedded credentials confirmed untouched (no false-positive risk from the new connection-string rule); a full regression sweep of every prior redaction category (12 cases, including the round-4 JSON-key fix) still passes; a simulated AWS INI block (access key id + secret key + session token, length-correct) redacts all three fields. `pnpm run build` clean, `pnpm test` still 259 passed / 1 skipped / 0 failed.
+
+Notified `monitor-tests` (SendMessage) that both fixes are pushed so they can convert their failing assertions to passing ones and re-verify against `tests/monitor-redact.test.ts`.
+
+### Status
+
+Both exhaustiveness gaps fixed, self-verified, committed, and pushed. Ready for the lead / tester.
