@@ -158,6 +158,25 @@ Self-verified with a scratch harness (never committed): all 4 named connection-s
 
 Notified `monitor-tests` (SendMessage) that both fixes are pushed so they can convert their failing assertions to passing ones and re-verify against `tests/monitor-redact.test.ts`.
 
-### Status
+### Status (superseded — see next section)
 
 Both exhaustiveness gaps fixed, self-verified, committed, and pushed. Ready for the lead / tester.
+
+## 2026-09-18 — final reconciliation with `main`, PR #6 marked ready for review
+
+By this point `monitor-tests` had confirmed both redaction fixes (37/37 in `tests/monitor-redact.test.ts`), finished the bridge-level wiring suite covering criteria 13/14 and items 2/4/6/8, and reported the final gate: `pnpm run build` clean, `pnpm test` 22 files / 398 passed / 1 skipped on `cec603b` — matching origin exactly. They also flagged (non-blocking, then fixed via a separately-merged PR #7) that a pre-existing test, `tests/repo-management.test.ts`, had been reading and writing the real `~/.tgcc/config.json` with no sandboxing the entire time, discovered while investigating why the real file's mtime moved during their runs. See the two entries above for the full account of both.
+
+The lead then asked me to reconcile this branch with `main` (now at `9199534`, PR #7 merged) before PR #6 goes to the owner for review.
+
+**Merge, not rebase** — the branch is shared (`monitor-tests` pushed to it too, though they were finished by this point) and rewriting shared history needs authorization I don't have; the repo squash-merges on integration anyway, so a merge commit here is harmless. `git merge origin/main --no-edit` produced exactly two conflicts, both anticipated by the lead:
+
+- `vitest.config.ts` / `tests/repo-management.test.ts`: confirmed via `git diff 60d17e7 9199534 -- vitest.config.ts tests/repo-management.test.ts` that the two sides were byte-identical *before* attempting the merge (`main`'s PR #7 was cherry-picked from this branch's own `60d17e7`) — the conflict markers were git being unable to auto-resolve identical-content-different-history hunks, not a real difference. Resolved by taking either side (they're the same); did not "fix" `main`'s version, per the lead's instruction.
+- `BACKLOG.md` / `PROJECT_LOG.md`: a real conflict needing judgment, resolved by keeping both streams rather than picking one side. `main`'s merged, factual `test-home-sandbox` entries were kept byte-for-byte as they arrived from `main` — including their own internal "not yet merged — awaiting review" wording, which is now stale relative to the actual merge but is the lead's record to groom, not mine to rewrite. This branch's `agent-conversation-monitor` entries were kept and updated to describe the now-fully-tested, now-reconciled state (still clearly labeled as a proposal — PR #6 itself hasn't merged), rather than left describing the pre-tester state from two rounds ago. `work/test-home-sandbox/{PLAN,BACKLOG,LOG}.md` (new files from `main`, no conflict) came through the merge untouched.
+
+Verified on the merged result (`ace605e`), because that's what actually lands: `rm -rf dist && pnpm run build` clean; `pnpm test` — **22 files / 398 passed / 1 skipped** — matching the tester's report exactly (not `main`'s pre-merge 259, since the feature's own test files are now part of the branch); real `~/.tgcc/config.json` mtime read via `stat` before and after the full test run — `1789662338` / `2026-09-17 17:25:38.343185495 +0100` both times, unchanged, matching the lead's own reported value and confirming the now-reconciled `test-home-sandbox` fix is doing its job in this branch's own test runs, not just in isolation on `main`.
+
+Fetched immediately before pushing (no divergence — `monitor-tests` had already signed off and wasn't pushing further); pushed the merge commit (`60d17e7..ace605e`). Updated the PR #6 body via `gh api repos/botverse/tgcc/pulls/6 -X PATCH -F body=@file` (the documented `gh pr edit` workaround) to describe the fully-tested, reconciled state — old body still described 13 criteria and "not done — for the tester"; rewrote it top to bottom rather than patching stale claims — and verified the new body actually landed by reading it back. Marked the PR ready via `gh pr ready 6`, then verified independently with `gh pr view 6 --json isDraft` (`false`) rather than trusting the ready command's own output, per the lead's instruction. Did not merge — that, and deployment, are the owner's call.
+
+### Status
+
+Branch reconciled with `main`, fully tested, pushed, and PR #6 is open (`isDraft: false`) awaiting the owner's review. Nothing further pending on my side unless review turns up something.
