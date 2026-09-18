@@ -62,6 +62,7 @@ import { RalphManager, buildRalphPrompt } from './ralph.js';
 import { ExternalCcManager, sanitizeSessionName, formatAgo } from './external-cc.js';
 import { wrapTeammateMessage, wrapSystemReminder } from './cc-tags.js';
 import { Scheduler, computeOneShotSchedule, parseEveryToCron } from './scheduler.js';
+import { ConversationMonitor, type TurnOrigin } from './monitor.js';
 import { randomUUID } from 'node:crypto';
 import { exec as nodeExec, execSync } from 'node:child_process';
 import { transcribeAudioGemini, buildTranscriptionTurn, type TranscribeResult } from './transcribe.js';
@@ -152,7 +153,7 @@ interface AgentInstance {
   awaitingAskCleanup: boolean;            // true when AskUserQuestion was detected this turn → delete fallback bubble on result
   muteOutput: boolean; // suppress TG rendering for wake-triggered supervisor turns
   authFlowInProgress: boolean; // prevents re-entrant auth fallback
-  lastSendData: { text: string; source?: { chatId?: number; spawnSource?: 'telegram' | 'supervisor' | 'cli' } } | null; // for retry after auth
+  lastSendData: { text: string; source?: { chatId?: number; spawnSource?: 'telegram' | 'supervisor' | 'cli'; alreadyMirrored?: boolean } } | null; // for retry after auth
   claudeConfigDir: string | undefined; // isolated CLAUDE_CONFIG_DIR for docker agents
   pendingCliTmuxAgent: string | null; // waiting for tmux session name reply from /new-cli
 }
@@ -203,6 +204,30 @@ export function buildInboundText(input: InboundTextInput, roster: string | null,
     }
   }
   return text;
+}
+
+// ── /monitor_here authorization ──
+//
+// Pulled out as a pure function (same pattern as buildInboundText / MessageBatcher above) so
+// the authorization decision is unit-testable without constructing a full Bridge instance —
+// this is the check that stops the people the monitor exists to watch (e.g. colleagues in
+// sentinella's allowedUsers, who can reach sentinella's bot but not the supervisor's) from
+// moving or disabling the monitor destination themselves.
+
+export type MonitorHereAuthResult =
+  | { ok: true }
+  | { ok: false; reason: 'not-supervisor-bot' | 'owner-not-configured' | 'not-owner' };
+
+export function checkMonitorHereAuth(
+  agentId: string,
+  nativeSupervisorId: string | null,
+  callerUserId: string,
+  ownerUserId: string | undefined,
+): MonitorHereAuthResult {
+  if (agentId !== nativeSupervisorId) return { ok: false, reason: 'not-supervisor-bot' };
+  if (!ownerUserId) return { ok: false, reason: 'owner-not-configured' };
+  if (callerUserId !== ownerUserId) return { ok: false, reason: 'not-owner' };
+  return { ok: true };
 }
 
 interface SupervisorPendingRequest {
@@ -409,6 +434,10 @@ export class Bridge extends EventEmitter implements CtlHandler {
   /** Cache of session-id → derived title (read from JSONL on first turn-complete per session). */
   private sessionTitleCache = new Map<string, string | null>();
 
+  // Conversation monitor: mirrors monitored-agent traffic into a Telegram destination
+  // (see work/agent-conversation-monitor/PLAN.md). Off when config.monitor is absent.
+  private monitor: ConversationMonitor;
+
   constructor(config: TgccConfig, logger?: pino.Logger) {
     super();
     this.config = config;
@@ -522,6 +551,17 @@ export class Bridge extends EventEmitter implements CtlHandler {
 
     // External CC sessions (tmux windows running `claude --remote-control`)
     this.externalCc = new ExternalCcManager(join(homedir(), '.tgcc', 'external-cc.json'), this.logger);
+
+    // Conversation monitor — reads this.config fresh on every send, so hot-reloading the
+    // top-level "monitor" block (including turning it on/off) takes effect immediately.
+    this.monitor = new ConversationMonitor({
+      getConfig: () => this.config.monitor,
+      getSenderBot: () => {
+        if (!this.nativeSupervisorId) return null;
+        return this.agents.get(this.nativeSupervisorId)?.tgBot ?? null;
+      },
+      logger: this.logger,
+    });
   }
 
   /** Start or restart the supervisor heartbeat timer. Delegates to SupervisorManager. */
@@ -601,13 +641,27 @@ export class Bridge extends EventEmitter implements CtlHandler {
     return discoverCCSessions(this.agentSessionRepo(agent), limit, agent.claudeConfigDir);
   }
 
-  /** Send a supervisor message to an agent and register a wake-on-complete ping. */
+  /** Send a supervisor message to an agent and register a wake-on-complete ping. Covers both
+   *  tgcc_send and an initial tgcc_spawn message — both are one agent directing another. */
   private sendSupervisorMessage(agentId: string, text: string, fromAgentId: string): void {
     const agent = this.agents.get(agentId);
     if (!agent) return;
     const summary = text.length > 60 ? text.slice(0, 60) + '…' : text;
     const taggedText = wrapTeammateMessage(fromAgentId, text, summary);
-    this.sendToCC(agentId, { text: taggedText }, { spawnSource: 'supervisor' });
+
+    // Conversation monitor: tag with the source agent and its traced originating human (or
+    // "unknown"), BEFORE sendToCC so alreadyMirrored suppresses the generic capture there.
+    const sendChatId = this.getAgentChatId(agent);
+    if (sendChatId != null) {
+      this.monitor.recordInboundSystem(
+        agentId,
+        sendChatId,
+        { kind: 'tgcc_send', fromAgentId, originHuman: this.monitor.resolveOriginHuman(fromAgentId) },
+        text,
+      );
+    }
+
+    this.sendToCC(agentId, { text: taggedText }, { spawnSource: 'supervisor', alreadyMirrored: true });
     if (agent.tgBot) {
       const chatId = this.getAgentChatId(agent);
       if (chatId) {
@@ -616,6 +670,18 @@ export class Bridge extends EventEmitter implements CtlHandler {
           .catch(err => this.logger.warn({ err }, 'Failed to notify TG on supervisor send'));
       }
     }
+  }
+
+  /** Deliver a fired cron job's message to its target agent, tagging it for the conversation
+   *  monitor as ⏰ cron (rather than falling into sendToCC's generic 🧭 supervisor bucket) before
+   *  the shared static/dynamic cron callback hands off to sendToCC. */
+  private sendCronMessage(agentId: string, text: string): void {
+    const agent = this.agents.get(agentId);
+    const chatId = agent ? this.getAgentChatId(agent) : null;
+    if (chatId != null) {
+      this.monitor.recordInboundSystem(agentId, chatId, { kind: 'cron' }, text);
+    }
+    this.sendToCC(agentId, { text }, { spawnSource: 'supervisor', alreadyMirrored: true });
   }
 
   // ── Cron isolated spawn ──
@@ -785,7 +851,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
     if (this.config.cron?.jobs.length) {
       this.scheduler.startAllCronJobs(
         this.config.cron.jobs,
-        (agentId, text) => this.sendToCC(agentId, { text }),
+        (agentId, text) => this.sendCronMessage(agentId, text),
         (job) => this.spawnCronIsolated(job),
       );
     }
@@ -793,7 +859,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
     // Load persisted dynamic cron jobs
     const validAgentIds = new Set(Object.keys(this.config.agents));
     this.scheduler.loadDynamicJobs(
-      (agentId, text) => this.sendToCC(agentId, { text }),
+      (agentId, text) => this.sendCronMessage(agentId, text),
       (job) => this.spawnCronIsolated(job),
       validAgentIds,
     );
@@ -949,6 +1015,7 @@ export class Bridge extends EventEmitter implements CtlHandler {
       (cmd) => this.handleSlashCommand(agentId, cmd),
       this.logger,
       (query) => this.handleCallbackQuery(agentId, query),
+      agentId === this.nativeSupervisorId,
     );
 
     // Resolve initial repo and model from config + persisted state
@@ -1096,14 +1163,14 @@ ${hbContent}`;
     if (newConfig.cron?.jobs.length) {
       this.scheduler.startAllCronJobs(
         newConfig.cron.jobs,
-        (agentId, text) => this.sendToCC(agentId, { text }),
+        (agentId, text) => this.sendCronMessage(agentId, text),
         (job) => this.spawnCronIsolated(job),
       );
     }
     // Re-load dynamic cron jobs (they survive config reload)
     const reloadValidAgentIds = new Set(Object.keys(newConfig.agents));
     this.scheduler.loadDynamicJobs(
-      (agentId, text) => this.sendToCC(agentId, { text }),
+      (agentId, text) => this.sendCronMessage(agentId, text),
       (job) => this.spawnCronIsolated(job),
       reloadValidAgentIds,
     );
@@ -1201,6 +1268,19 @@ ${hbContent}`;
     const agent = this.agents.get(agentId);
     if (!agent) return;
 
+    // The conversation-monitor destination chat is a one-way mirror feed, not a conversation.
+    // The owner has to be an allowed user for whichever bot posts there (to run /monitor_here),
+    // and that bot has to be a group admin to manage topics, so it receives every message in
+    // that chat — without this guard, anything typed there (a note, a reply to a mirrored
+    // message) would be treated as a prompt and spawn a CC turn inside the feed itself. Slash
+    // commands are unaffected (routed separately via onCommand/handleSlashCommand, which applies
+    // its own allowlist for this chat). Only applies to a GROUP destination on the supervisor's
+    // bot specifically — see isMonitorDestinationChat for why a private-chat destination must
+    // never trigger this (Telegram private chat ids are the user's id, identical across every
+    // bot, so this would otherwise lock the owner out of every agent whenever the destination is
+    // a DM).
+    if (this.isMonitorDestinationChat(agentId, msg.chatId)) return;
+
     this.logger.debug({ agentId, userId: msg.userId, type: msg.type }, 'TG message received');
 
     // Check if this text is an "Other" answer for a pending AskUserQuestion
@@ -1287,6 +1367,22 @@ ${hbContent}`;
     const agent = this.agents.get(agentId);
     if (!agent) return;
 
+    // Conversation monitor: capture the raw inbound message (full sender identity, pre-batching,
+    // pre-roster-injection) — the single point where both are available together. A no-op when
+    // the monitor is off or this agent isn't in monitor.agents.
+    this.monitor.recordInboundTelegram(
+      agentId,
+      {
+        userId: msg.userId,
+        userName: msg.userName,
+        userHandle: msg.userHandle,
+        chatId: msg.chatId,
+        isGroup: msg.chatId < 0,
+        chatTitle: msg.chatTitle,
+      },
+      { kind: msg.type, text: msg.text, fileName: msg.fileName },
+    );
+
     // Ensure a per-chat batcher exists — each chat batches independently.
     agent.lastTgChatId = msg.chatId;
     agent.lastTgUserId = msg.userId ? Number(msg.userId) : null;
@@ -1325,7 +1421,7 @@ ${hbContent}`;
   private async sendToCC(
     agentId: string,
     data: { text: string; imageBase64?: string; imageMediaType?: string; images?: Array<{ base64: string; mediaType: string }>; filePath?: string; fileName?: string },
-    source?: { chatId?: number; spawnSource?: 'telegram' | 'supervisor' | 'cli' }
+    source?: { chatId?: number; spawnSource?: 'telegram' | 'supervisor' | 'cli'; alreadyMirrored?: boolean }
   ): Promise<void> {
     const agent = this.agents.get(agentId);
     if (!agent) return;
@@ -1337,6 +1433,16 @@ ${hbContent}`;
       return;
     }
     const cs = getOrCreateChatSession(agent, chatId);
+
+    // Conversation monitor: capture every non-Telegram-originated turn (Telegram-originated ones
+    // are already captured earlier in queueForChat, with richer sender identity than survives
+    // batching). Callers that already mirrored this turn themselves with a more specific tag
+    // (tgcc_send, cron, ralph — see sendSupervisorMessage / sendCronMessage / the ralph prompt
+    // send) set alreadyMirrored so it isn't double-recorded under a generic label here.
+    if (source?.spawnSource !== 'telegram' && !source?.alreadyMirrored) {
+      const origin: TurnOrigin = source?.spawnSource === 'cli' ? { kind: 'cli' } : { kind: 'supervisor' };
+      this.monitor.recordInboundSystem(agentId, chatId, origin, data.text);
+    }
 
     // If a CLI session is attached, yank it: TG always wins. Pass the CLI's sessionId
     // through pendingSessionId so the new stdin CC resumes the same conversation.
@@ -1881,6 +1987,10 @@ ${hbContent}`;
     });
 
     proc.on('tool_result', (event: ToolResultEvent) => {
+      // Conversation monitor: mirror the tool result (redacted, truncated). Buffered until the
+      // next assistant flush or turn end — see monitor.ts recordToolResult.
+      this.monitor.recordToolResult(agentId, chatId, event);
+
       // Log to event buffer
       const toolName = event.tool_use_result?.name ?? 'unknown';
       const isToolErr = event.is_error === true;
@@ -2000,6 +2110,11 @@ ${hbContent}`;
     });
 
     proc.on('assistant', (event: AssistantMessage) => {
+      // Conversation monitor: mirror thinking/text/tool_use blocks from this complete assistant
+      // message (one flush per message_stop — see monitor.ts recordAssistant for why this also
+      // satisfies "destructive tool calls flush immediately").
+      this.monitor.recordAssistant(agentId, chatId, event);
+
       // Log text and thinking blocks to event buffer
       if (event.message?.content) {
         for (const block of event.message.content) {
@@ -2020,6 +2135,10 @@ ${hbContent}`;
     });
 
     proc.on('result', (event: ResultEvent) => {
+      // Conversation monitor: flush any remaining buffered lines (e.g. a trailing tool_result
+      // with no following assistant text) and tag the turn's end.
+      this.monitor.recordTurnEnd(agentId, chatId, event);
+
       this.stopTypingIndicator(agent, chatId);
       this.highSignalDetector.handleTurnEnd(agentId);
       // Track cumulative session cost and check budget thresholds
@@ -2561,10 +2680,38 @@ ${hbContent}`;
 
   // ── Slash commands ──
 
+  /**
+   * True only for a GROUP/supergroup monitor destination, and only on the supervisor's own bot.
+   *
+   * Telegram private-chat ids equal the user's id and are IDENTICAL across every bot — so if
+   * the destination were ever a DM (e.g. the owner's own, `7016073156`) and this matched on
+   * chatId alone, EVERY agent's bot would see the owner's private chatId collide with
+   * monitor.chatId and silently drop every message/command the owner sends to every agent. A
+   * private-chat destination must instead work with no exclusion at all: mirrored messages land
+   * in that DM alongside the owner's normal conversation with whichever bot posts there, and the
+   * owner's conversations with every other agent continue unaffected. Group/supergroup chat ids
+   * are Telegram-wide unique (never collide with a user id or another chat), so restricting to
+   * chatId < 0 is sufficient by itself; the agentId check is defence in depth in case some other
+   * agent's bot is also ever a member of that same group for an unrelated reason.
+   */
+  private isMonitorDestinationChat(agentId: string, chatId: number): boolean {
+    if (chatId >= 0) return false; // never a private chat — see above
+    if (agentId !== this.nativeSupervisorId) return false; // only the bot actually sitting in the monitor group
+    return this.config.monitor?.chatId === chatId;
+  }
+
   private async handleSlashCommand(agentId: string, cmd: SlashCommand): Promise<void> {
     const agent = this.agents.get(agentId);
     if (!agent) return;
     if (!agent.tgBot) return; // ephemeral agents don't have TG bots
+
+    // Same one-way-feed rule as handleTelegramMessage, applied to commands: only monitor_here
+    // (to move the destination) and a read-only status peek make sense inside the monitor
+    // destination chat — everything else (/new, /repo, /model, ...) would act on whichever
+    // agent's bot happens to be posting there, which is never what's intended.
+    if (this.isMonitorDestinationChat(agentId, cmd.chatId) && cmd.command !== 'monitor_here' && cmd.command !== 'status') {
+      return;
+    }
 
     this.logger.debug({ agentId, command: cmd.command, args: cmd.args }, 'Slash command');
 
@@ -2583,10 +2730,7 @@ ${hbContent}`;
         lines.push('', 'Send a message to start, or use /help for commands.');
         await agent.tgBot.sendText(cmd.chatId, lines.join('\n'), 'HTML');
         // Re-register commands with BotFather to ensure menu is up to date
-        try {
-          const { COMMANDS } = await import('./telegram.js');
-          await agent.tgBot.bot.api.setMyCommands(COMMANDS);
-        } catch {}
+        await agent.tgBot.refreshCommands().catch(() => {});
         break;
       }
 
@@ -2597,6 +2741,46 @@ ${hbContent}`;
       case 'ping': {
         const state = cs.ccProcess?.state ?? 'idle';
         await agent.tgBot.sendText(cmd.chatId, `pong — process: <b>${state.toUpperCase()}</b>`, 'HTML');
+        break;
+      }
+
+      case 'monitor_here': {
+        // Defense in depth: TelegramBot only wires this command up on the supervisor's bot at
+        // all (isSupervisorBot), but this handler is shared code reached from every bot, so it
+        // re-checks independently via a pure, unit-testable function rather than trusting that
+        // routing alone. The people this feature exists to watch (e.g. colleagues in
+        // sentinella's allowedUsers) must never be able to move or disable the monitor
+        // destination via some other agent's bot.
+        const auth = checkMonitorHereAuth(agentId, this.nativeSupervisorId, cmd.userId, this.config.monitor?.ownerUserId);
+        if (!auth.ok) {
+          if (auth.reason === 'not-supervisor-bot') {
+            this.logger.warn({ agentId, userId: cmd.userId }, '/monitor_here rejected — not the supervisor bot');
+            break;
+          }
+          if (auth.reason === 'owner-not-configured') {
+            await agent.tgBot.sendText(
+              cmd.chatId,
+              '<blockquote>⚠️ "monitor.ownerUserId" is not set in ~/.tgcc/config.json. Add a <code>monitor</code> block with at least <code>ownerUserId</code> (your Telegram user id) before /monitor_here can be used.</blockquote>',
+              'HTML',
+            );
+            break;
+          }
+          // not-owner
+          this.logger.warn({ agentId, userId: cmd.userId, ownerUserId: this.config.monitor?.ownerUserId }, '/monitor_here rejected — caller is not the configured owner');
+          await agent.tgBot.sendText(cmd.chatId, "<blockquote>You're not authorized to change the conversation monitor destination.</blockquote>", 'HTML');
+          break;
+        }
+
+        // Run inside the intended monitor destination chat (typically a private supergroup with
+        // Topics enabled, with this bot added as admin) — records its chat id into
+        // ~/.tgcc/config.json so the owner never has to look up a chat id by hand. Notifies the
+        // previous destination (if any) so a destination change is never silent.
+        this.monitor.registerHere(cmd.chatId, cmd.userId);
+        await agent.tgBot.sendText(
+          cmd.chatId,
+          `<blockquote>✅ This chat (<code>${escapeHtml(String(cmd.chatId))}</code>) is now the conversation monitor destination.\nSet <code>monitor.agents</code> in ~/.tgcc/config.json to the agent IDs you want mirrored (or add them now if this is the first time).</blockquote>`,
+          'HTML',
+        );
         break;
       }
 
@@ -3210,7 +3394,7 @@ ${hbContent}`;
 
         this.scheduler.addDynamicJob(
           result.job,
-          (aid, text) => this.sendToCC(aid, { text }),
+          (aid, text) => this.sendCronMessage(aid, text),
           (job) => this.spawnCronIsolated(job),
         );
 
@@ -3233,7 +3417,7 @@ ${hbContent}`;
         }
         const triggered = this.scheduler.triggerJob(
           jobId,
-          (aid, text) => this.sendToCC(aid, { text }),
+          (aid, text) => this.sendCronMessage(aid, text),
           (job) => this.spawnCronIsolated(job),
         );
         if (triggered) {
@@ -4482,7 +4666,7 @@ ${hbContent}`;
 
                 this.scheduler.addDynamicJob(
                   job,
-                  (aid, text) => this.sendToCC(aid, { text }),
+                  (aid, text) => this.sendCronMessage(aid, text),
                   (j) => this.spawnCronIsolated(j),
                 );
 
@@ -4506,7 +4690,7 @@ ${hbContent}`;
                 if (!jobId) return { id: request.id, success: false, error: 'jobId is required for trigger' };
                 const triggered = this.scheduler.triggerJob(
                   jobId,
-                  (aid, text) => this.sendToCC(aid, { text }),
+                  (aid, text) => this.sendCronMessage(aid, text),
                   (j) => this.spawnCronIsolated(j),
                 );
                 if (!triggered) return { id: request.id, success: false, error: `Job "${jobId}" not found` };

@@ -12,6 +12,8 @@ export interface TelegramMessage {
   userId: string;
   userName?: string;
   userHandle?: string; // Telegram @username (without @)
+  /** Group/supergroup title — undefined for DMs (chatId > 0). Used by the conversation monitor to tag inbound group traffic. */
+  chatTitle?: string;
   text: string;
   imageBase64?: string;
   imageMediaType?: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp';
@@ -74,6 +76,11 @@ export const COMMANDS = [
   { command: 'help', description: 'List all commands' },
 ];
 
+/** Only registered/visible on the supervisor's bot — see TelegramBot's isSupervisorBot flag.
+ *  Changing the conversation-monitor destination is owner-only and must not be reachable
+ *  (even cosmetically, via the command menu) from bots the people being monitored talk to. */
+export const MONITOR_HERE_COMMAND = { command: 'monitor_here', description: 'Register this chat as the conversation monitor destination (owner only)' };
+
 // ── Media type detection ──
 
 function detectImageMediaType(fileName: string): 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp' {
@@ -134,6 +141,11 @@ export class TelegramBot {
   /** Per-chat group member roster: chatId → userId → GroupMember */
   private groupMembers = new Map<number, Map<number, GroupMember>>();
 
+  /** True only for the native supervisor's bot — gates whether /monitor_here is even wired up
+   *  (see setupHandlers/start). The bridge-level handler double-checks agentId + owner user id
+   *  regardless; this is defense in depth, not the only guard. */
+  readonly isSupervisorBot: boolean;
+
   constructor(
     agentId: string,
     config: AgentConfig,
@@ -142,6 +154,7 @@ export class TelegramBot {
     onCommand: CommandHandler,
     logger: pino.Logger,
     onCallback?: CallbackHandler,
+    isSupervisorBot = false,
   ) {
     this.agentId = agentId;
     this.config = config;
@@ -150,6 +163,7 @@ export class TelegramBot {
     this.onMessage = onMessage;
     this.onCommand = onCommand;
     this.onCallback = onCallback ?? null;
+    this.isSupervisorBot = isSupervisorBot;
 
     this.bot = new Bot(config.botToken);
     this.setupHandlers();
@@ -270,6 +284,12 @@ export class TelegramBot {
     return from.last_name ? `${from.first_name} ${from.last_name}` : from.first_name;
   }
 
+  /** Group/supergroup title, if this chat has one (undefined for DMs). */
+  private static getChatTitle(ctx: Context): string | undefined {
+    const chat = ctx.chat;
+    return chat && 'title' in chat ? chat.title : undefined;
+  }
+
   private setupHandlers(): void {
     // ── Group member tracking (runs before all handlers) ──
     this.bot.use((ctx, next) => {
@@ -280,6 +300,11 @@ export class TelegramBot {
     // ── Slash commands ──
     for (const { command } of COMMANDS) {
       this.bot.command(command, (ctx) => this.handleCommand(ctx, command));
+    }
+    // monitor_here is wired up ONLY on the supervisor's bot — other bots don't even parse it
+    // as a command (it falls through to handleText as ordinary text there).
+    if (this.isSupervisorBot) {
+      this.bot.command(MONITOR_HERE_COMMAND.command, (ctx) => this.handleCommand(ctx, MONITOR_HERE_COMMAND.command));
     }
 
     // ── Callback queries (inline button presses) ──
@@ -415,6 +440,7 @@ export class TelegramBot {
         userId: String(userId),
         userName: TelegramBot.getUserName(ctx),
         userHandle: ctx.from?.username,
+        chatTitle: TelegramBot.getChatTitle(ctx),
         text: caption,
         imageBase64: base64,
         imageMediaType: mediaType,
@@ -450,6 +476,7 @@ export class TelegramBot {
       const caption = ctx.message?.caption ?? '';
       const userName = TelegramBot.getUserName(ctx);
       const userHandle = ctx.from?.username;
+      const chatTitle = TelegramBot.getChatTitle(ctx);
 
       // Check if it's an image — send as image content block
       if (doc.mime_type?.startsWith('image/')) {
@@ -461,6 +488,7 @@ export class TelegramBot {
           userId: String(userId),
           userName,
           userHandle,
+          chatTitle,
           text: caption,
           imageBase64: base64,
           imageMediaType: mediaType,
@@ -474,6 +502,7 @@ export class TelegramBot {
         userId: String(userId),
         userName,
         userHandle,
+        chatTitle,
         text: caption,
         filePath: savePath,
         fileName,
@@ -515,6 +544,7 @@ export class TelegramBot {
         userId: String(userId),
         userName: TelegramBot.getUserName(ctx),
         userHandle: ctx.from?.username,
+        chatTitle: TelegramBot.getChatTitle(ctx),
         text: ctx.message?.caption ?? '',
         filePath: savePath,
         fileName,
@@ -561,6 +591,7 @@ export class TelegramBot {
         userId: String(userId),
         userName: TelegramBot.getUserName(ctx),
         userHandle: ctx.from?.username,
+        chatTitle: TelegramBot.getChatTitle(ctx),
         text: ctx.message?.caption ?? '',
         filePath: savePath,
         fileName,
@@ -607,6 +638,7 @@ export class TelegramBot {
         userId: String(userId),
         userName: TelegramBot.getUserName(ctx),
         userHandle: ctx.from?.username,
+        chatTitle: TelegramBot.getChatTitle(ctx),
         text: '',
         filePath: savePath,
         fileName,
@@ -647,6 +679,7 @@ export class TelegramBot {
         userId: String(userId),
         userName: TelegramBot.getUserName(ctx),
         userHandle: ctx.from?.username,
+        chatTitle: TelegramBot.getChatTitle(ctx),
         text: ctx.message?.caption ?? '',
         filePath: savePath,
         fileName,
@@ -658,10 +691,23 @@ export class TelegramBot {
 
   // ── Bot lifecycle ──
 
+  /** Commands to register/show in the BotFather menu for this bot — includes monitor_here
+   *  only on the supervisor's bot (see isSupervisorBot). */
+  private registeredCommands(): typeof COMMANDS {
+    return this.isSupervisorBot ? [...COMMANDS, MONITOR_HERE_COMMAND] : COMMANDS;
+  }
+
+  /** Re-register this bot's command menu with BotFather (e.g. after /start). Public so callers
+   *  never need to reach for the raw COMMANDS constant directly and risk registering
+   *  monitor_here on a non-supervisor bot. */
+  async refreshCommands(): Promise<void> {
+    await this.bot.api.setMyCommands(this.registeredCommands());
+  }
+
   async start(): Promise<void> {
     // Register commands with BotFather
     try {
-      await this.bot.api.setMyCommands(COMMANDS);
+      await this.bot.api.setMyCommands(this.registeredCommands());
       this.logger.info('Registered slash commands with BotFather');
     } catch (err) {
       this.logger.warn({ err }, 'Failed to register commands');
@@ -722,11 +768,12 @@ export class TelegramBot {
     return Number(chatId) === 0;
   }
 
-  async sendText(chatId: number | string, text: string, parseMode?: string, silent = false): Promise<number> {
+  async sendText(chatId: number | string, text: string, parseMode?: string, silent = false, threadId?: number): Promise<number> {
     if (this.isSyntheticChat(chatId)) return 0;
     const msg = await this.bot.api.sendMessage(Number(chatId), text, {
       parse_mode: parseMode as 'Markdown' | 'MarkdownV2' | 'HTML' | undefined,
       disable_notification: silent || undefined,
+      message_thread_id: threadId,
     });
     this.trackBotMessage(Number(chatId), msg.message_id, text);
     return msg.message_id;
@@ -804,6 +851,13 @@ export class TelegramBot {
     await this.bot.api.sendVoice(Number(chatId), new InputFile(filePath), {
       caption,
     });
+  }
+
+  /** Create a Topics-enabled forum topic in a supergroup. Returns the message_thread_id.
+   *  Requires the bot to be an admin with "Manage Topics" in that supergroup. */
+  async createForumTopic(chatId: number | string, name: string): Promise<number> {
+    const topic = await this.bot.api.createForumTopic(Number(chatId), name.slice(0, 128));
+    return topic.message_thread_id;
   }
 
   async replyToMessage(chatId: number | string, text: string, replyToMessageId: number, parseMode?: string): Promise<number> {
